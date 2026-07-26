@@ -1,0 +1,14 @@
+{
+  "name": "ui",
+  "version": "1.0.0",
+  "description": "UI generee par SquareLine Studio. Ce library.json ne sert qu'a restreindre le PERIMETRE DE COMPILATION : PlatformIO compile sinon recursivement tout squareline/ui, ce qui provoque des erreurs de lien a chaque export de l'UI. Deux cas, tous deux crees par SquareLine lui-meme, et tous deux resolus ici plutot qu'en editant ses fichiers (qu'il regenere) : (1) assets/ contient une COPIE de chaque police deja presente dans fonts/ -> 'multiple definition of ui_font_Font12' ; l'outil exige cette copie et affiche 'file is missing' si on la supprime. (2) ui_events.c contient des STUBS VIDES des callbacks, dont les vraies implementations vivent dans src/display_manager.cpp -> 'multiple definition of display_show_TABLE_NAS_DISKS'. Le fichier n'est reference par rien (verifie : aucun ecran n'appelle ses autres stubs, et ui_events.h suffit a declarer les deux callbacks utiles). NE PAS editer les fichiers de SquareLine pour contourner : ils reviennent au prochain export.",
+  "build": {
+    "srcFilter": [
+      "+<*>",
+      "-<assets/>",
+      "-<backup/>",
+      "-<cache/>",
+      "-<ui_events.c>"
+    ]
+  }
+}

@@ -1,0 +1,22 @@
+# Name,     Type, SubType,  Offset,   Size,      Flags
+# ------------------------------------------------------------
+# Calculée à la main pour 16MB (board_build.flash_size = 16MB) :
+#   nvs      :  20 KB  @ 0x009000
+#   otadata  :   8 KB  @ 0x00E000
+#   app0     : 3.125MB @ 0x010000  (slot OTA A)
+#   app1     : 3.125MB @ 0x330000  (slot OTA B — offset auto, contigu)
+#   model    :    4MB  @ 0x650000  (réservée pour jarvis/ESP-SR)
+#   littlefs : 5.625MB @ 0xA50000  (0x5A0000 — l'avatar Companion en occupe
+#                                  ~907 Ko, soit 16 % : large marge)
+#   -> total : 0xFF0000 (~15.94MB), marge de 64KB en fin de flash 
+#
+# app0/app1 à 3.125MB chacun laisse une marge large par rapport au
+# sketch actuel (à vérifier avec `pio run -t size`, mais largement
+# suffisant pour LVGL+TFT_eSPI+FastLED+HTTP+MQTT+audio).
+# ------------------------------------------------------------
+nvs,       data, nvs,      0x9000,   0x5000,
+otadata,   data, ota,      0xE000,   0x2000,
+app0,      app,  ota_0,    0x10000,  0x320000,
+app1,      app,  ota_1,           ,  0x320000,
+model,     data, spiffs,          ,  0x400000,
+littlefs,  data, spiffs,          ,  0x5A0000,

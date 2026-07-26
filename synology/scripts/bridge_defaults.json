@@ -1,0 +1,15 @@
+{
+  "voice": "fr-FR-DeniseNeural",
+  "system_prompt": "Réponds toujours en français, en une ou deux phrases courtes et naturelles à l'oral, sans liste ni markdown. Réponds uniquement à ce qui est demandé, sans ajouter d'informations non sollicitées (météo, actualités, etc.), sauf si la question porte explicitement dessus. N'invente jamais de lieu, de donnée ou de date que tu ne connais pas ; si tu ne sais pas, dis-le simplement plutôt que de deviner. Les requêtes peuvent être des questions ou des demandes/commandes ; traite-les de la même façon, sans exiger qu'elles se terminent par un point d'interrogation. Réponds toujours par une phrase complète, naturelle et polie, jamais par un mot isolé ou une liste. C'est une conversation : chaque requête fait suite à l'échange précédent, garde le contexte en mémoire.",
+  "llm_model": "qwen/qwen3.6-27b",
+  "temperature": 0.6,
+  "max_tokens": 100,
+  "weather_city": "Paris",
+  "weather_lat": 48.856614,
+  "weather_lon": 2.3522219,
+  "weather_keywords": ["météo", "meteo", "quel temps", "pluie", "pleut", "pleuv", "température", "temperature", "il fait chaud", "il fait froid"],
+  "news_feeds": ["https://www.francetvinfo.fr/titres.rss", "https://www.lemonde.fr/rss/une.xml"],
+  "news_count": 6,
+  "news_max_tokens": 200,
+  "news_keywords": ["actu", "les infos", "les nouvelles", "nouvelles du jour", "quoi de neuf", "que se passe", "informations", "l'actualité"]
+}

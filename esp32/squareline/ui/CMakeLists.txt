@@ -1,0 +1,13 @@
+SET(SOURCES screens/ui_ScreenHome.c
+    screens/ui_ScreenNAS.c
+    screens/ui_ScreenFreebox.c
+    screens/ui_ScreenTable.c
+    screens/ui_ScreenAI.c
+    ui.c
+    components/ui_comp_hook.c
+    ui_helpers.c
+    ui_events.c
+    fonts/ui_font_Font10.c
+    fonts/ui_font_Font12.c)
+
+add_library(ui ${SOURCES})

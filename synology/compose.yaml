@@ -1,0 +1,26 @@
+version: '3.8'
+services:
+  mosquitto:
+    image: eclipse-mosquitto:latest
+    container_name: mosquitto
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf
+      - ./mosquitto/data:/mosquitto/data
+      - ./mosquitto/log:/mosquitto/log
+  monitor:
+    build: .
+    container_name: monitor
+    restart: unless-stopped
+    env_file: monitor.env
+    working_dir: /app
+    ports:
+      - "8090:8090"
+    volumes:
+      - ./scripts:/app/scripts
+      - ./monitor.py:/app/monitor.py
+    depends_on:
+      - mosquitto

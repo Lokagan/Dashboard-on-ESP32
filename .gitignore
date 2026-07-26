@@ -1,0 +1,16 @@
+# Outils / éditeurs
+.claude/
+.vscode/
+.DS_Store
+CLAUDE.md
+
+# Firmware ESP32 — build + secrets WiFi
+esp32/.pio/
+esp32/.vscode/
+esp32/src/config.h
+esp32/squareline/ui/backup/
+
+# Services NAS — secrets + état runtime local + captures vocales
+synology/monitor.env
+synology/scripts/bridge_settings.json
+synology/scripts/captures/

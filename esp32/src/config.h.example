@@ -1,0 +1,160 @@
+#pragma once
+
+// ============================================================
+// CONFIG.H — Configuration centrale.
+// Tout ce qui peut changer est ici. Ne jamais hardcoder ailleurs.
+// ============================================================
+//
+// MODÈLE — copier ce fichier vers `config.h` puis renseigner les valeurs
+// marquées « À RENSEIGNER ». `config.h` est ignoré par git (secrets WiFi/OTA),
+// ce template ne l'est pas.
+//
+//   cp esp32/src/config.h.example esp32/src/config.h
+
+// ---- OBJETS GLOBAUX ----
+
+// --- LVGL / ÉCRAN ---
+#define LV_TICK_PERIOD_MS   10
+#define SCREEN_WIDTH        320
+#define SCREEN_HEIGHT       240
+#define DISPLAY_BRIGHTNESS_DEFAULT 10 // appliqué au boot ET position initiale du Slider
+
+// --- RÉSEAU ---
+#define WIFI_HOSTNAME           "Dashboard"
+#define WIFI_SSID               "VOTRE_SSID"        // À RENSEIGNER
+#define WIFI_PASSWORD           "VOTRE_MDP_WIFI"    // À RENSEIGNER
+#define WIFI_CHECK_INTERVAL_MS  5000
+
+// --- SYNOLOGY — hôte du broker MQTT ET du bridge IA ---
+// Changer l'IP ICI et nulle part ailleurs : MQTT_BROKER et les cinq URL du
+// bridge en découlent par concaténation.
+#define NAS_HOST            "192.168.1.1"           // À RENSEIGNER (IP du NAS)
+#define AI_BRIDGE_PORT      8090
+
+// CFG_STR permet de concaténer AI_BRIDGE_PORT dans un littéral tout en le
+// gardant numérique (le double niveau est nécessaire pour que la macro soit
+// développée avant d'être transformée en chaîne).
+#define CFG_STR_(x)         #x
+#define CFG_STR(x)          CFG_STR_(x)
+#define AI_BRIDGE_URL_BASE  "http://" NAS_HOST ":" CFG_STR(AI_BRIDGE_PORT)
+
+// --- SERVEUR HTTP ---
+#define HTTP_SERVER_PORT    80
+
+// --- VERROU OTA ---
+#define OTA_PASSWORD        "VOTRE_MDP_OTA"         // À RENSEIGNER (ou laisser vide pour OTA sans mot de passe)
+
+// --- MQTT ---
+#define MQTT_BROKER         NAS_HOST
+#define MQTT_PORT           1883
+#define MQTT_CLIENT_ID      "esp32-dashboard"
+#define MQTT_RECONNECT_MS   5000
+#define MQTT_KEEPALIVE_S    60
+#define MQTT_BUFFER_SIZE    4096    // Taille du buffer de réception PubSubClient
+
+// --- TOPICS MQTT — NAS Synology DS1522+ ---
+#define TOPIC_NAS_CPU               "nas/cpu"               // int %
+#define TOPIC_NAS_RAM               "nas/ram"               // int %
+#define TOPIC_NAS_TEMP              "nas/temp"              // int °C
+#define TOPIC_NAS_NET_RX            "nas/net_rx"            // int KB/s
+#define TOPIC_NAS_NET_TX            "nas/net_tx"            // int KB/s
+#define TOPIC_NAS_VOL1_USED_PCT     "nas/volume1_used_pct"  // int %
+#define TOPIC_NAS_VOL1_STATUS       "nas/volume1_status"    // string
+#define TOPIC_NAS_VOL1_READ_MBS     "nas/volume1_read_mbs"  // float MB/s
+#define TOPIC_NAS_VOL1_WRITE_MBS    "nas/volume1_write_mbs" // float MB/s
+#define TOPIC_NAS_DISKS             "nas/disks"             // JSON array
+#define TOPIC_NAS_DOWNLOADS         "nas/downloads"         // JSON array top10
+#define TOPIC_NAS_CONNECTIONS       "nas/connections"       // JSON array
+
+// --- TOPICS MQTT — Freebox v8 ---
+#define TOPIC_FB_RATE_DOWN          "freebox/rate_down"         // float Mb/s
+#define TOPIC_FB_RATE_UP            "freebox/rate_up"           // float Mb/s
+#define TOPIC_FB_BANDWIDTH_DOWN     "freebox/bandwidth_down"    // int Mb/s
+#define TOPIC_FB_BANDWIDTH_UP       "freebox/bandwidth_up"      // int Mb/s
+#define TOPIC_FB_STATE              "freebox/state"             // string
+#define TOPIC_FB_IPV4               "freebox/ipv4"              // string
+#define TOPIC_FB_DEVICES_ACTIVE     "freebox/devices_active"    // int
+#define TOPIC_FB_DEVICES_TOTAL      "freebox/devices_total"     // int
+#define TOPIC_FB_DEVICES            "freebox/devices"           // JSON array
+
+// --- TOPICS MQTT — ESP32 ---
+#define TOPIC_ESP_STATUS    "esp32/status"  // "online" / "offline"
+#define TOPIC_ESP_CMD       "esp32/cmd"     // commandes entrantes
+//
+// Liste de référence des commandes esp32/cmd (aussi acceptées en
+// POST /cmd). Traitées par mqtt_handle_esp_cmd() — tenir cette liste à jour
+// en même temps que lui.
+//   page:home | nas | freebox | ai | sysinfo
+//   page:disks | downloads | connections | devices
+//   brightness:1-100     luminosité de l'écran
+//   volume:0-100         volume du haut-parleur
+//   mem                  état mémoire dans le journal
+//   saverec              envoie la dernière capture vocale au NAS
+//   spy                  trace les 24 prochaines invalidations LVGL
+//   tree                 arbre des widgets de l'écran actif
+//   reboot
+
+// --- TOPICS MQTT — IA ---
+#define TOPIC_AI_STATUS      "ai/status"       // idle|listening|thinking|speaking|error
+#define TOPIC_AI_ASK         "ai/ask"          // question à poser
+#define TOPIC_AI_TRANSCRIPT  "ai/transcript"   // texte de la question (STT)
+#define TOPIC_AI_ANSWER      "ai/answer"       // texte de la réponse (LLM)
+
+// --- AUDIO ---
+#define AUDIO_SAMPLE_RATE           16000 // référence unique (audio_manager en fait son SAMPLE_RATE)
+#define AUDIO_RECORD_MAX_SECONDS    8     // durée max d'une question
+#define AUDIO_VOLUME_DEFAULT        75    // appliqué au boot ET position initiale du Slider
+#define AUDIO_MIN_SPEECH_MS  250          // Durée de PAROLE minimale sinon Whisper hallucine
+
+// --- IA — bridge NAS (cf. NAS_HOST / AI_BRIDGE_PORT) ---
+#define AI_BRIDGE_URL          AI_BRIDGE_URL_BASE "/ask"        // audio -> STT/LLM/TTS
+#define AI_BRIDGE_TEXT_URL     AI_BRIDGE_URL_BASE "/ask_text"   // texte -> LLM/TTS
+#define AI_BRIDGE_SAY_URL      AI_BRIDGE_URL_BASE "/say"        // TTS seul
+#define AI_BRIDGE_RECORD_URL   AI_BRIDGE_URL_BASE "/record"     // archive une capture en WAV
+#define AI_BRIDGE_UI_URL       AI_BRIDGE_URL_BASE "/"           // page de paramétrage
+#define AI_NOT_HEARD_TEXT      "Je n'ai pas entendu."           // Prononcé quand la capture est silencieuse
+#define AI_SCREEN_RETURN_MS    5000                             // Retour auto à l'écran précédent après inactivité
+
+// ===========================
+// === DEFINITIONS DE PINS ===
+// ===========================
+
+// --- Écran ILI9341 (SPI) — déclarés par principe : c'est User_Setup.h qui les initialise ---
+#define TFT_CS      10
+#define TFT_DC      46
+#define TFT_SCLK    12
+#define TFT_MOSI    11
+#define TFT_MISO    13
+#define TFT_RST     -1      // RESET câblé au RST de la carte, pas à un GPIO
+#define TFT_BL      45      // rétroéclairage (HIGH = allumé)
+
+// --- Touch FT6336G (I2C) ---
+#define TOUCH_SDA   16
+#define TOUCH_SCL   15
+#define TOUCH_RST   18
+#define TOUCH_INT   17
+#define TOUCH_ADDR  0x38
+
+// --- Audio ES8311 (I2S) ---
+#define I2S_MCLK    4
+#define I2S_BCLK    5
+#define I2S_DIN     6       // micro → ESP32
+#define I2S_LRC     7
+#define I2S_DOUT    8       // ESP32 → HP
+#define AMP_ENABLE  1       // LOW = ampli activé
+
+// --- LED RGB WS2812B ---
+#define LED_RGB_PIN 42
+#define LED_RGB_NUM 1
+
+// --- SD Card (SDIO) ---
+#define SD_CLK      38
+#define SD_CMD      40
+#define SD_D0       39
+#define SD_D1       41
+#define SD_D2       48
+#define SD_D3       47
+
+// --- Divers ---
+#define BAT_ADC     9       // tension batterie (ADC)
+#define BOOT_BTN    0       // bouton BOOT
