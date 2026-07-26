@@ -238,6 +238,19 @@ pio device monitor -b 115200
 
 ## Écrans disponibles
 
+<table>
+  <tr>
+    <td align="center"><img src="docs/img/home.jpg" width="250"><br><sub><b>Accueil</b> — navigation + sliders</sub></td>
+    <td align="center"><img src="docs/img/nas.jpg" width="250"><br><sub><b>NAS</b> — CPU/RAM, débits, graphiques</sub></td>
+    <td align="center"><img src="docs/img/freebox.jpg" width="250"><br><sub><b>Freebox</b> — débit, appareils, graphique</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/img/nas-disques.jpg" width="250"><br><sub><b>NAS – Disques</b> — table SMART/statut/T°</sub></td>
+    <td align="center"><img src="docs/img/sysinfo.jpg" width="250"><br><sub><b>SysInfo</b> — diagnostics (page 1/6)</sub></td>
+    <td align="center"><img src="docs/img/companion.jpg" width="250"><br><sub><b>Companion IA</b> — assistant vocal « Jarvis »</sub></td>
+  </tr>
+</table>
+
 | Écran          | Description                                              |
 |----------------|----------------------------------------------------------|
 | Home           | Navigation principale + sliders luminosité backlight et volume |
