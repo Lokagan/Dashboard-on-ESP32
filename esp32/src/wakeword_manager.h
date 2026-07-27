@@ -2,7 +2,6 @@
 
 // ============================================================
 // WAKEWORD_MANAGER.H — Détection du mot-clé "Jarvis" (ESP_SR / WakeNet)
-//
 // Utilise le wrapper Arduino officiel ESP_SR (core 3.x) : la détection tourne
 // dans la tâche interne d'ESP_SR (réglée par Espressif), qui lit le micro sur
 // le bus I2S partagé fourni par audio_manager (audio_get_i2s()). Sur détection,

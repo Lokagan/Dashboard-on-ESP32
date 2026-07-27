@@ -1,8 +1,7 @@
 #pragma once
 
 // ============================================================
-// TOUCH_MANAGER.H
-// Gestion du tactile FT6336G (I2C)
+// TOUCH_MANAGER.H — Gestion du tactile FT6336G (I2C)
 // ============================================================
 
 // ---- BIBLIOTHÈQUES ----

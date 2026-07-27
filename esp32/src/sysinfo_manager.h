@@ -1,8 +1,8 @@
 #pragma once
 
 // ============================================================
-// SYSINFO_MANAGER.H
-// Écran de diagnostic système — dessiné dans un TFT_eSprite hors-écran
+// SYSINFO_MANAGER.H — Écran de diagnostic système
+// dessiné dans un TFT_eSprite hors-écran
 // puis affiché via un lv_canvas, comme un écran LVGL normal (tap pour
 // naviguer/sortir). Non bloquant : display_show_sysinfo() affiche la
 // première page et rend la main immédiatement.

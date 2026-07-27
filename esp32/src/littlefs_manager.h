@@ -1,9 +1,8 @@
 #pragma once
 
 // ============================================================
-// LITTLEFS_MANAGER.H
-// Montage LittleFS + accès fichiers génériques, utilisés par
-// audio_manager, http_manager, sysinfo_manager et ai_companion.
+// LITTLEFS_MANAGER.H — Montage LittleFS + accès fichiers génériques
+// utilisés par audio_manager, http_manager, sysinfo_manager et ai_companion.
 // ============================================================
 
 // ---- BIBLIOTHÈQUES ----

@@ -1,8 +1,7 @@
 #pragma once
 
 // ============================================================
-// LOG_MANAGER.H
-// Journal circulaire des logs, survivant à un reset logiciel/crash
+// LOG_MANAGER.H — Journal circulaire des logs, survivant à un reset logiciel/crash
 // (RTC_NOINIT_ATTR — pas à une coupure d'alimentation) : sert de
 // remplacement à Serial.print*/println/printf dans tout le firmware.
 // Exposé côté web via GET /serial (cf. http_manager.cpp).
