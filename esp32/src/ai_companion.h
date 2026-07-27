@@ -1,7 +1,7 @@
 #pragma once
 
 // ============================================================
-// AI_COMPANION.H
+// AI_COMPANION.H — sprites/avatar de l'écran Companion (ui_ScreenAI)
 // ============================================================
 
 // ---- RESSOURCES LOCALES ----
