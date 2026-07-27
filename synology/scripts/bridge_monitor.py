@@ -139,7 +139,7 @@ mqtt_client = mqtt.Client(callback_api_version=CallbackAPIVersion.VERSION2, clie
 app = Flask(__name__)
 
 # ----------------------------------------------------------------
-# HELPERS
+# API LOCALES
 # ----------------------------------------------------------------
 
 # --- Audio — normalisation du niveau avant STT ---
@@ -279,10 +279,6 @@ def _conversation_remember(question: str, answer: str):
     conversation.append({"role": "user", "content": question})
     conversation.append({"role": "assistant", "content": answer})
     _last_exchange_ts = time.monotonic()
-
-# ----------------------------------------------------------------
-# API LOCALES
-# ----------------------------------------------------------------
 
 # --- 1. STT — Groq Whisper ---
 def stt_transcribe(pcm_bytes: bytes) -> str | None:
@@ -472,6 +468,10 @@ def tts_speak(text: str, voice: str | None = None) -> bytes | None:
     except Exception as e:
         print(f"[Bridge] Erreur TTS : {e}")
         return None
+
+# ----------------------------------------------------------------
+# ROUTES HTTP
+# ----------------------------------------------------------------
 
 # --- Endpoint HTTP — appelé par ai_manager.cpp (_ask_bridge) ---
 @app.route("/ask", methods=["POST"])

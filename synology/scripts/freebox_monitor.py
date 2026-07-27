@@ -55,7 +55,7 @@ session_token = None
 _TYPE_ORDER = {"ETH": 0, "5G": 1, "2.4G": 2}
 
 # ----------------------------------------------------------------
-# HELPERS
+# API LOCALES
 # ----------------------------------------------------------------
 
 # --- Classement des appareils — type abrégé + ordre d'affichage ---
@@ -89,10 +89,6 @@ def _fmt_bytes(n):
 
 def headers():
     return {"X-Fbx-App-Auth": session_token}
-
-# ----------------------------------------------------------------
-# API LOCALES
-# ----------------------------------------------------------------
 
 # --- Authentification ---
 def freebox_login():
