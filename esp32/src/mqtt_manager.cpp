@@ -31,7 +31,7 @@ static char* _payload_buf = nullptr;
 // Aides des messages d'erreur de esp32/cmd.
 // ⚠️ Doivent tenir dans LOG_LINE_LEN (100 OCTETS, dont 10 d'horodatage)
 static const char* CMD_HELP      = "page:X, brightness, volume, loop:on|off, mem, saverec, spy, tree, reboot";
-static const char* CMD_HELP_PAGE = "home, nas, freebox, ai, sysinfo[1-6], disks, downloads, connections, devices";
+static const char* CMD_HELP_PAGE = "home, nas, freebox, ai, sysinfo[1-6], disks, downloads, connections, devices, activity";
 
 // ---- SÉQUENCE D'INITIALISATION ----
 
@@ -40,7 +40,7 @@ static const char* CMD_HELP_PAGE = "home, nas, freebox, ai, sysinfo[1-6], disks,
 static void _mqtt_reconnect() {
     if (!wifi_is_connected()) return;
 
-    log_line("[MQTT] Connexion à %s:%d...", MQTT_BROKER, MQTT_PORT);
+    log_line("[MQTT] Connexion à %s:%d en cours...", MQTT_BROKER, MQTT_PORT);
 
     if (!_mqtt.connect(MQTT_CLIENT_ID)) {
         log_line("[MQTT] Echec, rc=%d - retry dans %ds", _mqtt.state(), MQTT_RECONNECT_MS / 1000);
@@ -172,6 +172,7 @@ void mqtt_handle_esp_cmd(const char* cmd) {
         else if (strcmp(arg, "downloads")   == 0) display_show_TABLE_NAS_DOWNLOADS(nullptr);
         else if (strcmp(arg, "connections") == 0) display_show_TABLE_NAS_CONNECTIONS(nullptr);
         else if (strcmp(arg, "devices")     == 0) display_show_TABLE_FBX_DEVICES(nullptr);
+        else if (strcmp(arg, "activity")    == 0) display_show_TABLE_FBX_ACTIVITY(nullptr);
         else {
             log_line("[MQTT] page inconnue : %s", arg);
             log_line("[MQTT] pages : %s", CMD_HELP_PAGE);

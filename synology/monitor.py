@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts"))
 import nas_monitor
 import freebox_monitor
 import bridge_monitor
+import activity_monitor
 
 # ----------------------------------------------------------------
 # OBJETS GLOBAUX
@@ -27,7 +28,8 @@ import bridge_monitor
 MONITORS = [
     nas_monitor.main,
     freebox_monitor.main,
-    bridge_monitor.main
+    bridge_monitor.main,
+    activity_monitor.main
 ]
 
 # ----------------------------------------------------------------

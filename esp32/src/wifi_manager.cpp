@@ -41,7 +41,7 @@ void wifi_connect() {
     // OTA/MQTT après une période d'inactivité réseau.
     WiFi.setSleep(false);
     WiFi.setHostname(WIFI_HOSTNAME);
-    log_line("[WiFi] Connexion à %s (en arrière-plan)...", WIFI_SSID);
+    log_line("[WiFi] Connexion à %s en cours...", WIFI_SSID);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 }
 

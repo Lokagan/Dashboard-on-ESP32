@@ -130,6 +130,7 @@ typedef enum {
     TABLE_NAS_DOWNLOADS,
     TABLE_NAS_CONNECTIONS,
     TABLE_FBX_DEVICES,
+    TABLE_FBX_ACTIVITY,
     TABLE_SOURCE_COUNT
 } TableSource;
 
@@ -414,6 +415,7 @@ static void _table_setup_structure(TableSource source, const char* title,
         lv_label_set_text(_title_label, title);
     } else {
         _title_label = lv_label_create(ui_ScreenTable);
+        lv_obj_set_style_text_font(_title_label, &ui_font_Font12, LV_PART_MAIN); 
         lv_obj_set_x(_title_label, 5);
         lv_obj_set_y(_title_label, 8);
         lv_label_set_text(_title_label, title);
@@ -537,6 +539,15 @@ static void _table_load(TableSource source) {
             const char* keys[] = {"name", "type", "rx_rate", "tx_rate", "ip", "phy_rx_rate"};
             _table_setup_structure(TABLE_FBX_DEVICES, "Freebox - Devices", hdrs, w, 6, true);
             _table_fill(_json_fbx_devices, keys, 6);
+            break;
+        }
+        case TABLE_FBX_ACTIVITY: {
+            // Qui fait quoi : réutilise freebox/devices (enrichi d'un champ 'service' par le bridge).
+            const char* hdrs[] = {"Appareil", "Service", "DL", "UP"};
+            const uint16_t w[] = {110, 100, 55, 55};
+            const char* keys[] = {"name", "service", "rx_rate", "tx_rate"};
+            _table_setup_structure(TABLE_FBX_ACTIVITY, "Freebox - Activité Réseau", hdrs, w, 4, false);
+            _table_fill(_json_fbx_devices, keys, 4);
             break;
         }
         default: break;
@@ -884,6 +895,11 @@ void display_show_TABLE_FBX_DEVICES(lv_event_t* e) {
     _table_load(TABLE_FBX_DEVICES);
 }
 
+void display_show_TABLE_FBX_ACTIVITY(lv_event_t* e) {
+    _table_back_screen = ui_ScreenFreebox;
+    _table_load(TABLE_FBX_ACTIVITY);
+}
+
 } // extern "C"
 
 // --- NAS ---
@@ -1062,8 +1078,10 @@ void display_update_fb_devices_total(int count) {
 
 void display_update_fb_devices(const char* json) {
     _json_buf_set(_json_fbx_devices, JSON_FBX_DEVICES_SIZE, json);
-    if (lv_scr_act() == ui_ScreenTable && _table_source == TABLE_FBX_DEVICES)
-        _table_load(TABLE_FBX_DEVICES);
+    // Les deux tables lisent freebox/devices : rafraîchir celle qui est affichée.
+    if (lv_scr_act() == ui_ScreenTable &&
+        (_table_source == TABLE_FBX_DEVICES || _table_source == TABLE_FBX_ACTIVITY))
+        _table_load(_table_source);
 }
 
 // --- Utils ---

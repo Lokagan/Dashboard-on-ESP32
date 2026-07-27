@@ -115,6 +115,10 @@
 #define AI_NOT_HEARD_TEXT      "Je n'ai pas entendu."           // Prononcé quand la capture est silencieuse
 #define AI_SCREEN_RETURN_MS    5000                             // Retour auto à l'écran précédent après inactivité
 
+// --- Activite reseau / config Services — page NAS (AdGuard, cf. NAS_HOST) ---
+#define ACTIVITY_UI_PORT       8091
+#define ACTIVITY_UI_URL        "http://" NAS_HOST ":" CFG_STR(ACTIVITY_UI_PORT) "/"
+
 // ===========================
 // === DEFINITIONS DE PINS ===
 // ===========================

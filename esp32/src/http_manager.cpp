@@ -165,11 +165,12 @@ const char HTML_CONTENT[] PROGMEM = R"=====(
             <button class="cmd-btn" onclick="sendCmd('page:home')">Accueil</button>
             <button class="cmd-btn" onclick="sendCmd('page:ai')">Assistant IA</button>
             <button class="cmd-btn" onclick="sendCmd('page:nas')">NAS</button>
-            <button class="cmd-btn" onclick="sendCmd('page:disks')">NAS-Disques</button>
-            <button class="cmd-btn" onclick="sendCmd('page:downloads')">NAS-Téléchargements</button>
-            <button class="cmd-btn" onclick="sendCmd('page:connections')">NAS-Connexions</button>
+            <button class="cmd-btn" onclick="sendCmd('page:disks')">NAS - Disques</button>
+            <button class="cmd-btn" onclick="sendCmd('page:downloads')">NAS - Téléchargements</button>
+            <button class="cmd-btn" onclick="sendCmd('page:connections')">NAS - Connexions</button>
             <button class="cmd-btn" onclick="sendCmd('page:freebox')">Freebox</button>
-            <button class="cmd-btn" onclick="sendCmd('page:devices')">Freebox-Appareils</button>
+            <button class="cmd-btn" onclick="sendCmd('page:devices')">Freebox - Appareils</button>
+            <button class="cmd-btn" onclick="sendCmd('page:activity')">Freebox - Activité Réseau</button>
         </div>
 
         <div class="cmd-section">
@@ -185,7 +186,11 @@ const char HTML_CONTENT[] PROGMEM = R"=====(
                        onchange="sendCmd('volume:' + this.value)">
             </div>
             <a class="cmd-btn" target="_blank" rel="noopener"
-               href=")=====" AI_BRIDGE_UI_URL R"=====(">⚙ Config NAS (voix, contexte, LLM)</a>
+               href=")=====" AI_BRIDGE_UI_URL R"=====(">⚙ Config IA côté NAS (voix, contexte, LLM)</a>
+            <a class="cmd-btn" target="_blank" rel="noopener"
+               href=")=====" ACTIVITY_UI_URL R"=====(">⚙ Config Services côté NAS</a>
+            <a class="cmd-btn" target="_blank" rel="noopener"
+               href=")=====" ACTIVITY_ADGUARD_URL R"=====(">⚙ Config ADGUARD côté NAS</a>
         </div>
 
         <div class="cmd-section">

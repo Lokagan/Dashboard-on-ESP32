@@ -1,0 +1,516 @@
+{
+  "_comment": "Mapping domaine -> service. 'match' = sous-chaines cherchees dans le domaine (priorite aux services avant le bruit). Etends la liste a mesure que tu vois passer des domaines inconnus dans la page. Rechargement a chaud : pas besoin de relancer le conteneur.",
+  "categories": [
+    {
+      "name": "Vidéo / TV",
+      "icon": "🎬"
+    },
+    {
+      "name": "Jeux",
+      "icon": "🎮"
+    },
+    {
+      "name": "Musique",
+      "icon": "🎵"
+    },
+    {
+      "name": "Social / Messagerie",
+      "icon": "💬"
+    },
+    {
+      "name": "IA",
+      "icon": "🤖"
+    },
+    {
+      "name": "Domotique",
+      "icon": "🏠"
+    },
+    {
+      "name": "Web / Système",
+      "icon": "🌐"
+    },
+    {
+      "name": "À trier",
+      "icon": "📁"
+    }
+  ],
+  "services": [
+    {
+      "name": "YouTube",
+      "icon": "📺",
+      "category": "Vidéo / TV",
+      "match": [
+        "youtube",
+        "googlevideo",
+        "ytimg",
+        "youtu.be",
+        "yt3."
+      ]
+    },
+    {
+      "name": "Netflix",
+      "icon": "🎬",
+      "category": "Vidéo / TV",
+      "match": [
+        "netflix",
+        "nflxvideo",
+        "nflximg",
+        "nflxext",
+        "nflxso"
+      ]
+    },
+    {
+      "name": "Twitch",
+      "icon": "🟣",
+      "category": "Vidéo / TV",
+      "match": [
+        "twitch",
+        "ttvnw",
+        "jtvnw"
+      ]
+    },
+    {
+      "name": "Disney+",
+      "icon": "🏰",
+      "category": "Vidéo / TV",
+      "match": [
+        "disneyplus",
+        "disney-plus",
+        "dssott",
+        "bamgrid"
+      ]
+    },
+    {
+      "name": "Prime Video",
+      "icon": "📦",
+      "category": "Vidéo / TV",
+      "match": [
+        "primevideo",
+        "aiv-cdn",
+        "aiv-delivery",
+        "amazonvideo"
+      ]
+    },
+    {
+      "name": "Crunchyroll",
+      "icon": "🍥",
+      "category": "Vidéo / TV",
+      "match": [
+        "crunchyroll",
+        "vrv.co"
+      ]
+    },
+    {
+      "name": "Molotov / TV",
+      "icon": "📺",
+      "category": "Vidéo / TV",
+      "match": [
+        "molotov"
+      ]
+    },
+    {
+      "name": "Canal+",
+      "icon": "🎬",
+      "category": "Vidéo / TV",
+      "match": [
+        "canalplus",
+        "canal-plus",
+        "mycanal"
+      ]
+    },
+    {
+      "name": "France TV",
+      "icon": "📺",
+      "category": "Vidéo / TV",
+      "match": [
+        "francetv",
+        "france.tv",
+        "ftvcdn"
+      ]
+    },
+    {
+      "name": "TF1",
+      "icon": "📺",
+      "category": "Vidéo / TV",
+      "match": [
+        "tf1",
+        "mytf1",
+        "wat.tv"
+      ]
+    },
+    {
+      "name": "M6 / 6play",
+      "icon": "📺",
+      "category": "Vidéo / TV",
+      "match": [
+        "6play",
+        "m6web",
+        "m6.fr"
+      ]
+    },
+    {
+      "name": "Spotify",
+      "icon": "🎵",
+      "category": "Musique",
+      "match": [
+        "spotify",
+        "scdn.co",
+        "spotifycdn"
+      ]
+    },
+    {
+      "name": "Deezer",
+      "icon": "🎧",
+      "category": "Musique",
+      "match": [
+        "deezer",
+        "dzcdn"
+      ]
+    },
+    {
+      "name": "TikTok",
+      "icon": "🎬",
+      "category": "Social / Messagerie",
+      "match": [
+        "tiktok",
+        "tiktokcdn",
+        "tiktokv",
+        "byteoversea",
+        "musical.ly",
+        "ibyteimg"
+      ]
+    },
+    {
+      "name": "Instagram",
+      "icon": "📷",
+      "category": "Social / Messagerie",
+      "match": [
+        "instagram",
+        "cdninstagram"
+      ]
+    },
+    {
+      "name": "Facebook",
+      "icon": "👥",
+      "category": "Social / Messagerie",
+      "match": [
+        "facebook",
+        "fbcdn",
+        "fbsbx"
+      ]
+    },
+    {
+      "name": "WhatsApp",
+      "icon": "💬",
+      "category": "Social / Messagerie",
+      "match": [
+        "whatsapp"
+      ]
+    },
+    {
+      "name": "Snapchat",
+      "icon": "👻",
+      "category": "Social / Messagerie",
+      "match": [
+        "snapchat",
+        "sc-cdn",
+        "snap-dev"
+      ]
+    },
+    {
+      "name": "Discord",
+      "icon": "🎧",
+      "category": "Social / Messagerie",
+      "match": [
+        "discord",
+        "discordapp"
+      ]
+    },
+    {
+      "name": "Reddit",
+      "icon": "🤖",
+      "category": "Social / Messagerie",
+      "match": [
+        "reddit",
+        "redditmedia",
+        "redd.it"
+      ]
+    },
+    {
+      "name": "Twitter / X",
+      "icon": "🐦",
+      "category": "Social / Messagerie",
+      "match": [
+        "twitter",
+        "twimg",
+        "t.co",
+        "x.com"
+      ]
+    },
+    {
+      "name": "Fortnite / Epic",
+      "icon": "🎮",
+      "category": "Jeux",
+      "match": [
+        "epicgames",
+        "fortnite",
+        "unrealengine"
+      ]
+    },
+    {
+      "name": "Steam",
+      "icon": "🎮",
+      "category": "Jeux",
+      "match": [
+        "steampowered",
+        "steamcontent",
+        "steamstatic",
+        "steamcommunity",
+        "steamserver"
+      ]
+    },
+    {
+      "name": "PlayStation",
+      "icon": "🎮",
+      "category": "Jeux",
+      "match": [
+        "playstation",
+        "sonyentertainmentnetwork"
+      ]
+    },
+    {
+      "name": "Xbox",
+      "icon": "🎮",
+      "category": "Jeux",
+      "match": [
+        "xboxlive",
+        "xbox.com",
+        "xboxservices"
+      ]
+    },
+    {
+      "name": "Nintendo",
+      "icon": "🎮",
+      "category": "Jeux",
+      "match": [
+        "nintendo",
+        "nintendowifi",
+        "nintendoswitch"
+      ]
+    },
+    {
+      "name": "Roblox",
+      "icon": "🎮",
+      "category": "Jeux",
+      "match": [
+        "roblox",
+        "rbxcdn"
+      ]
+    },
+    {
+      "name": "Riot / LoL",
+      "icon": "🎮",
+      "category": "Jeux",
+      "match": [
+        "riotgames",
+        "leagueoflegends"
+      ]
+    },
+    {
+      "name": "Minecraft",
+      "icon": "🎮",
+      "category": "Jeux",
+      "match": [
+        "minecraft",
+        "mojang"
+      ]
+    },
+    {
+      "name": "ChatGPT",
+      "icon": "🤖",
+      "category": "IA",
+      "match": [
+        "openai",
+        "chatgpt",
+        "oaistatic",
+        "oaiusercontent"
+      ]
+    },
+    {
+      "name": "Claude",
+      "icon": "🤖",
+      "category": "IA",
+      "match": [
+        "claude.ai",
+        "anthropic"
+      ]
+    },
+    {
+      "name": "Gemini",
+      "icon": "🤖",
+      "category": "IA",
+      "match": [
+        "gemini.google",
+        "bard.google"
+      ]
+    },
+    {
+      "name": "Apple",
+      "icon": "🍎",
+      "category": "Web / Système",
+      "match": [
+        "apple.com",
+        "icloud",
+        "mzstatic",
+        "appleid",
+        "cdn-apple",
+        "aaplimg"
+      ]
+    },
+    {
+      "name": "Microsoft",
+      "icon": "🪟",
+      "category": "Web / Système",
+      "match": [
+        "microsoft",
+        "windowsupdate",
+        "office.com",
+        "office365",
+        "live.com",
+        "msftncsi",
+        "msedge"
+      ]
+    },
+    {
+      "name": "Google",
+      "icon": "🔎",
+      "category": "Web / Système",
+      "match": [
+        "google.com",
+        "google.fr",
+        "gmail"
+      ]
+    },
+    {
+      "name": "Amazon",
+      "icon": "🚚",
+      "category": "Web / Système",
+      "match": [
+        "amazon.fr",
+        "amazon.com",
+        "media-amazon"
+      ]
+    },
+    {
+      "name": "Tuya",
+      "icon": "🏠",
+      "category": "Domotique",
+      "match": [
+        "tuya",
+        "plantsio"
+      ]
+    },
+    {
+      "name": "Free",
+      "icon": "🌐",
+      "category": "Web / Système",
+      "match": [
+        "proxad"
+      ]
+    },
+    {
+      "name": "Vscode",
+      "icon": "🌐",
+      "category": "Web / Système",
+      "match": [
+        "vscode-cdn",
+        "visualstudio"
+      ]
+    },
+    {
+      "name": "Genshin Impact",
+      "icon": "🌐",
+      "category": "Jeux",
+      "match": [
+        "hoyoverse",
+        "yuanshen"
+      ]
+    },
+    {
+      "name": "Capcut",
+      "icon": "🎬",
+      "category": "Vidéo / TV",
+      "match": [
+        "capcutapi"
+      ]
+    },
+    {
+      "name": "DuckDuckGo",
+      "icon": "🌐",
+      "category": "Web / Système",
+      "match": [
+        "duckduckgo"
+      ]
+    },
+    {
+      "name": "Github",
+      "icon": "🌐",
+      "category": "Web / Système",
+      "match": [
+        "github"
+      ]
+    }
+  ],
+  "noise": [
+    "1e100.net",
+    "_dns.resolver.arpa",
+    "adjust.com",
+    "akadns",
+    "akamai",
+    "akamaized",
+    "amazonaws.com",
+    "amplitude",
+    "app-measurement",
+    "appsflyer",
+    "azureedge",
+    "bblmw.com",
+    "branch.io",
+    "bugsnag",
+    "cloudflare.com",
+    "cloudfront.net",
+    "connectivitycheck",
+    "cookielaw",
+    "crashlytics",
+    "criteo",
+    "doubleclick",
+    "edgekey",
+    "edgesuite",
+    "fastly.net",
+    "fbcdn.net",
+    "firebase",
+    "firebaseinstallations",
+    "firebaseremoteconfig",
+    "ggpht.com",
+    "google-analytics",
+    "googleadservices",
+    "googleapis.com",
+    "googlesyndication",
+    "googletagmanager",
+    "gstatic.com",
+    "gvt1.com",
+    "gvt2.com",
+    "in-addr.arpa",
+    "ip6.arpa",
+    "mixpanel",
+    "msftconnecttest",
+    "ntp.org",
+    "onetrust",
+    "pool.ntp",
+    "scorecardresearch",
+    "segment.com",
+    "segment.io",
+    "sentry",
+    "sharethis",
+    "time.apple"
+  ]
+}

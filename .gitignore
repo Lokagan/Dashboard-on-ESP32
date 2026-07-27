@@ -9,6 +9,7 @@ esp32/.pio/
 esp32/.vscode/
 esp32/src/config.h
 esp32/squareline/ui/backup/
+esp32/*.local.ini
 
 # Services NAS — secrets + état runtime local + captures vocales
 synology/monitor.env

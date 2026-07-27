@@ -63,6 +63,7 @@ void display_show_TABLE_NAS_DISKS(lv_event_t* e);
 void display_show_TABLE_NAS_DOWNLOADS(lv_event_t* e);
 void display_show_TABLE_NAS_CONNECTIONS(lv_event_t* e);
 void display_show_TABLE_FBX_DEVICES(lv_event_t* e);
+void display_show_TABLE_FBX_ACTIVITY(lv_event_t* e);
 
 #ifdef __cplusplus
 }

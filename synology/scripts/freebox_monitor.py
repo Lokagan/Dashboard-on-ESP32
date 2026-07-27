@@ -27,6 +27,7 @@ import traceback
 import requests
 import paho.mqtt.client as mqtt
 from paho.mqtt.enums import CallbackAPIVersion
+import activity_monitor
 
 # ----------------------------------------------------------------
 # OBJETS GLOBAUX
@@ -192,10 +193,16 @@ def get_devices():
     # (ETH, 5G, 2.4G, reste), puis IP. Sur les octets/s BRUTS (avant formatage).
     active_list.sort(key=lambda d: (-d["rx_rate"], -d["tx_rate"],
                                     _type_order(d["type"]), d["ip"]))
-    # Puis on formate les débits avec unité (le tri a déjà eu lieu sur le brut).
+    # Puis on formate les débits avec unité (le tri a déjà eu lieu sur le brut) et on
+    # ajoute le service courant (DNS) par IP — un souci côté DNS ne casse jamais la liste.
+    try:
+        svc = activity_monitor.current_service_names()
+    except Exception:
+        svc = {}
     for d in active_list:
         d["rx_rate"] = _fmt_bytes(d["rx_rate"]) + "/s"
         d["tx_rate"] = _fmt_bytes(d["tx_rate"]) + "/s"
+        d["service"] = svc.get(d["ip"], "")
 
     return len(active_list), len(devices), active_list
 
