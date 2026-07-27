@@ -463,11 +463,8 @@ PAGE = """<!doctype html>
   .ago .live { color: #3fb950; }
   .empty { color: #7d8590; padding: 40px; text-align: center; grid-column: 1 / -1; }
 
-  /* Pied de page FIXE (hauteur constante) : ne bouge plus quand la grille grandit/rapetisse. */
-  #view-activity { padding-bottom: 170px; }
-  .unknowns { position: fixed; left: 0; right: 0; bottom: 0; z-index: 40; height: 150px;
-              box-sizing: border-box; overflow: auto; background: #0d1117;
-              border-top: 1px solid #21262d; padding: 10px 22px; }
+  /* « Domaines inconnus » vit maintenant dans son propre onglet (bloc normal, plus de footer fixe). */
+  .unknowns { margin-bottom: 22px; }
   .unknowns h2 { font-size: 13px; letter-spacing: 1px; text-transform: uppercase; color: #adbac7;
                  margin: 0 0 10px; }
   .unknowns h2 span { text-transform: none; letter-spacing: 0; color: #6e7681; font-weight: 400; font-size: 12px; }
@@ -490,11 +487,17 @@ PAGE = """<!doctype html>
   .mhead { font-size: 15px; font-weight: 600; margin-bottom: 14px; }
   .mhead .mdom { font-family: ui-monospace, monospace; color: #7ee787; }
   .mlabel { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: #7d8590; margin: 12px 0 6px; }
-  .catalog { display: flex; flex-wrap: wrap; gap: 6px; }
+  .catalog { display: flex; flex-direction: column; gap: 6px; }
   .cchip { font-size: 13px; background: #21262d; border: 1px solid #30363d; border-radius: 20px;
            padding: 4px 11px; cursor: pointer; }
   .cchip:hover { border-color: #4c9aff; }
   .cchip.sel { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  .mcat { border: 1px solid #21262d; border-radius: 8px; overflow: hidden; }
+  .mcat > summary { cursor: pointer; padding: 8px 11px; font-size: 13px; color: #c9d1d9;
+                    background: #1b2029; user-select: none; }
+  .mcat > summary:hover { background: #21262d; }
+  .mcat .mcatcount { color: #7d8590; font-size: 12px; }
+  .mcatchips { display: flex; flex-wrap: wrap; gap: 6px; padding: 9px 11px; }
   .mgrid { display: flex; gap: 8px; }
   .mgrid input { flex: 1; }
   .modalbox input { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3;
@@ -573,7 +576,8 @@ PAGE = """<!doctype html>
   <h1>ACTIVITE RESEAU</h1>
   <nav class="tabs">
     <button class="tab active" data-view="activity">Activité</button>
-    <button class="tab" data-view="services">Paramètres</button>
+    <button class="tab" data-view="services">Domaines Connus</button>
+    <button class="tab" data-view="unknowns">Domaines Inconnus</button>
   </nav>
   <span id="status">connexion...</span>
 </header>
@@ -598,10 +602,6 @@ PAGE = """<!doctype html>
   </div>
 </section>
 <main id="grid"></main>
-<section class="unknowns">
-  <h2>Domaines inconnus <span>&mdash; les plus frequents, a mapper dans services.json</span></h2>
-  <div id="unknownlist" class="ulist"></div>
-</section>
 </div><!-- /view-activity -->
 <div id="view-services" class="hidden">
   <div class="editor">
@@ -616,12 +616,22 @@ PAGE = """<!doctype html>
       </div>
     </div>
     <div id="svc_list" class="svclist"></div>
-    <details class="noisebox">
-      <summary>Bruit masque (avance)</summary>
+  </div>
+</div>
+<div id="view-unknowns" class="hidden">
+  <div class="editor">
+    <section class="unknowns">
+      <h2>À classer <span>&mdash; les plus fréquents, clique pour mapper vers un service</span></h2>
+      <div id="unknownlist" class="ulist"></div>
+    </section>
+    <details class="noisebox" open>
+      <summary>Bruit masqué &mdash; domaines cachés (télémétrie, CDN…)</summary>
       <div id="noise_chips" class="chips2"></div>
       <div class="addnoise">
-        <input id="noise_input" placeholder="ajouter un fragment a masquer (ex. doubleclick)">
+        <input id="noise_input" placeholder="ajouter un fragment à masquer (ex. doubleclick)">
         <button id="noise_add">+ ajouter</button>
+        <button id="noise_save">Enregistrer</button>
+        <span id="noise_msg"></span>
       </div>
     </details>
   </div>
@@ -631,7 +641,7 @@ PAGE = """<!doctype html>
     <div class="mhead">Mapper <span id="m_domain" class="mdom"></span></div>
     <div class="mlabel">Rattacher a un service existant</div>
     <div id="m_catalog" class="catalog"></div>
-    <div class="mlabel">&hellip; ou creer un service</div>
+    <div class="mlabel">&hellip; ou créer un service <span style="text-transform:none;letter-spacing:0;opacity:.7;">(rangé dans « À trier »)</span></div>
     <div class="mgrid">
       <input id="m_name" type="text" placeholder="Nom du service">
       <input id="m_icon" type="text" class="micon" placeholder="&#127760;" maxlength="8">
@@ -810,23 +820,50 @@ PAGE = """<!doctype html>
     if (!chip) return;
     const s = modalCatalog[+chip.dataset.i];
     mName.value = s.name; mIcon.value = s.icon || '';
-    [...mCatalog.children].forEach(c => c.classList.remove('sel'));
+    mCatalog.querySelectorAll('.cchip').forEach(c => c.classList.remove('sel'));
     chip.classList.add('sel');
   });
   mName.addEventListener('input', () =>
-    [...mCatalog.children].forEach(c => c.classList.remove('sel')));
+    mCatalog.querySelectorAll('.cchip').forEach(c => c.classList.remove('sel')));
 
+  // « À trier » toujours en dernier dans une liste de catégories.
+  function _catOrder(cats){
+    const o = cats.slice();
+    const i = o.indexOf('À trier');
+    if (i !== -1){ o.splice(i, 1); o.push('À trier'); }
+    return o;
+  }
+  // Services groupés par catégorie en accordéons repliés (chips avec data-i = index dans
+  // modalCatalog → le handler de clic ne change pas). CATEGORIES/CAT_ICON viennent de l'éditeur.
+  function _renderCatalog(){
+    const groups = new Map();
+    modalCatalog.forEach((s, i) => {
+      const c = s.category || 'À trier';
+      if (!groups.has(c)) groups.set(c, []);
+      groups.get(c).push(i);
+    });
+    const base = CATEGORIES.slice();
+    for (const c of groups.keys()) if (!base.includes(c)) base.push(c);
+    const html = _catOrder(base).filter(c => groups.has(c)).map(cat => {
+      const chips = groups.get(cat).map(i =>
+        '<span class="cchip" data-i="'+i+'">'+(modalCatalog[i].icon || '')+' '+esc(modalCatalog[i].name)+'</span>').join('');
+      return '<details class="mcat"><summary>'+(CAT_ICON[cat] || '📁')+' '+esc(cat)
+           + ' <span class="mcatcount">'+groups.get(cat).length+'</span></summary>'
+           + '<div class="mcatchips">'+chips+'</div></details>';
+    }).join('');
+    mCatalog.innerHTML = html || '<span class="uempty">Aucun service pour le moment.</span>';
+  }
   function _fillModal(domain, name, match){
     mDomain.textContent = domain;
     mName.value = name; mIcon.value = '🌐'; mMatch.value = match; mMsg.textContent = '';
-    mCatalog.innerHTML = modalCatalog.map((s, i) =>
-      '<span class="cchip" data-i="'+i+'">'+(s.icon || '')+' '+esc(s.name)+'</span>').join('')
-      || '<span class="uempty">Aucun service pour le moment.</span>';
+    _renderCatalog();
     modal.classList.remove('hidden');
     mName.focus(); mName.select();
   }
-  function openModal(domain, name, match){         // onglet Activite -> POST /map
-    modalMode = 'map'; modalCatalog = catalog;
+  async function openModal(domain, name, match){   // depuis « Domaines Inconnus » (À classer) -> POST /map
+    modalMode = 'map';
+    await ensureEditor();                           // garantit services + catégories chargés (pour le groupage)
+    modalCatalog = editServices;
     _fillModal(domain, name, match);
   }
   function openModalNoise(fragment, idx){          // onglet Services -> en memoire
@@ -865,12 +902,18 @@ PAGE = """<!doctype html>
 
   // --- Onglets ---
   const views = { activity: document.getElementById('view-activity'),
-                  services: document.getElementById('view-services') };
+                  services: document.getElementById('view-services'),
+                  unknowns: document.getElementById('view-unknowns') };
+  // L'éditeur (services + bruit) est partagé par les onglets « Domaines Connus » et
+  // « Domaines Inconnus » : chargé UNE fois, re-rendu ensuite sans re-fetch (sinon on
+  // écraserait les modifs non enregistrées en changeant d'onglet).
+  let editorLoaded = false;
+  async function ensureEditor(){ if (editorLoaded) { renderEditor(); return; } editorLoaded = true; await loadEditor(); }
   document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
     document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
     t.classList.add('active');
     for (const k in views) views[k].classList.toggle('hidden', k !== t.dataset.view);
-    if (t.dataset.view === 'services') loadEditor();
+    if (t.dataset.view === 'services' || t.dataset.view === 'unknowns') ensureEditor();
   }));
 
   // --- Editeur services.json (onglet Services) ---
@@ -939,8 +982,9 @@ PAGE = """<!doctype html>
       if (!groups.has(c)) groups.set(c, []);
       groups.get(c).push(i);
     });
-    const order = CATEGORIES.slice();   // toutes les catégories (même vides) puis extras éventuels
+    let order = CATEGORIES.slice();     // catégories définies puis extras éventuels
     for (const c of groups.keys()) if (!order.includes(c)) order.push(c);
+    order = _catOrder(order);           // « À trier » toujours en dernier
 
     svcList.innerHTML = order.map(cat => {
       const idxs = groups.get(cat) || [];
@@ -1032,15 +1076,20 @@ PAGE = """<!doctype html>
     renderEditor();
   });
   document.getElementById('svc_reload').addEventListener('click', loadEditor);
-  document.getElementById('svc_save').addEventListener('click', async () => {
-    svcMsg.textContent = 'enregistrement...';
+  // Un seul enregistrement pour tout (services + bruit + catégories, payload atomique) —
+  // déclenchable depuis « Domaines Connus » (svc_save) ET « Domaines Inconnus » (noise_save).
+  async function saveEditor(msgEl){
+    msgEl.textContent = 'enregistrement...';
     try {
       const r = await fetch('services', { method: 'POST', headers: { 'Content-Type': 'application/json' },
                                           body: JSON.stringify({ services: editServices, noise: editNoise, categories: categoriesList }) });
       const d = await r.json();
-      svcMsg.textContent = d.ok ? ('Enregistre : '+d.services+' services, '+d.noise+' bruits') : (d.error || 'Erreur');
-    } catch (e) { svcMsg.textContent = 'Erreur reseau'; }
-  });
+      msgEl.textContent = d.ok ? ('Enregistre : '+d.services+' services, '+d.noise+' bruits') : (d.error || 'Erreur');
+    } catch (e) { msgEl.textContent = 'Erreur reseau'; }
+  }
+  document.getElementById('svc_save').addEventListener('click', () => saveEditor(svcMsg));
+  document.getElementById('noise_save').addEventListener('click', () =>
+    saveEditor(document.getElementById('noise_msg')));
 
   async function tick(){
     try {
