@@ -2,7 +2,6 @@
 """
 activity_monitor.py — Vue « qui fait quoi » du réseau, à partir des logs DNS d'AdGuard Home
 
-Prototype de la colonne « service » du futur écran ESP32 « Activité réseau ».
 Un serveur DNS ne voit QUE les résolutions de noms (jamais les débits) : cette page
 lit le Query Log d'AGH (API REST), mappe chaque domaine vers un service lisible
 (services.json), masque le bruit (télémétrie/CDN), groupe par appareil et rafraîchit
@@ -20,7 +19,7 @@ Endpoints HTTP :
 """
 
 # ----------------------------------------------------------------
-# RESSOURCES BIBLIOTHÈQUES
+# BIBLIOTHÈQUES
 # ----------------------------------------------------------------
 import os
 import re

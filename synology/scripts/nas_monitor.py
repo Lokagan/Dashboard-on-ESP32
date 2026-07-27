@@ -22,7 +22,7 @@ vide. Sans cette distinction, une erreur transitoire vidait l'affichage.
 """
 
 # ----------------------------------------------------------------
-# RESSOURCES BIBLIOTHÈQUES
+# BIBLIOTHÈQUES
 # ----------------------------------------------------------------
 import os
 import sys

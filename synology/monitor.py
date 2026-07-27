@@ -6,7 +6,7 @@ Pour ajouter un script : importer et ajouter à la liste MONITORS.
 """
 
 # ----------------------------------------------------------------
-# RESSOURCES BIBLIOTHÈQUES
+# BIBLIOTHÈQUES
 # ----------------------------------------------------------------
 import threading
 import sys

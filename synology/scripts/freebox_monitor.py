@@ -16,7 +16,7 @@ Topics MQTT publiés :
 """
 
 # ----------------------------------------------------------------
-# RESSOURCES BIBLIOTHÈQUES
+# BIBLIOTHÈQUES
 # ----------------------------------------------------------------
 import os
 import json

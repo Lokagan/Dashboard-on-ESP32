@@ -30,7 +30,7 @@ Le firmware ESP32 (ai_manager.cpp) publie déjà lui-même "listening",
 """
 
 # ----------------------------------------------------------------
-# RESSOURCES BIBLIOTHÈQUES
+# BIBLIOTHÈQUES
 # ----------------------------------------------------------------
 import os
 import io
