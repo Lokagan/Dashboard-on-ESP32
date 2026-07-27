@@ -116,14 +116,17 @@ Publiés par : `synology/scripts/freebox_monitor.py` — métriques légères to
     "phy_rx_rate": 866,
     "phy_tx_rate": 866,
     "rx_rate": "14 B/s",
-    "tx_rate": "3 B/s"
+    "tx_rate": "3 B/s",
+    "service": "YouTube"
   }
 ]
 ```
 
 `rx_rate`/`tx_rate` = débits **instantanés**, déjà formatés avec unité par le bridge (ex. « 5.0 MB/s ») ; le tri se fait côté bridge sur les octets/s **bruts** avant formatage. (`phy_rx_rate`/`phy_tx_rate` restent des entiers Mbps = débit de liaison Wi-Fi, pas le trafic.)
 
-Affiché dans le tableau **Freebox - Devices** : colonnes Nom, Type (ETH / 5G / 2.4G), RX, TX (chaînes avec unité). IP accessible en scrollant horizontalement. Trié par **débit down instantané décroissant, puis up, puis type** (ETH → 5G → 2.4G), puis IP.
+`service` = nom du service en cours pour cet appareil (« YouTube », « Steam »…), **ajouté par enrichissement** : `freebox_monitor.py` le récupère en mémoire auprès de `activity_monitor.py` (mapping DNS AdGuard → service via `services.json`) — **pas de nouveau topic MQTT**. Chaîne vide si l'appareil n'a émis aucune requête DNS identifiable, ou si AdGuard n'est pas configuré (`AGH_*` de `monitor.env`).
+
+Affiché dans le tableau **Freebox - Devices** : colonnes Nom, Type (ETH / 5G / 2.4G), RX, TX (chaînes avec unité). IP accessible en scrollant horizontalement. Trié par **débit down instantané décroissant, puis up, puis type** (ETH → 5G → 2.4G), puis IP. Le champ `service` alimente en plus le tableau **Activité réseau** (colonnes Appareil, Service, DL, UP).
 
 ---
 

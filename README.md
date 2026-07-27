@@ -80,19 +80,22 @@ ESP32-S3 (ES3C28P)
 
 ```
 dashboard-projet/
+├── README.md                        # Ce fichier
+├── LICENSE                          # Licence GPLv3
+├── .gitignore                       # Exclut les secrets (config.h, monitor.env, ota.local.ini…)
 ├── 3D/
 │   ├── Arrière.3mf                # Impression 3D — coque arrière
 │   ├── Avant.3mf                  # Impression 3D — coque avant
 │   └── ES3C28P case.f3d           # Source Fusion 360
 ├── docs/
+│   ├── img/                       # Captures d'écran (galerie du README)
 │   ├── ES3C28P.md                 # Pinout complet du module
 │   ├── ES3C28P_ES2N28P_Specification_V1.0.pdf
 │   ├── ES8311.user.Guide.pdf      # Datasheet codec audio
 │   ├── mqtt_topics.md             # Description des topics MQTT
-│   ├── README.md                  # Ce fichier
 │   └── Scripts_tests.md           # Notes de tests et scripts utiles
 ├── esp32/
-│   ├── platformio.ini             # Configuration PlatformIO
+│   ├── platformio.ini             # Configuration PlatformIO (extra_configs → ota.local.ini)
 │   ├── squareline/
 │   │   └── ui/                    # Sources générées Squareline Studio 1.6.1
 │   │       ├── screens/           # Un fichier .c/.h par écran
@@ -106,7 +109,7 @@ dashboard-projet/
 │   │       ├── ui.c / .h
 │   │       └── dashboard.slp      # Projet Squareline Studio
 │   └── src/
-│       ├── config.h               # Configuration centrale (pins, MQTT, WiFi)
+│       ├── config.h.example       # Modèle de config (config.h réel = hors dépôt, secrets WiFi/OTA)
 │       ├── lv_conf.h              # Configuration LVGL
 │       ├── User_Setup.h           # Configuration TFT_eSPI (référence)
 │       ├── main.cpp
@@ -126,7 +129,7 @@ dashboard-projet/
 └── synology/
     ├── Dockerfile               # Dépendances Python (installées à l'image)
     ├── compose.yaml             # Container Python central + Mosquitto
-    ├── monitor.env              # Variables structurelles + secrets (broker, hôtes, credentials)
+    ├── monitor.env.example     # Modèle (monitor.env réel = hors dépôt : secrets NAS/Freebox/Groq/AdGuard)
     ├── monitor.py               # Orchestrateur des scripts
     ├── scripts/
     │   ├── nas_monitor.py       # Collecte métriques NAS DSM
@@ -134,7 +137,9 @@ dashboard-projet/
     │   ├── bridge_monitor.py    # Assistant IA — bridge HTTP (STT/LLM/TTS + météo/actus)
     │   ├── bridge_defaults.json # Défauts des paramètres IA (versionné)
     │   ├── bridge_settings.json # Overrides sauvés par la page config (hors repo)
-    │   └── freebox_get_token.py # Générateur d'API_TOKEN Freebox
+    │   ├── freebox_get_token.py # Générateur d'API_TOKEN Freebox
+    │   ├── activity_monitor.py  # Activité réseau — lit le journal DNS AdGuard (port 8091)
+    │   └── services.json        # Mapping domaine → service (éditable à chaud)
     └── mosquitto/
         ├── mosquitto.conf       # conf serveur MQTT
         ├── data/                # data serveur MQTT (inutilisés)
@@ -179,6 +184,8 @@ cp synology/monitor.env.example synology/monitor.env
 
 Les paramètres de l'assistant IA (voix, modèle, personnalité, météo, actualités) ne sont **pas** dans `monitor.env` : leurs défauts vivent dans `synology/scripts/bridge_defaults.json` (versionné, sans secret) et se modifient à chaud depuis la page `http://<NAS>:8090/`. `bridge_settings.json` garde les réglages sauvés côté NAS (hors dépôt).
 
+L'écran **« Activité réseau »** (voir plus bas) s'appuie sur [AdGuard Home](https://adguard.com/adguard-home.html) installé sur le NAS comme résolveur DNS du réseau : renseignez `AGH_URL` / `AGH_USER` / `AGH_PASS` dans `monitor.env`. Le service `activity_monitor.py` interroge son journal DNS (page servie sur le port `8091`). Sans AdGuard, tout le reste fonctionne — seule la colonne « service » reste vide.
+
 ### 2. Lancer le container de monitoring
 
 ```bash
@@ -203,10 +210,11 @@ Mettez à jour `esp32/src/config.h` avec :
 - l'adresse du NAS (`NAS_HOST`)
 - l'URL du bridge IA (`AI_BRIDGE_URL` pour l'audio, `AI_BRIDGE_TEXT_URL` pour le texte) — pointe vers le service HTTP `bridge_monitor.py` (STT/LLM/TTS), déployé avec le reste du monitoring sur le NAS (`synology/`, port 8090)
 
-Le mot de passe OTA (`upload_flags` de `platformio.ini`) n'est **pas** versionné : exportez-le avant un téléversement WiFi, avec la même valeur que `OTA_PASSWORD` de `config.h` :
+Le mot de passe OTA n'est **pas** versionné dans `platformio.ini`. Créez un fichier `esp32/ota.local.ini` (ignoré par git, fusionné automatiquement par PlatformIO via `extra_configs`) avec la même valeur que `OTA_PASSWORD` de `config.h` :
 
-```bash
-export OTA_PASSWORD=votre_mdp_ota
+```ini
+[env:esp32s3]
+upload_flags = --auth=votre_mdp_ota
 ```
 
 Compilez et téléversez sur l'ESP32 depuis PlatformIO.
@@ -234,6 +242,8 @@ pio device monitor -b 115200
 
 **Upload OTA par défaut** — `platformio.ini` est configuré avec `upload_protocol = espota` et `upload_port = Dashboard.local` : `pio run -t upload` téléverse donc par WiFi (ArduinoOTA) une fois le firmware initial flashé, sans câble. Pour le tout premier flash (ou en cas de perte de connexion WiFi), basculez temporairement sur `upload_protocol = esptool` avec le port série USB-C.
 
+**Mot de passe OTA** — non versionné : à placer dans `esp32/ota.local.ini` (gitignoré, fusionné via `extra_configs = *.local.ini`). Sans ce fichier, l'upload OTA se fait sans authentification. ⚠️ La variable `${sysenv.OTA_PASSWORD}` ne convient pas : lancé depuis l'interface VS Code, PlatformIO n'hérite pas des `export` du shell.
+
 ---
 
 ## Écrans disponibles
@@ -257,6 +267,7 @@ pio device monitor -b 115200
 | NAS            | CPU, RAM, temp, réseau, volume — graphiques temps réel   |
 | Freebox        | Débit, IP publique, compteur appareils — graphique       |
 | Table          | Tableau générique : disques / downloads / connexions / appareils Freebox |
+| Activité réseau | Par appareil : service en cours (YouTube, Steam…) + débits DL/UP — via le journal DNS d'AdGuard Home |
 | Companion (IA) | Assistant vocal : bouton Rec (enregistrement), bouton Play (rejouer la dernière réponse), sous-titres question/réponse |
 | SysInfo        | Diagnostic système (6 pages, écran LVGL via canvas + TFT_eSprite) : identité chip, mémoire, réseau, tâches FreeRTOS, partitions flash, système de fichiers LittleFS |
 
@@ -281,12 +292,17 @@ Accessible depuis le bouton dédié sur l'écran Home. Fonctionnement :
 - **Intentions** : le bridge détecte la **météo** (Open-Meteo ; actuel / demain / semaine) et les **actualités** (flux RSS) par mots-clés et les injecte au LLM. Réglages à chaud sur `http://<NAS>:8090/` (voix, personnalité, modèle, météo, actualités).
 - États affichés : `idle`, `listening`, `thinking`, `speaking`, `error` — publiés sur `ai/status`.
 
+### Écran Activité réseau (AdGuard Home)
+
+Table « qui fait quoi sur le réseau » : pour chaque appareil, le **service** en cours (YouTube, Steam, Discord…) et les débits **DL/UP**. Le service est déduit du **journal DNS d'[AdGuard Home](https://adguard.com/adguard-home.html)** installé sur le NAS comme résolveur DNS du réseau : `synology/scripts/activity_monitor.py` mappe `domaine → service` (`services.json`, éditable à chaud depuis sa page web) et enrichit le topic `freebox/devices` d'un champ `service` par IP — **aucun nouveau topic MQTT**. Page web dédiée sur `http://<NAS>:8091/` (bouton « ⚙ Config Services » de l'interface web ESP32). Déployez le bridge NAS **avant** de flasher, sinon la colonne « service » reste vide (sans casse).
+
 ### Interface web ESP32
 
 Accessible sur `http://<IP_ESP32>/` (port 80, `http_manager.cpp`, tâche FreeRTOS dédiée). Trois panneaux :
 - **Fichiers** : liste, téléchargement et suppression des fichiers LittleFS (`/list`, `/data`, `/delete`)
 - **Logs** : dernières lignes du journal circulaire (`GET /serial`), tenu par `log_manager.cpp` en remplacement de `Serial.print*` — survit à un reset logiciel/crash (pas à une coupure d'alimentation)
 - **Commandes ESP32** : mêmes commandes que le topic MQTT `esp32/cmd` (navigation, luminosité, volume, reboot), envoyées via `POST /cmd`
+- **Config NAS** : boutons « ⚙ Config IA » (`http://<NAS>:8090/`) et « ⚙ Config Services / AdGuard » (`http://<NAS>:8091/`) ouvrant les pages de paramétrage servies par le NAS
 
 ---
 
@@ -317,7 +333,7 @@ Pour plus de détails, voir `docs/mqtt_topics.md`.
 - **Backlight** : géré via `analogWrite()` après l'init TFT_eSPI. Ne pas initialiser LEDC manuellement — TFT_eSPI s'en charge en interne.
 - **`%f` dans LVGL** : newlib nano ne supporte pas `printf` flottant. Tous les affichages de flottants passent par des macros `FLOAT_INT` / `FLOAT_DEC` dans `display_manager.cpp`.
 - Si vous changez `FREEBOX_API`, vérifiez la compatibilité avec la version de l'API Freebox.
-- **Mot de passe OTA** : `ota_manager.cpp` ne fixe un mot de passe OTA que si `OTA_PASSWORD` est défini dans `config.h`. Sur un réseau non maîtrisé, définissez-le (et exportez la même valeur via la variable d'environnement `OTA_PASSWORD` pour le téléversement) afin d'éviter qu'un tiers ne flashe l'ESP32 via WiFi.
+- **Mot de passe OTA** : `ota_manager.cpp` ne fixe un mot de passe OTA que si `OTA_PASSWORD` est défini dans `config.h`. Sur un réseau non maîtrisé, définissez-le, et reportez la même valeur dans `esp32/ota.local.ini` (gitignoré) pour le téléversement OTA, afin d'éviter qu'un tiers ne flashe l'ESP32 via WiFi.
 - **Secrets** : `config.h` (`WIFI_SSID`, `WIFI_PASSWORD`, `OTA_PASSWORD`) et `synology/monitor.env` (mots de passe NAS, clé Groq, token Freebox) contiennent des secrets en clair. Ces deux fichiers sont **exclus du dépôt** par le `.gitignore` racine (avec `scripts/bridge_settings.json` et `scripts/captures/`) ; seuls les modèles `config.h.example` et `monitor.env.example` sont versionnés. Ne jamais forcer l'ajout des vrais fichiers (`git add -f`).
 - **Audio** : le rendu (tons, fanfare, lecture) et l'enregistrement micro tournent sur une tâche FreeRTOS dédiée au cœur 1, afin de ne jamais bloquer `loop()` (LVGL, MQTT, touch, OTA) sur le cœur 0.
 - **`esp32/status`** : publié en `"online"` uniquement à la connexion MQTT — aucun Last Will Testament n'est configuré (`_mqtt.connect(MQTT_CLIENT_ID)` sans argument LWT dans `mqtt_manager.cpp`), donc le broker ne publiera jamais automatiquement `"offline"` en cas de déconnexion brutale de l'ESP32.
