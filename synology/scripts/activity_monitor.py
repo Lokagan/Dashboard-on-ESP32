@@ -255,16 +255,31 @@ def _registrable(d):
         return ".".join(parts[-3:])
     return ".".join(parts[-2:]) if len(parts) >= 2 else d
 
+# --- Un token matche-t-il un domaine, en respectant les frontières de labels ? ---
+# Token AVEC point (t.co, amazon.fr, pool.ntp) = suite de labels ENTIERS : doit s'aligner sur
+#   des labels -> ".token." dans ".domaine." — rejette riot.com/dropbox.com pour "t.co"/"x.com".
+# Token SANS point (youtube, fbcdn) = fragment DANS un label (ne traverse jamais un point).
+# Les points de tête/fin du token sont ignorés ("yt3." se comporte comme "yt3").
+def _match_token(token, wrapped, labels):
+    t = token.strip(".")
+    if not t:
+        return False
+    if "." in t:
+        return ("." + t + ".") in wrapped
+    return any(t in lab for lab in labels)
+
 # --- Classe un domaine : ("service"|"unknown", label, icone) ou ("noise", None, None) ---
 # Priorité aux services AVANT le bruit : googlevideo.com = YouTube, pas du bruit Google.
 def _classify(domain, services, noise):
     d = domain.lower().rstrip(".")
+    wrapped = "." + d + "."
+    labels = d.split(".")
     for svc in services:
         for token in svc.get("match") or []:
-            if token and token in d:
+            if _match_token(token, wrapped, labels):
                 return "service", svc["name"], svc.get("icon", "")
     for n in noise:
-        if n in d:
+        if _match_token(n, wrapped, labels):
             return "noise", None, None
     return "unknown", _registrable(d), "\U0001F310"    # 🌐
 
@@ -649,7 +664,7 @@ PAGE = """<!doctype html>
     <div id="m_picks" class="picks"></div>
     <div class="mmatch"><label>match</label><input id="m_match" type="text"></div>
     <div id="m_msg" class="mmsg"></div>
-    <div class="mactions"><button id="m_cancel">Annuler</button><button id="m_ok" class="primary">Mapper</button></div>
+    <div class="mactions"><button id="m_noise" style="margin-right:auto;">Mettre en bruit</button><button id="m_cancel">Annuler</button><button id="m_ok" class="primary">Mapper</button></div>
   </div>
 </div>
 <script>
@@ -856,6 +871,9 @@ PAGE = """<!doctype html>
   function _fillModal(domain, name, match){
     mDomain.textContent = domain;
     mName.value = name; mIcon.value = '🌐'; mMatch.value = match; mMsg.textContent = '';
+    // « Mettre en bruit » n'a de sens que depuis un domaine inconnu (mode map), pas quand
+    // on reclasse un fragment déjà dans le bruit vers un service (mode noise).
+    document.getElementById('m_noise').style.display = (modalMode === 'map') ? '' : 'none';
     _renderCatalog();
     modal.classList.remove('hidden');
     mName.focus(); mName.select();
@@ -874,6 +892,14 @@ PAGE = """<!doctype html>
 
   document.getElementById('m_cancel').addEventListener('click', closeModal);
   modal.addEventListener('click', e => { if (e.target === modal) closeModal(); });
+  // « Mettre en bruit » : ajoute le fragment (match) au bruit, persiste, ferme. Le domaine
+  // quitte « À classer » au tick suivant (reclassé en bruit côté serveur).
+  document.getElementById('m_noise').addEventListener('click', async () => {
+    const frag = mMatch.value.trim().toLowerCase();
+    if (!frag){ mMsg.textContent = 'Fragment (match) requis.'; return; }
+    if (!editNoise.includes(frag)) editNoise.push(frag);
+    if (await saveEditor(mMsg)) closeModal();
+  });
   document.getElementById('m_ok').addEventListener('click', async () => {
     const name = mName.value.trim(), icon = mIcon.value.trim(), match = mMatch.value.trim();
     if (!name || !match){ mMsg.textContent = 'Nom et match requis.'; return; }
@@ -890,7 +916,15 @@ PAGE = """<!doctype html>
       const r = await fetch('map', { method: 'POST', headers: { 'Content-Type': 'application/json' },
                                      body: JSON.stringify({ name, icon, match }) });
       const d = await r.json();
-      if (d.ok) closeModal(); else mMsg.textContent = d.error || 'Erreur';
+      if (d.ok){
+        // Garder editServices en phase avec ce que /map vient d'écrire côté serveur,
+        // sinon l'onglet « Domaines Connus » (chargé une seule fois) resterait périmé.
+        const frag = match.toLowerCase();
+        const svc = editServices.find(s => s.name.toLowerCase() === name.toLowerCase());
+        if (svc){ if (!svc.match.includes(frag)) svc.match.push(frag); if (icon && !svc.icon) svc.icon = icon; }
+        else editServices.unshift({ name: name, icon: icon || '🌐', category: 'À trier', match: [frag] });
+        closeModal();
+      } else mMsg.textContent = d.error || 'Erreur';
     } catch (e) { mMsg.textContent = 'Erreur reseau'; }
   });
 
@@ -1085,7 +1119,8 @@ PAGE = """<!doctype html>
                                           body: JSON.stringify({ services: editServices, noise: editNoise, categories: categoriesList }) });
       const d = await r.json();
       msgEl.textContent = d.ok ? ('Enregistre : '+d.services+' services, '+d.noise+' bruits') : (d.error || 'Erreur');
-    } catch (e) { msgEl.textContent = 'Erreur reseau'; }
+      return d.ok;
+    } catch (e) { msgEl.textContent = 'Erreur reseau'; return false; }
   }
   document.getElementById('svc_save').addEventListener('click', () => saveEditor(svcMsg));
   document.getElementById('noise_save').addEventListener('click', () =>
