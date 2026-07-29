@@ -384,31 +384,43 @@ def maybe_fetch_news(text: str) -> str | None:
         return None
     # Titres collectés PAR flux, puis ENTRELACÉS (round-robin) : sans ça, un flux
     # volumineux en tête (franceinfo, 35 titres) remplit à lui seul news_count et
-    # un flux local ajouté après (Angoulême) n'apparaît JAMAIS. L'entrelacement
+    # un flux local ajouté après (Charente Libre) n'apparaît JAMAIS. L'entrelacement
     # garantit que chaque flux contribue.
-    per_feed: list[list[str]] = []
+    per_feed: list[tuple[str, list[str]]] = []          # (source, titres)
     for url in _settings["news_feeds"]:
         try:
             r = requests.get(url, timeout=10, headers={"User-Agent": "dashboard-bridge"})
             r.raise_for_status()
             root = ElementTree.fromstring(r.content)
-            per_feed.append([t for it in root.iter("item")          # RSS 2.0
-                             if (t := (it.findtext("title") or "").strip())])
+            # Le <title> du <channel> nomme la source (« Charente Libre… ») : sans
+            # lui, un titre local n'est PAS rattachable à sa région par le LLM.
+            src = (root.findtext("channel/title") or url).strip()
+            per_feed.append((src, [t for it in root.iter("item")     # RSS 2.0
+                                   if (t := (it.findtext("title") or "").strip())]))
         except Exception as e:
             print(f"[Bridge] Erreur actualités ({url}) : {e}")
-    titles: list[str] = []
-    for rank in range(max((len(f) for f in per_feed), default=0)):
-        for feed in per_feed:
-            if rank < len(feed) and feed[rank] not in titles:
-                titles.append(feed[rank])
-        if len(titles) >= _settings["news_count"]:
+    # Round-robin plafonné à news_count, la SOURCE conservée pour regrouper ensuite.
+    picked: list[tuple[str, str]] = []                  # (source, titre)
+    seen: set[str] = set()
+    for rank in range(max((len(t) for _, t in per_feed), default=0)):
+        for src, feed in per_feed:
+            if rank < len(feed) and feed[rank] not in seen:
+                seen.add(feed[rank])
+                picked.append((src, feed[rank]))
+        if len(picked) >= _settings["news_count"]:
             break
-    titles = titles[:_settings["news_count"]]
-    if not titles:
+    picked = picked[:_settings["news_count"]]
+    if not picked:
         return None
-    lignes = "\n".join(f"{i}. {t}" for i, t in enumerate(titles, 1))
-    return ("Titres d'actualité du jour (résume à l'oral les principaux, "
-            f"sans tous les énumérer) :\n{lignes}")
+    # Regroupé par source : le LLM répond « en Charente » via la section dédiée.
+    par_src: dict[str, list[str]] = {}
+    for src, t in picked:
+        par_src.setdefault(src, []).append(t)
+    blocs = "\n".join(f"[{src}]\n" + "\n".join(f"- {t}" for t in ts)
+                      for src, ts in par_src.items())
+    return ("Titres d'actualité du jour, groupés par source (résume à l'oral les "
+            "principaux, sans tous les énumérer ; si la question cible un lieu ou "
+            "une région, privilégie la source correspondante) :\n" + blocs)
 
 # --- 3. LLM — endpoint compatible OpenAI (modulable via LLM_BASE_URL/MODEL) ---
 def llm_answer(question: str, context: str | None, max_tokens: int | None = None) -> str | None:

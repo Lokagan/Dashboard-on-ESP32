@@ -185,7 +185,7 @@ mosquitto_pub -h <BROKER> -t esp32/cmd -m "page:nas" -q 0
 
 Chaîne simple : `online`, `offline` ou `booting`.
 
-> ⚠️ En pratique, le firmware (`mqtt_manager.cpp`) ne publie actuellement que `"online"`, une seule fois juste après la connexion au broker (`_mqtt_reconnect()`). Aucun *Last Will Testament* (LWT) n'est configuré sur la connexion MQTT : `offline` n'est donc jamais publié automatiquement par le broker si l'ESP32 se déconnecte brutalement (crash, coupure secteur, perte WiFi), et `booting` n'est publié à aucun moment du code actuel.
+> En pratique (depuis la migration esp-mqtt) : le firmware publie `"online"` sur `MQTT_EVENT_CONNECTED`, et un **Last Will Testament** est configuré (`cfg.session.last_will`) — le broker publie donc `"offline"` automatiquement si l'ESP32 se déconnecte brutalement (crash, coupure secteur, perte WiFi). `booting` n'est publié à aucun moment du code actuel.
 
 ---
 
@@ -225,7 +225,7 @@ En complément de MQTT, l'ESP32 appelle directement en HTTP `bridge_monitor.py` 
 ## Notes
 
 - L'ESP32 publie `esp32/status` à la connexion MQTT.
-- `PubSubClient` est configuré avec un buffer de 4096 bytes pour absorber les gros payloads JSON (`freebox/devices` peut dépasser 2800 bytes).
+- Le client MQTT est **esp-mqtt** (natif ESP-IDF, migré depuis PubSubClient le 2026-07-28) : réception/parsing sur sa propre tâche `mqtt_task`, dispatch marshallé vers `loopTask` par une file FreeRTOS. `cfg.buffer.size = 5120` (> 4096 → alloué en PSRAM) pour absorber les gros payloads JSON (`freebox/devices` dépasse 4 Ko), réassemblés dans un tampon PSRAM.
 - Les valeurs flottantes (`rate_down`, `rate_up`, `volume1_read_mbs`, etc.) sont affichées sans `%f` (non supporté par newlib nano) via des macros de conversion entière dans `display_manager.cpp`.
 
 ## Sources

@@ -59,6 +59,7 @@ ESP32-S3 (ES3C28P)
 - ✅ Interface graphique LVGL 9.x sur ESP32 via TFT_eSPI
 - ✅ Gestion du tactile FT6336G (I2C 400KHz)
 - ✅ Écran tableau générique dynamique (disques, downloads, connexions, appareils Freebox)
+- ✅ Écran « Activité réseau » — service en cours par appareil (YouTube, Steam…) déduit du journal DNS d'AdGuard Home (`activity_monitor.py`, port 8091)
 - ✅ Réglage luminosité backlight via slider tactile
 - ✅ Réglage du volume via slider tactile
 - ✅ Audio ES8311 + I2S (sons d'interface, fanfare, test loopback micro/haut-parleur) — tourne sur une tâche FreeRTOS dédiée (cœur 1)
@@ -93,9 +94,16 @@ dashboard-projet/
 │   ├── ES3C28P_ES2N28P_Specification_V1.0.pdf
 │   ├── ES8311.user.Guide.pdf      # Datasheet codec audio
 │   ├── mqtt_topics.md             # Description des topics MQTT
-│   └── Scripts_tests.md           # Notes de tests et scripts utiles
+│   ├── Scripts_tests.md           # Notes de tests et scripts utiles
+│   └── multinet_srmodels.md       # Construction du srmodels.bin (ESP-SR / MultiNet)
 ├── esp32/
-│   ├── platformio.ini             # Configuration PlatformIO (extra_configs → ota.local.ini)
+│   ├── platformio.ini             # Configuration pioarduino (extra_configs → ota.local.ini)
+│   ├── partitions.csv             # Table de partitions 16MB (app0/app1/model/littlefs)
+│   ├── extra_scripts/             # Scripts de build (patch couleur TFT, png→bin)
+│   ├── include/                   # Headers bas niveau
+│   │   ├── lv_conf.h              # Configuration LVGL
+│   │   ├── User_Setup.h           # Configuration TFT_eSPI
+│   │   └── ILI9341_Init.h         # Séquence d'init ILI9341
 │   ├── squareline/
 │   │   └── ui/                    # Sources générées Squareline Studio 1.6.1
 │   │       ├── screens/           # Un fichier .c/.h par écran
@@ -107,11 +115,9 @@ dashboard-projet/
 │   │       ├── ui_events.c / .h   # Callbacks événements
 │   │       ├── ui_helpers.c / .h
 │   │       ├── ui.c / .h
-│   │       └── dashboard.slp      # Projet Squareline Studio
+│   │       └── dashboard.spj      # Projet Squareline Studio (+ .sll / .slp / project.info)
 │   └── src/
 │       ├── config.h.example       # Modèle de config (config.h réel = hors dépôt, secrets WiFi/OTA)
-│       ├── lv_conf.h              # Configuration LVGL
-│       ├── User_Setup.h           # Configuration TFT_eSPI (référence)
 │       ├── main.cpp
 │       ├── ai_companion.cpp / .h      # Sprites/état visuel de l'écran Companion
 │       ├── ai_manager.cpp / .h        # Assistant IA — bridge HTTP (STT/LLM/TTS), état Companion
@@ -238,7 +244,7 @@ pio device monitor -b 115200
 ```
 
 ### Notes de compilation
-**Buffer MQTT** — les payloads JSON (notamment `freebox/devices`) peuvent dépasser 2KB. `PubSubClient` est configuré avec `setBufferSize(4096)` dans `mqtt_manager.cpp`.
+**Client MQTT** — `mqtt_manager.cpp` utilise **esp-mqtt** (natif ESP-IDF, migré depuis PubSubClient en 07/2026) : réception/parsing sur sa propre tâche `mqtt_task`, hors `loop()`, le dispatch vers l'UI étant marshallé sur `loop()` par une file FreeRTOS. Les gros payloads JSON (notamment `freebox/devices`, > 4KB) sont absorbés par `cfg.buffer.size = 5120` (alloué en PSRAM) et un tampon de réassemblage PSRAM.
 
 **Upload OTA par défaut** — `platformio.ini` est configuré avec `upload_protocol = espota` et `upload_port = Dashboard.local` : `pio run -t upload` téléverse donc par WiFi (ArduinoOTA) une fois le firmware initial flashé, sans câble. Pour le tout premier flash (ou en cas de perte de connexion WiFi), basculez temporairement sur `upload_protocol = esptool` avec le port série USB-C.
 
@@ -335,8 +341,8 @@ Pour plus de détails, voir `docs/mqtt_topics.md`.
 - Si vous changez `FREEBOX_API`, vérifiez la compatibilité avec la version de l'API Freebox.
 - **Mot de passe OTA** : `ota_manager.cpp` ne fixe un mot de passe OTA que si `OTA_PASSWORD` est défini dans `config.h`. Sur un réseau non maîtrisé, définissez-le, et reportez la même valeur dans `esp32/ota.local.ini` (gitignoré) pour le téléversement OTA, afin d'éviter qu'un tiers ne flashe l'ESP32 via WiFi.
 - **Secrets** : `config.h` (`WIFI_SSID`, `WIFI_PASSWORD`, `OTA_PASSWORD`) et `synology/monitor.env` (mots de passe NAS, clé Groq, token Freebox) contiennent des secrets en clair. Ces deux fichiers sont **exclus du dépôt** par le `.gitignore` racine (avec `scripts/bridge_settings.json` et `scripts/captures/`) ; seuls les modèles `config.h.example` et `monitor.env.example` sont versionnés. Ne jamais forcer l'ajout des vrais fichiers (`git add -f`).
-- **Audio** : le rendu (tons, fanfare, lecture) et l'enregistrement micro tournent sur une tâche FreeRTOS dédiée au cœur 1, afin de ne jamais bloquer `loop()` (LVGL, MQTT, touch, OTA) sur le cœur 0.
-- **`esp32/status`** : publié en `"online"` uniquement à la connexion MQTT — aucun Last Will Testament n'est configuré (`_mqtt.connect(MQTT_CLIENT_ID)` sans argument LWT dans `mqtt_manager.cpp`), donc le broker ne publiera jamais automatiquement `"offline"` en cas de déconnexion brutale de l'ESP32.
+- **Audio** : le rendu (tons, fanfare, lecture) et l'enregistrement micro tournent sur une tâche FreeRTOS dédiée au cœur 1, afin de ne jamais bloquer `loop()` (LVGL, touch, OTA). La réception MQTT tourne elle aussi sur sa propre tâche (esp-mqtt), `loop()` ne fait qu'appliquer les valeurs déjà parsées.
+- **`esp32/status`** : publié en `"online"` sur `MQTT_EVENT_CONNECTED`, et un **Last Will Testament** est configuré (`cfg.session.last_will` dans `mqtt_manager.cpp`), donc le broker publie automatiquement `"offline"` en cas de déconnexion brutale de l'ESP32.
 - **Bridge IA** : `AI_BRIDGE_URL` / `AI_BRIDGE_TEXT_URL` pointent vers `synology/scripts/bridge_monitor.py` (serveur Flask, port 8090), lancé dans le même container Docker que `nas_monitor.py`/`freebox_monitor.py` via `monitor.py`.
 
 ---
