@@ -23,6 +23,10 @@
 #include "http_manager.h"
 #include "wakeword_manager.h"
 
+// Pile de loopTask fixée explicitement (STACK_BYTES_LOOP_TASK, = défaut Arduino).
+// ⚠️ À portée globale : la macro définit un symbole lu au démarrage.
+SET_LOOP_TASK_STACK_SIZE(STACK_BYTES_LOOP_TASK);
+
 // ---- OBJETS GLOBAUX ----
 
 // Chronométrage des managers : tous partagent loopTask, celui qui traîne
@@ -128,7 +132,7 @@ void setup() {
 
 void loop() {
     TIMED(L_WIFI, wifi_loop());
-    TIMED(L_MQTT, mqtt_loop());   // keepalive + réception (donc les display_update_*)
+    TIMED(L_MQTT, mqtt_loop());   // draine la file esp-mqtt → applique les display_update_*
     TIMED(L_HTTP, http_loop());
     TIMED_ACC(L_LVGL, display_loop());   // se logge lui-même ("[LVGL] slow")
     TIMED(L_LED, led_loop());

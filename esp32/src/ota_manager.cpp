@@ -83,7 +83,7 @@ void ota_init() {
     ArduinoOTA.begin();
 
     // Tâche dédiée sur le cœur 0, priorité 2 (au-dessus de loop).
-    xTaskCreatePinnedToCore(_ota_task, "ota_task", 4096, nullptr, 2, nullptr, 0);
+    xTaskCreatePinnedToCore(_ota_task, "ota_task", STACK_BYTES_OTA_TASK, nullptr, 2, nullptr, 0);
 
     log_line("[OTA] Pret — hostname : %s.local", WIFI_HOSTNAME);
 }

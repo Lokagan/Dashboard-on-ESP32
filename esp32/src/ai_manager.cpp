@@ -124,9 +124,12 @@ static void _apply(AiState s, const char* transcript, const char* answer) {
     bool state_changed = (s != _state);
     _state = s;
     if (transcript) {
+        // Le transcript arrive par 3 canaux (écho local, MQTT ai/transcript,
+        // en-tête X-Transcript) : ne logger qu'au CHANGEMENT évite le triple.
+        bool changed = strncmp(_transcript, transcript, sizeof(_transcript) - 1) != 0;
         strncpy(_transcript, transcript, sizeof(_transcript) - 1);
         _transcript[sizeof(_transcript) - 1] = '\0';
-        if (_transcript[0]) log_line("[AI] Question : %s", _transcript);
+        if (_transcript[0] && changed) log_line("[AI] Question : %s", _transcript);
     }
     if (answer) {
         strncpy(_answer, answer, sizeof(_answer) - 1);
@@ -363,9 +366,9 @@ void ai_init() {
     _ai_queue   = xQueueCreate(2, sizeof(AiCmdMsg));
     _post_queue = xQueueCreate(3, sizeof(_PostMsg));
     if (!_post_queue) log_line("[AI] FATAL: file d'etats non creee");
-    // Pile 6144 : à 4096 il ne restait que 1128 o après une requête vocale
-    // complète. Ne pas redescendre sans un relevé pris APRÈS un échange complet.
-    xTaskCreate(_ai_task, "ai_task", 6144, nullptr, 1, nullptr);
+    // Pile : STACK_BYTES_AI_TASK. Pic mesuré 2984 o (identique météo/actus).
+    // High-water trompeur, relever APRÈS un échange vocal complet.
+    xTaskCreate(_ai_task, "ai_task", STACK_BYTES_AI_TASK, nullptr, 1, nullptr);
     log_line("[AI] Init OK");
 }
 

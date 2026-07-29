@@ -23,6 +23,7 @@
 #include "config.h"
 #include "wifi_manager.h"
 #include "mqtt_manager.h"
+#include "wakeword_manager.h"
 #include "littlefs_manager.h"
 #include "log_manager.h"
 // Pour les tailles de _si_alloc — chaque poste vient du header de son propriétaire
@@ -110,15 +111,15 @@ static int          _si_task_y0     = 0;   // y de la 1re ligne de tâche
 static int          _si_chip_load_y = 0;   // y de la ligne "Charge" (page IDENTITE)
 static int          _si_mem_y0 = 0, _si_mem_y1 = 0;   // bornes du bloc vivant (page MEMOIRE)
 
-// Tailles de pile que NOUS fixons — TaskStatus_t ne donne que le high-water
-// (octets LIBRES), jamais la taille allouée : sans cette table, pas de
-// pourcentage possible. À tenir à jour si un xTaskCreate change.
+// Miroir des tailles de config.h (PILES FREERTOS) — TaskStatus_t ne donne que le
+// high-water, jamais la taille allouée : sans ce lookup, pas de pourcentage.
 static const struct { const char* name; uint16_t stack; } _si_stacks[] = {
-    { "loopTask",   8192 },   // CONFIG_ARDUINO_LOOP_STACK_SIZE
-    { "audio_task", 5120 },
-    { "ai_task",    6144 },
-    { "http_task",  6144 },
-    { "ota_task",   4096 },
+    { "loopTask",   STACK_BYTES_LOOP_TASK  },
+    { "audio_task", STACK_BYTES_AUDIO_TASK },
+    { "ai_task",    STACK_BYTES_AI_TASK    },
+    { "http_task",  STACK_BYTES_HTTP_TASK  },
+    { "mqtt_task",  STACK_BYTES_MQTT_TASK  },
+    { "ota_task",   STACK_BYTES_OTA_TASK   },
 };
 
 // ---- HELPERS ----
@@ -459,7 +460,9 @@ static void _si_page_chip() {
 
 // --- PAGE 2 — MEMOIRE ---
 
-// Postes d'allocation connus du firmware. La LISTE reste tenue à la main —
+// Postes d'allocation connus du firmware — buffers/objets UNIQUEMENT, PAS les
+// piles de tâches (celles-ci vivent dans _si_stacks, comptées à part dans le
+// bilan mémoire pour ne pas doublonner). La LISTE reste tenue à la main —
 // l'ESP-IDF ne sait pas dire qui a alloué quoi sans CONFIG_HEAP_TASK_TRACKING,
 // absent des libs Arduino précompilées — mais chaque TAILLE vient désormais du
 // header de son propriétaire : elles ne peuvent plus diverger sans que le
@@ -468,13 +471,16 @@ static void _si_page_chip() {
 // en PSRAM).
 static const struct { const char* label; bool internal; uint32_t bytes; } _si_alloc[] = {
     { "LVGL",     true,  LV_BUF_BYTES },                       // buffer de dessin
-    { "MQTT",     true,  MQTT_BUFFER_SIZE },                   // PubSubClient (malloc interne)
-    { "Payload",  false, MQTT_BUFFER_SIZE },                   // tampon de payload MQTT
+    { "MQTT out", true,  MQTT_OUT_BUFFER_SIZE },               // buffer d'émission (interne)
+    { "MQTT buf", false, MQTT_BUFFER_SIZE },                   // buffer RX (PSRAM via seuil ALWAYSINTERNAL)
+    { "Reassemb.",false, MQTT_BUFFER_SIZE },                   // staging PSRAM du payload
     { "Capture",  false, AUDIO_RECORD_CAPACITY_SAMPLES * 2 },  // buffer d'enregistrement
-    { "Sprite",   false, (uint32_t)SI_W * SI_H * 2 },          // sprite SysInfo
-    { "Canvas",   false, (uint32_t)SI_W * SI_H * 2 },          // canvas SysInfo
     { "Avatar",   false, COMPANION_PSRAM_BYTES },              // frames Companion
     { "JSON",     false, JSON_TOTAL_SIZE },                    // tables
+    // Sprite/Canvas EN DERNIER : alloués seulement à la 1re ouverture de SysInfo
+    // (paresseux) — le bilan mémoire les affiche à 0 tant que _si_screen == null.
+    { "Sprite",   false, (uint32_t)SI_W * SI_H * 2 },          // sprite SysInfo
+    { "Canvas",   false, (uint32_t)SI_W * SI_H * 2 },          // canvas SysInfo
 };
 
 // Partie VIVANTE de la page (les postes connus en dessous sont une table
@@ -1294,57 +1300,116 @@ static void _si_ensure_created() {
 
 // ---- API PUBLIQUES ----
 
+// Séparateur titré à largeur fixe : "=== TITRE ===…===(NN% libre)".
+static void _si_mem_sep(const char* title, unsigned pctFree) {
+    const int W = 45;
+    char line[W + 1];
+    char suffix[16];
+    int slen = snprintf(suffix, sizeof(suffix), "(%u%% libre)", pctFree);
+    int plen = snprintf(line, sizeof(line), "=== %s ", title);   // "=== RAM " + '\0'
+    if (plen < 0 || plen > W) plen = 0;
+    for (int i = plen; i < W - slen; i++) line[i] = '=';
+    if (slen > 0 && slen <= W) memcpy(line + (W - slen), suffix, slen);
+    line[W] = '\0';
+    log_line("[MEM] %s", line);
+}
+
+// Séparateur plein (fermeture).
+static void _si_mem_sep_plain() {
+    char line[46];
+    memset(line, '=', 45);
+    line[45] = '\0';
+    log_line("[MEM] %s", line);
+}
+
 // Journalise l'état mémoire (cmd "mem"). Volontairement en octets : le pire cas
 // interne se joue à quelques Ko près, l'arrondi Ko de la page MÉMOIRE est trop
-// grossier pour le suivi.
+// grossier pour le suivi. Trois sections : RAM (postes internes → bilan → marges),
+// PSRAM (postes → bilan → marge), puis le plus gros bloc contigu.
 void sysinfo_log_memory() {
-    size_t intFree  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    size_t intTotal = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
-    size_t intMin   = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+    size_t   intFree  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    size_t   intTotal = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
+    size_t   intMin   = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+    size_t   intUsed  = intTotal - intFree;
+    unsigned intPct   = intTotal ? (unsigned)(100u * intFree / intTotal) : 0;
 
-    log_line("[MEM] Interne : %u o libre / %u o (pire cas atteint %u o)",
-             (unsigned)intFree, (unsigned)intTotal, (unsigned)intMin);
+    uint32_t dmaFree = heap_caps_get_free_size(MALLOC_CAP_DMA);
+    uint32_t dmaMin  = heap_caps_get_minimum_free_size(MALLOC_CAP_DMA);
 
-    log_line("[MEM] DMA     : %u o libre (pire cas atteint %u o)",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
-             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_DMA));
+    bool     hasPs   = psramFound();
+    uint32_t psTotal = hasPs ? ESP.getPsramSize() : 0;
+    uint32_t psFree  = hasPs ? ESP.getFreePsram() : 0;
+    uint32_t psMin   = hasPs ? heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM) : 0;
+    unsigned psPct   = psTotal ? (unsigned)(100u * psFree / psTotal) : 0;
 
-    if (psramFound()) {
-        log_line("[MEM] PSRAM   : %u o libre / %u o (pire cas atteint %u o)",
-                 (unsigned)ESP.getFreePsram(), (unsigned)ESP.getPsramSize(),
-                 (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM));
-    } else {
-        log_line("[MEM] PSRAM   : NON DETECTEE");
-    }
-
-    // Un total libre confortable ne garantit pas qu'une allocation d'un seul
-    // tenant passera.
-    log_line("[MEM] Plus gros bloc libre : interne %u o | PSRAM %u o",
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
-
-    // Piles que nous dimensionnons. Le high-water n'est relevé qu'APRÈS coup :
-    // une valeur basse signifie que le pic a DÉJÀ frôlé le débordement.
-    static const char* WATCHED[] = { "loopTask", "audio_task", "ai_task", "http_task" };
+    // Comptabilité interne : intUsed = postes connus (_si_alloc internes + les 6
+    // piles _si_stacks) + ESP_SR (mesuré à part) + reste (non tracé : WiFi/lwIP,
+    // cœur, FreeRTOS…). Reste SIGNÉ : un négatif signalerait que la table sur-compte.
+    uint32_t knownInt = 0;
+    for (auto const& a : _si_alloc)  if (a.internal) knownInt += a.bytes;
+    for (auto const& s : _si_stacks)                 knownInt += s.stack;
+    uint32_t espSr = wakeword_esp_sr_internal_bytes();
+    long     reste = (long)intUsed - (long)knownInt - (long)espSr;
 
     TaskStatus_t st[SI_MAX_TASKS];
     UBaseType_t  n = uxTaskGetSystemState(st, SI_MAX_TASKS, nullptr);
 
+    // === RAM (interne) : postes → bilan → marges ===
+    _si_mem_sep("RAM", intPct);
     if (n == 0) {
-        log_line("[MEM] Piles : uxTaskGetSystemState a échoué (buffer trop petit)");
-        return;
-    }
-
-    for (const char* name : WATCHED) {
-        for (UBaseType_t i = 0; i < n; i++) {
-            if (strcmp(st[i].pcTaskName, name) != 0) continue;
-            // usStackHighWaterMark est en mots (4 o sur ESP32), pas en octets
-            unsigned freeBytes = (unsigned)st[i].usStackHighWaterMark * sizeof(StackType_t);
-            log_line("[MEM] Pile %-11s : %u o libre%s", name, freeBytes,
-                     freeBytes < 1024 ? "  <<< MARGE FAIBLE" : "");
-            break;
+        log_line("[MEM] %-20s : uxTaskGetSystemState a echoue", "Piles");
+    } else {
+        // High-water : le plus petit reste JAMAIS atteint depuis le boot (pas le
+        // libre courant) — un min bas = le pic a DÉJÀ frôlé le débordement.
+        for (auto const& s : _si_stacks) {
+            for (UBaseType_t i = 0; i < n; i++) {
+                if (strcmp(st[i].pcTaskName, s.name) != 0) continue;
+                unsigned freeBytes = (unsigned)st[i].usStackHighWaterMark * sizeof(StackType_t);
+                unsigned pct = 100u * freeBytes / s.stack;
+                log_line("[MEM] Pile %-15s : min %u / %u o (%u%% libre)%s",
+                         s.name, freeBytes, s.stack, pct,
+                         freeBytes < 1024 ? "  <<< MARGE FAIBLE" : "");
+                break;
+            }
         }
     }
+    for (auto const& a : _si_alloc)
+        if (a.internal) log_line("[MEM] Buf. %-15s : %u o", a.label, (unsigned)a.bytes);
+    log_line("[MEM] %-20s : %u o d'interne (mesure au boot)", "ESP_SR occupe", (unsigned)espSr);
+    log_line("[MEM] %-20s : %ld o", "Systeme (non trace)", reste);
+    log_line("[MEM] %-20s : %u o utilise / %u o", "   Bilan HEAP", (unsigned)intUsed, (unsigned)intTotal);
+    log_line("[MEM] %-20s : %u o libre (pire cas : %u o)", "Interne", (unsigned)intFree, (unsigned)intMin);
+    log_line("[MEM] %-20s : %u o libre (pire cas : %u o)", "DMA", (unsigned)dmaFree, (unsigned)dmaMin);
+    // Un total libre confortable ne garantit pas qu'une alloc d'un seul tenant passe.
+    log_line("[MEM] %-20s : %u o", "Plus gros bloc libre",
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+
+    // === PSRAM : postes → bilan → marge ===
+    if (hasPs) {
+        _si_mem_sep("PSRAM", psPct);
+        uint32_t knownPs = 0;
+        for (auto const& a : _si_alloc) {
+            if (a.internal) continue;
+            uint32_t bytes = a.bytes;
+            // Sprite/Canvas SysInfo : alloués seulement à la 1re ouverture — gatés
+            // pour que le reste PSRAM reste exact dans les deux états.
+            if (!_si_screen && (strcmp(a.label, "Sprite") == 0 || strcmp(a.label, "Canvas") == 0))
+                bytes = 0;
+            knownPs += bytes;
+            log_line("[MEM] Buf. %-15s : %u o", a.label, (unsigned)bytes);
+        }
+        // Non tracé : modèles ESP_SR chargés en PSRAM + framework.
+        log_line("[MEM] %-20s : %ld o", "Systeme (non trace)", (long)(psTotal - psFree) - (long)knownPs);
+        log_line("[MEM] %-20s : %u o utilise / %u o", "   Bilan PSRAM", (unsigned)(psTotal - psFree), (unsigned)psTotal);
+        log_line("[MEM] %-20s : %u o libre (pire cas : %u o)", "PSRAM", (unsigned)psFree, (unsigned)psMin);
+        log_line("[MEM] %-20s : %u o", "Plus gros bloc libre",
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+    } else {
+        _si_mem_sep("PSRAM", 0);
+        log_line("[MEM] %-20s : NON DETECTEE", "PSRAM");
+    }
+
+    _si_mem_sep_plain();   // ferme le dernier bloc
 }
 
 void display_show_sysinfo() {

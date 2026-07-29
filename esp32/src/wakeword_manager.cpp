@@ -30,6 +30,10 @@
 // (audio_manager peut jouer un son avant wakeword_init()).
 static bool _sr_started = false;
 
+// Interne consommé par ESP_SR (delta libre avant/après begin), pour le bilan
+// mémoire de sysinfo_manager. 0 tant que begin() n'a pas réussi.
+static uint32_t _esp_sr_internal_bytes = 0;
+
 // ---- HELPERS ----
 
 // Détection en attente de traitement. Simple drapeau : il n'y a aucune donnée à
@@ -50,9 +54,11 @@ static void _on_sr_event(sr_event_t event, int command_id, int phrase_id) {
 // ---- API PUBLIQUES ----
 void wakeword_init() {
     // Diagnostic RAM interne — les tâches d'ESP_SR (feed/detect/handler + AFE)
-    // s'allouent en RAM interne ; on veut voir la marge avant begin().
+    // s'allouent en RAM interne ; on veut voir la marge avant begin() ET mesurer
+    // ce qu'ESP_SR consomme (delta avant/après, pour le bilan mémoire de SysInfo).
+    uint32_t freeBefore = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     log_line("[Wakeword] RAM interne libre avant ESP_SR : %u o (plus gros bloc : %u o)",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)freeBefore,
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 
     ESP_SR.onEvent(_on_sr_event);
@@ -66,7 +72,13 @@ void wakeword_init() {
         return;
     }
     _sr_started = true;
-    log_line("[Wakeword] ESP_SR démarré (écoute active, mot-clé Jarvis)");
+    _esp_sr_internal_bytes = freeBefore - heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    log_line("[Wakeword] ESP_SR démarré (écoute active, mot-clé Jarvis) — %u o d'interne",
+             (unsigned)_esp_sr_internal_bytes);
+}
+
+uint32_t wakeword_esp_sr_internal_bytes() {
+    return _esp_sr_internal_bytes;
 }
 
 // Traite une détection en attente. Appelée depuis loop() (main.cpp), donc sur

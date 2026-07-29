@@ -434,11 +434,12 @@ void audio_init() {
     _ensure_record_buffer();   // évite un malloc PSRAM au premier enregistrement
 
     _audio_queue = xQueueCreate(4, sizeof(AudioMsg));
-    // Pile 5120 : le high-water est trompeur, ne relever qu'APRÈS un échange
-    // vocal complet (à 3072 il ne restait que 200 o). Priorité 3 et non 1 :
-    // la capture I2S est temps réel, à égalité avec loopTask elle se faisait
-    // affamer par LVGL (ratio ×3,26 mesuré, échantillons perdus). Cf. CLAUDE.md.
-    xTaskCreatePinnedToCore(_audio_task, "audio_task", 5120, nullptr, 3, nullptr, 1);
+    // Pile : STACK_BYTES_AUDIO_TASK. Pic mesuré 2064 o (enreg. long) ; à 3072 il
+    // ne restait que 1008 o (MARGE FAIBLE) — ne pas redescendre. High-water
+    // trompeur, relever APRÈS un échange vocal complet. Priorité 3 et non 1 :
+    // capture I2S temps réel, à égalité avec loopTask elle se faisait affamer
+    // par LVGL (×3,26 mesuré, échantillons perdus). CLAUDE.md.
+    xTaskCreatePinnedToCore(_audio_task, "audio_task", STACK_BYTES_AUDIO_TASK, nullptr, 3, nullptr, 1);
 
     log_line("[Audio] Init OK");
 }

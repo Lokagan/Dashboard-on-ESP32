@@ -25,3 +25,7 @@ void wakeword_loop();
 // Sûrs à appeler même avant wakeword_init() (no-op tant qu'ESP_SR n'a pas démarré).
 void wakeword_pause();
 void wakeword_resume();
+
+// Interne consommé par ESP_SR, mesuré au boot (delta libre avant/après begin) —
+// pour le bilan mémoire de sysinfo_manager. 0 si ESP_SR n'a pas (encore) démarré.
+uint32_t wakeword_esp_sr_internal_bytes();

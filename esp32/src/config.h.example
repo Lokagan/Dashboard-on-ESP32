@@ -45,12 +45,31 @@
 #define OTA_PASSWORD        "VOTRE_MDP_OTA"         // À RENSEIGNER (ou laisser vide pour OTA sans mot de passe)
 
 // --- MQTT ---
-#define MQTT_BROKER         NAS_HOST
-#define MQTT_PORT           1883
-#define MQTT_CLIENT_ID      "esp32-dashboard"
-#define MQTT_RECONNECT_MS   5000
-#define MQTT_KEEPALIVE_S    60
-#define MQTT_BUFFER_SIZE    4096    // Taille du buffer de réception PubSubClient
+#define MQTT_BROKER          NAS_HOST
+#define MQTT_PORT            1883
+#define MQTT_URI             "mqtt://" NAS_HOST ":" CFG_STR(MQTT_PORT)
+#define MQTT_CLIENT_ID       "esp32-dashboard"
+#define MQTT_RECONNECT_MS    5000    // backoff de reconnexion esp-mqtt
+#define MQTT_KEEPALIVE_S     60
+#define MQTT_BUFFER_SIZE     5120    // buffer RX esp-mqtt : > 4096 ⇒ PSRAM (seuil ALWAYSINTERNAL) ; tient un freebox/devices d'un trait
+#define MQTT_OUT_BUFFER_SIZE 256     // buffer d'émission : nos publish sont minuscules (online/status)
+#define MQTT_RX_QUEUE_LEN    12      // file mqtt_task → loopTask (rafale bulk ~9 msg/5 s)
+
+// --- PILES FREERTOS (octets) ---
+// Tailles allouées de nos 6 tâches, centralisées : chacune est lue à DEUX
+// endroits — le xTaskCreate / SET_LOOP_TASK_STACK_SIZE / cfg.task.stack_size ET
+// le miroir _si_stacks de sysinfo (+ _si_alloc pour MQTT).
+// ⚠️ NE PAS rogner pour gagner de la RAM : mesuré, ça ne remonte PAS le plancher
+// DMA (ESP_SR gobe l'interne libéré → plancher baissé d'exactement le montant
+// rogné) et ça a mis audio_task en MARGE FAIBLE (1008 o à 3072). High-water
+// trompeur : ne redimensionner qu'après un relevé pris APRÈS un échange vocal
+// complet ET un téléchargement. Cf. CLAUDE.md.
+#define STACK_BYTES_LOOP_TASK   8192   // pic 4692
+#define STACK_BYTES_AUDIO_TASK  5120   // pic 2064 (1008 restants à 3072 : NON)
+#define STACK_BYTES_AI_TASK     6144   // pic 2984 (identique météo/actus)
+#define STACK_BYTES_HTTP_TASK   6144   // pic 3080 (après download)
+#define STACK_BYTES_MQTT_TASK   6144   // pic 2440
+#define STACK_BYTES_OTA_TASK    4096   // pic 1264
 
 // --- TOPICS MQTT — NAS Synology DS1522+ ---
 #define TOPIC_NAS_CPU               "nas/cpu"               // int %
@@ -118,6 +137,8 @@
 // --- Activite reseau / config Services — page NAS (AdGuard, cf. NAS_HOST) ---
 #define ACTIVITY_UI_PORT       8091
 #define ACTIVITY_UI_URL        "http://" NAS_HOST ":" CFG_STR(ACTIVITY_UI_PORT) "/"
+#define ACTIVITY_ADGUARD_PORT  3000
+#define ACTIVITY_ADGUARD_URL   "http://" NAS_HOST ":" CFG_STR(ACTIVITY_ADGUARD_PORT) "/"
 
 // ===========================
 // === DEFINITIONS DE PINS ===

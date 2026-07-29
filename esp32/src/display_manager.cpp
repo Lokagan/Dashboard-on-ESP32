@@ -186,7 +186,7 @@ static volatile uint8_t _spy_remaining = 0;
 // courbe ET son label d'échelle. ⚠️ DOIT rester alignée sur les couleurs des
 // readouts dans SquareLine (ui_ScreenNAS/Freebox.c) : si l'une change là-bas,
 // la mettre à jour ici (paire SquareLine/code, comme ailleurs dans le projet).
-#define COL_CPU    lv_color_hex(0xAAFF00)
+#define COL_CPU    lv_color_hex(0xFFFF00)
 #define COL_RAM    lv_color_hex(0x0088FF)
 #define COL_READ   lv_color_hex(0x00FF00)
 #define COL_WRITE  lv_color_hex(0xFF0000)
@@ -543,9 +543,9 @@ static void _table_load(TableSource source) {
         }
         case TABLE_FBX_ACTIVITY: {
             // Qui fait quoi : réutilise freebox/devices (enrichi d'un champ 'service' par le bridge).
-            const char* hdrs[] = {"Appareil", "Service", "DL", "UP"};
-            const uint16_t w[] = {110, 100, 55, 55};
-            const char* keys[] = {"name", "service", "rx_rate", "tx_rate"};
+            const char* hdrs[] = {"Appareil", "DL", "UP", "Service"};
+            const uint16_t w[] = {100, 70, 70, 80};
+            const char* keys[] = {"name", "rx_rate", "tx_rate", "service"};
             _table_setup_structure(TABLE_FBX_ACTIVITY, "Freebox - Activité Réseau", hdrs, w, 4, false);
             _table_fill(_json_fbx_devices, keys, 4);
             break;
@@ -579,11 +579,13 @@ void display_init() {
     // le reste passé à écrire puis relire la PSRAM.
     _buf1 = (lv_color_t*)heap_caps_malloc(LV_BUF_BYTES,
                                           MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    // Second buffer NON alloué pour l'instant : en mode PARTIAL il ne sert qu'à
-    // préparer la bande suivante pendant le flush, or _lv_flush_cb est synchrone
-    // (pushPixels, sans DMA) — il n'y a rien à recouvrir, et il doublerait le
-    // coût en RAM interne. Gardé pour y revenir le jour où le flush passera en
-    // DMA : il suffira de l'allouer comme _buf1.
+    // Buffer UNIQUE volontairement : le flush est synchrone (pushPixels, copie CPU
+    // sans DMA), un second ne recouvrirait rien.
+    // ⚠️ Double buffer 2×12 + flush DMA (pushPixelsDMA) TENTÉ le 2026-07-28 : ÉCHEC
+    // sur ce S3+HSPI. Écran NOIR (endWrite() termine la transaction avant la fin
+    // du DMA → pixels jamais sortis) ; et même en version DMA bloquante la frame
+    // plein écran est PLUS lente (156 ms vs 124, 20 flush vs 14 : l'overhead DMA
+    // par bande dépasse le SPI recouvrable, ~13 ms sur 124). Ne pas rouvrir.
     _buf2 = nullptr;
 
     if (!_buf1) {
@@ -1107,9 +1109,18 @@ static const char* _obj_class_name(lv_obj_t* o) {
 static void _tree_rec(lv_obj_t* o, int depth) {
     lv_area_t a;
     lv_obj_get_coords(o, &a);
-    char txt[16] = "";
-    if (lv_obj_get_class(o) == &lv_label_class)
-        snprintf(txt, sizeof(txt), " '%.10s'", lv_label_get_text(o));
+    char txt[20] = "";
+    if (lv_obj_get_class(o) == &lv_label_class) {
+        // Troncature UTF-8-safe : ne JAMAIS couper au milieu d'une séquence
+        // multi-octets (sinon octet orphelin → � dans le log). Au plus ~12 octets,
+        // puis on recule tant que le point de coupe tombe sur un octet de
+        // continuation (10xxxxxx). Le `°C` du label Temp reste ainsi intact.
+        const char* s = lv_label_get_text(o);
+        size_t keep = 0;
+        while (s[keep] && keep < 12) keep++;
+        while (keep > 0 && ((unsigned char)s[keep] & 0xC0) == 0x80) keep--;
+        snprintf(txt, sizeof(txt), " '%.*s'", (int)keep, s);
+    }
     // ext_draw_size : marge que LVGL ajoute AUTOUR de l'objet à l'invalidation,
     // pour couvrir ce qui déborde. C'est elle qui transforme un chart de 280x95
     // en repeint de 320x179.

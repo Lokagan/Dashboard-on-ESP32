@@ -663,14 +663,10 @@ void http_init() {
     server.begin();
     log_line("[HTTP] Serveur démarré sur le port %d", HTTP_SERVER_PORT);
 
-    // 6144 -> 12288 -> 10240 -> 6144. Les 6144 d'origine débordaient à cause de
-    // log_get_json(), qui copiait le journal entier sur CETTE pile (4 Ko) avant
-    // de le sérialiser : pic mesuré ~5880 o. Il construit désormais son JSON
-    // ligne par ligne, et le pic est retombé à 2956 o (relevé après échange
-    // vocal + page web) — 6144 laisse donc ~3,2 Ko de marge.
-    // Ne pas redescendre sans un relevé pris APRÈS un téléchargement de fichier,
-    // le chemin le plus gourmand de ce serveur.
-    xTaskCreatePinnedToCore(_http_task, "http_task", 6144, nullptr, 1, nullptr, 0);
+    // Pile : STACK_BYTES_HTTP_TASK. Les 6144 initiaux débordaient via
+    // log_get_json() (~5880 o) ; sérialisé ligne par ligne désormais → pic 3080 o
+    // (relevé APRÈS un téléchargement, le chemin le plus gourmand) → ~3 Ko marge.
+    xTaskCreatePinnedToCore(_http_task, "http_task", STACK_BYTES_HTTP_TASK, nullptr, 1, nullptr, 0);
 }
 
 // Exécute ce qui est en attente — sur loopTask, jamais depuis _http_task.
