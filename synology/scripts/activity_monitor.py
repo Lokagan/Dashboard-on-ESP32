@@ -32,9 +32,8 @@ import requests
 from datetime import datetime
 from flask import Flask, Response, jsonify, request
 
-# Werkzeug logge chaque requête HTTP en INFO : /activity est sondé toutes les 3 s -> flood du
-# journal du conteneur. On ne garde que warnings/erreurs. Logger global au process : vaut aussi
-# pour le bridge (8090).
+# Werkzeug logge chaque requête HTTP en INFO : /activity est sondé toutes les 3 s.
+# ⚠️ Logger global au process : vaut aussi pour le bridge (8090).
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 # ----------------------------------------------------------------
@@ -46,10 +45,9 @@ AGH_PASS      = os.getenv("AGH_PASS", "")
 ACTIVITY_PORT = int(os.getenv("ACTIVITY_PORT", "8091"))
 
 # Deux fenêtres, clé de la stabilité de l'affichage :
-#   ACTIVE_S   : au-delà, l'appareil est marqué « inactif » (grisé) mais RESTE affiché.
-#   PRESENCE_S : au-delà (silence total), l'appareil disparaît enfin de la liste.
-# QUERYLOG_LIMIT borne ce qu'on tire d'AGH par appel (l'état est mémorisé entre appels,
-# donc pas besoin d'en tirer beaucoup).
+#   ACTIVE_S   : au-delà, l'appareil est marqué « inactif » mais RESTE affiché.
+#   PRESENCE_S : au-delà, l'appareil disparaît de la liste.
+# QUERYLOG_LIMIT borne ce qu'on tire d'AGH par appel.
 ACTIVE_S       = int(os.getenv("ACTIVE_S", "90"))
 PRESENCE_S     = int(os.getenv("PRESENCE_S", "36000"))
 INSTANT_S      = int(os.getenv("INSTANT_S", "10"))       # fenêtre glissante du donut « instantané »
@@ -58,9 +56,9 @@ QUERYLOG_LIMIT = int(os.getenv("QUERYLOG_LIMIT", "1000"))
 HOUR_S, DAY_S, WEEK_S = 3600, 86400, 604800              # fenêtres glissantes des donuts historiques
 UNKNOWN_TTL = 6 * 3600      # un domaine inconnu quitte le panneau s'il n'est pas revu depuis N s
 
-# Au démarrage, on rejoue le query log d'AGH (jusqu'à sa rétention, 90 j possibles) pour
-# remplir l'historique tout de suite ET survivre à un redémarrage — pas besoin de SQLite.
-# Inutile de dépasser la plus grande fenêtre affichée (7 j).
+# Au démarrage on rejoue le query log d'AGH : l'historique est rempli tout de
+# suite et survit à un redémarrage, sans SQLite. Inutile de dépasser la plus
+# grande fenêtre affichée (7 j).
 BACKFILL_S         = int(os.getenv("BACKFILL_DAYS", "7")) * 86400
 BACKFILL_PAGE      = 1000                                 # entrées par page d'API
 BACKFILL_MAX_PAGES = 2000                                 # garde-fou (2 M entrées max)
@@ -317,9 +315,8 @@ def _build_state_and_output():
     data  = _agh_get("/control/querylog", {"limit": QUERYLOG_LIMIT}).get("data") or []
     now   = time.time()
 
-    # 1) Ingestion — on ne traite QUE les entrées plus récentes que le dernier horodatage
-    #    déjà vu (hw). Ça évite de recompter les requêtes à chaque appel (on repioche
-    #    les mêmes 1000 entrées) tout en gardant service/last_ts à jour.
+    # 1) Ingestion — QUE les entrées plus récentes que le dernier horodatage vu
+    #    (hw), sinon on recompte les mêmes entrées à chaque appel.
     hw       = _ingest["ts"]
     new_high = hw
     for e in data:
@@ -431,9 +428,53 @@ PAGE = """<!doctype html>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
-  body { margin: 0; font-family: system-ui, sans-serif; background: #0d1117; color: #e6edf3; }
+  /* Mise en page "app shell" : la page ne defile pas, seule la grille des
+     cartes le fait. En-tete et bandeau des donuts restent donc visibles.
+     dvh et pas vh : sur mobile, vh compte la barre d'adresse retractable et
+     laisse depasser la page de quelques dizaines de pixels. */
+  body { margin: 0; font-family: system-ui, sans-serif; background: #0d1117; color: #e6edf3;
+         height: 100vh; height: 100dvh; display: flex; flex-direction: column;
+         overflow: hidden; }
   header { padding: 18px 22px; border-bottom: 1px solid #21262d; display: flex;
-           align-items: baseline; gap: 16px; flex-wrap: wrap; }
+           align-items: baseline; gap: 16px; flex-wrap: wrap;
+           background: #0d1117; flex: none; }
+
+  /* Un onglet visible occupe toute la hauteur restante.
+     ⚠️ :not(.hidden) est OBLIGATOIRE. Un selecteur d'id (specificite 100) bat
+     .hidden (10) : sans lui, le `display: flex` ci-dessous l'emporte sur le
+     `display: none` de .hidden et l'onglet Activite ne se cache plus jamais —
+     la navigation par onglets est cassee. */
+  #view-activity:not(.hidden),
+  #view-services:not(.hidden),
+  #view-unknowns:not(.hidden) { flex: 1; min-height: 0; }
+  #view-activity:not(.hidden) { display: flex; flex-direction: column; }
+
+  /* min-height:0 est OBLIGATOIRE sur un enfant flex qui doit defiler : sans
+     lui, min-height vaut auto, l'enfant refuse de descendre sous la hauteur de
+     son contenu et c'est la PAGE qui deborde au lieu de la zone. */
+  #view-activity > .summary { flex: none; }
+  /* ⚠️ align-content: start est OBLIGATOIRE depuis que #grid a une hauteur
+     DÉFINIE (flex: 1). Un conteneur grid de hauteur définie repartit l'espace
+     libre sur ses rangées implicites — align-content vaut `normal`, qui se
+     comporte comme `stretch` : les cartes s'étirent verticalement pour remplir
+     la zone. Avant, #grid avait une hauteur auto et les rangées suivaient leur
+     contenu. */
+  #grid { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain;
+          align-content: start; }
+  #view-services, #view-unknowns { overflow-y: auto; }
+
+  /* Repli en defilement normal du document, en gardant l'en-tete visible par
+     position:sticky. Deux cas, et le second est celui qui casse sur mobile :
+       - fenetre BASSE  : le bandeau des donuts ne laisserait rien a la grille ;
+       - fenetre ETROITE: en portrait telephone la hauteur est confortable, mais
+         l'en-tete ET les 4 donuts passent a la ligne, et le meme probleme
+         revient sans qu'aucun critere de hauteur ne se declenche. */
+  @media (max-height: 600px), (max-width: 760px) {
+    body { height: auto; overflow: visible; display: block; }
+    header { position: sticky; top: 0; z-index: 20; }
+    #view-activity:not(.hidden) { display: block; }
+    #grid, #view-services, #view-unknowns { overflow: visible; min-height: 0; }
+  }
   header h1 { margin: 0; font-size: 18px; letter-spacing: 2px; }
   #status { color: #7d8590; font-size: 13px; }
 

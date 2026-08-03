@@ -29,9 +29,8 @@ static lv_indev_t* _indev       = nullptr;
 static bool        _was_touched = false;
 static lv_point_t  _last_point  = {0, 0};
 
-// Un appui qui ne se relâche jamais est SILENCIEUX sans ça : le log de point
-// n'est émis qu'au relâchement, alors qu'un PRESSED permanent dont la
-// coordonnée bruite fait défiler l'écran en continu.
+// Un appui qui ne se relâche jamais serait SILENCIEUX : le log de point n'est
+// émis qu'au relâchement.
 static uint32_t      _pressed_reads    = 0;
 static unsigned long _last_timeout_log = 0;
 
@@ -46,9 +45,8 @@ static uint8_t _ft6336_read(uint8_t reg) {
     unsigned long t = millis();
     while (!Wire.available()) {
         if (millis() - t > FT6336_TIMEOUT_MS) {
-            // Throttlé, et surtout HORS de la boucle : ce log y était, et
-            // produisait des centaines de lignes (donc de Serial.println,
-            // sur loopTask) pour une seule lecture lente.
+            // Throttlé, et surtout HORS de la boucle : des centaines de lignes
+            // (donc de Serial.println, sur loopTask) pour une lecture lente.
             unsigned long now = millis();
             if (now - _last_timeout_log > TOUCH_TIMEOUT_LOG_MS) {
                 _last_timeout_log = now;
@@ -82,8 +80,8 @@ static void _lv_touch_read_cb(lv_indev_t* indev, lv_indev_data_t* data) {
         _last_point  = data->point;
         _was_touched = true;
 
-        // ~50 lectures ≈ 1,5 s d'appui ininterrompu, plus long qu'un appui
-        // humain. Journalisé une seule fois par appui (== et non >=).
+        // ~50 lectures ≈ 1,5 s, plus long qu'un appui humain. Journalisé une
+        // seule fois par appui (== et non >=).
         if (++_pressed_reads == 50) {
             log_line("[Touch] Appui continu (50 lectures) — x=%d y=%d, num=%d, raw=%d/%d",
                      data->point.x, data->point.y, (int)num_touches, raw_x, raw_y);

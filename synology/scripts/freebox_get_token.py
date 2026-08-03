@@ -15,6 +15,7 @@ Prérequis :
 # ----------------------------------------------------------------
 # BIBLIOTHÈQUES
 # ----------------------------------------------------------------
+import os
 import time
 import hmac
 import hashlib
@@ -23,7 +24,9 @@ import requests
 # ----------------------------------------------------------------
 # OBJETS GLOBAUX
 # ----------------------------------------------------------------
-FREEBOX_HOST = "192.168.1.254"
+# Même variable d'env que freebox_monitor.py, pour ne pas déclarer l'adresse
+# de la box à deux endroits.
+FREEBOX_HOST = os.getenv("FREEBOX_HOST", "192.168.1.254")
 FREEBOX_API  = "v6"
 APP_ID       = "dashboard.esp32"
 APP_NAME     = "Dashboard ESP32"

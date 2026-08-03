@@ -258,7 +258,7 @@
 #define LV_USE_BUTTON     1   /* boutons de nav */
 #define LV_USE_BUTTONMATRIX  1   /* dépendance de lv_keyboard */
 #define LV_USE_CALENDAR   0
-#define LV_USE_CANVAS     1   /* écran SysInfo (sysinfo_manager.cpp) — sprite TFT_eSPI blitté dans un canvas */
+#define LV_USE_CANVAS     1   /* écran SysInfo (sysinfo_manager.cpp) — buffer gfx blitté dans un canvas */
 #define LV_USE_CHART      1   /* ChartNAS, ChartFreebox */
 #define LV_USE_CHECKBOX   0
 #define LV_USE_DROPDOWN   1   /* requis par ui_helpers.c (SquareLine, générique) */

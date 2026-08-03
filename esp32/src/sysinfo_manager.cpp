@@ -1,12 +1,23 @@
 // ============================================================
 // SYSINFO_MANAGER.CPP — écran de diagnostic système.
-// Dessiné dans un TFT_eSprite hors-écran puis copié (memcpy) dans un
+// Dessiné par gfx dans un buffer hors-écran puis copié (memcpy) dans un
 // lv_canvas affiché comme un écran LVGL normal. 6 pages, navigation
 // tactile gauche/droite/centre.
+//
+// ORGANISATION DU FICHIER
+//   1. Les OBJETS      — palette, géométrie, surface, dessin, cadre, format,
+//                        cpu, inventaire. Aucun ne connaît les pages.
+//   2. Les PAGES       — un bloc autonome chacun, découpé en trois :
+//                          FIXE       dessiné une fois, à l'entrée sur la page
+//                          BLITTÉ     réécrit par-dessus à chaque rafraîchissement
+//                          ASSEMBLAGE ce que le dispatcher appelle
+//   3. La TABLE        — _pages[] : draw / refresh / cadence. Ajouter une page
+//                        = une ligne + un bloc.
+//   4. Écran, ticker, API publiques.
 // ============================================================
 
 // ---- BIBLIOTHÈQUES ----
-#include <TFT_eSPI.h>
+#include <Arduino.h>
 #include <WiFi.h>
 #include <lvgl.h>
 #include <esp_chip_info.h>
@@ -17,21 +28,27 @@
 #include <freertos/task.h>
 #include <esp_partition.h>
 #include <esp_ota_ops.h>
+#include <esp_app_format.h>   // en-tête d'image ESP — occupation d'un slot OTA
 
 // ---- RESSOURCES LOCALES ----
 #include "sysinfo_manager.h"
+#include "display_gfx.h"
+#include "display_driver.h"
 #include "config.h"
 #include "wifi_manager.h"
 #include "mqtt_manager.h"
 #include "wakeword_manager.h"
 #include "littlefs_manager.h"
 #include "log_manager.h"
-// Pour les tailles de _si_alloc — chaque poste vient du header de son propriétaire
+// Pour les tailles de l'inventaire — chaque poste vient du header de son propriétaire
 #include "display_manager.h"
 #include "audio_manager.h"
 #include "ai_companion.h"
 
-// ---- OBJETS GLOBAUX ----
+
+// ════════════════════════════════════════════════════════════
+// PALETTE
+// ════════════════════════════════════════════════════════════
 
 // Palette néon terminal
 #define C_BG      0x0841
@@ -47,224 +64,257 @@
 #define C_MAGENTA_DK 0x780F   // magenta assombri — espace réellement occupé (spiffs/fat)
 #define C_DKCYAN  0x0410
 
-// Localisation mémoire (page MEMOIRE) : OÙ vit une allocation, un seul axe.
-// Pas de rampe de criticité — choix assumé : orange ne doit pas signifier à la
-// fois "interne" et "alarme". Jauges ET postes partagent ces deux teintes.
-#define C_MEM_INT  C_ORANGE   // RAM interne
-#define C_MEM_EXT  0x64BD     // PSRAM (externe) — bleu bleuet
+// Localisation mémoire (page MEMOIRE) : OÙ vit une allocation, un seul axe —
+// pas de rampe de criticité, orange ne doit pas signifier "interne" ET "alarme".
+#define C_MEM_INT     C_ORANGE   // RAM interne
+#define C_MEM_EXT     0x64BD     // PSRAM (externe) — bleu bleuet
+// Teintes sourdes des deux mêmes couleurs : la LUMINOSITÉ hiérarchise, la
+// teinte reste la localisation.
+#define C_MEM_INT_DK  0x7A80
+#define C_MEM_EXT_DK  0x324E
+
+
+// ════════════════════════════════════════════════════════════
+// GÉOMÉTRIE
+// ════════════════════════════════════════════════════════════
 
 #define SI_W   320
 #define SI_H   240
-#define SI_LH  12
-#define SI_LX  8
+#define SI_LH  12     // hauteur de ligne
+#define SI_LX  8      // marge gauche
 
-#define SI_MAX_TASKS 32
+#define SI_HEADER_H   16
+#define SI_FOOTER_H   14
+#define SI_CONTENT_Y  (SI_HEADER_H + 1)
+#define SI_CONTENT_H  (SI_H - SI_CONTENT_Y - SI_FOOTER_H)
+#define SI_PAGE_Y0    (SI_CONTENT_Y + 3)   // 1re ligne utile d'une page
+#define SI_PAGE_YMAX  (SI_H - SI_FOOTER_H) // 1re ligne INTERDITE (pied de page)
+
+#define SI_CLOCK_W    64    // largeur du coin horodatage (blit le plus fréquent)
+
+#define SI_MAX_TASKS  32
 
 #define SI_REFRESH_TICKS  20    // timer à 50 ms -> rafraîchissement 1 Hz
-#define SI_TASK_LIVE_X   110    // début des colonnes vivantes (ETAT/PRI/%CPU/PILE)
-#define SI_CPU_BAR_W      80    // barres de charge (page IDENTITE) — la moitié
-                                // de la place dispo suffit et allège la ligne
-#define SI_MEM_EVERY_N     2    // MEMOIRE : un rafraîchissement sur deux
-#define SI_MEM_BAR_W      55    // barres MEM : largeur fixe (bornée par la valeur PSRAM, la plus longue)
 
-extern TFT_eSPI _tft;   // instance partagée (display_manager.cpp) — sert
-                        // uniquement à construire le sprite ci-dessous.
 
-static TFT_eSprite _si_sprite(&_tft);          // surface de dessin hors-écran
-static lv_obj_t*   _si_screen        = nullptr; // écran LVGL dédié (créé une fois)
-static lv_obj_t*   _si_canvas        = nullptr; // canvas plein écran
-static lv_color_t* _si_canvas_buf    = nullptr; // buffer PSRAM du canvas
-static lv_obj_t*   _si_return_screen = nullptr; // écran à restaurer à la sortie
-static lv_timer_t* _si_uptime_timer  = nullptr; // rafraîchit l'horodatage
+// ════════════════════════════════════════════════════════════
+// SURFACE — sprite hors-écran + recopie vers le canvas LVGL
+// ════════════════════════════════════════════════════════════
 
-enum SiPage {
-    SI_PAGE_CHIP = 0,
-    SI_PAGE_MEM,
-    SI_PAGE_NET,
-    SI_PAGE_TASKS,
-    SI_PAGE_PART,
-    SI_PAGE_FS,
-    SI_PAGE_COUNT
-};
+namespace surface {
 
-static_assert(SI_PAGE_COUNT == SYSINFO_PAGE_COUNT,
-              "SYSINFO_PAGE_COUNT (sysinfo_manager.h) doit suivre l'enum SiPage");
+static uint16_t*   buf        = nullptr; // surface de dessin hors-écran (PSRAM)
+static gfx::Canvas cv         = { nullptr, SI_W, SI_H };
+static lv_obj_t*   canvas     = nullptr; // canvas plein écran
+static lv_color_t* canvas_buf = nullptr; // buffer PSRAM du canvas
 
-static int _si_page = SI_PAGE_CHIP;
-
-// Snapshot précédent des compteurs d'exécution FreeRTOS, pour un %CPU en DELTA.
-// ⚠️ Le compteur est un u32 de MICROSECONDES (RUN_TIME_STATS_USING_ESP_TIMER) :
-// il déborde toutes les 71,6 min, un cumul depuis le boot serait donc faux au-
-// delà. La soustraction non signée, elle, reste juste tant que l'écart entre
-// deux relevés est plus court que ça — c'est toujours le cas ici (deux
-// affichages de page).
-static struct { TaskHandle_t h; uint32_t run; } _si_prev[SI_MAX_TASKS];
-static UBaseType_t _si_prev_n  = 0;
-static uint32_t    _si_prev_us = 0;
-
-// Zones rafraîchies à 1 Hz par _si_uptime_timer_cb (blit PARTIEL).
-// Ordre d'affichage des tâches FIGÉ à l'entrée sur la page : le tri est fait par
-// %CPU, le rejouer à chaque seconde ferait sauter les lignes sous les yeux.
-static TaskHandle_t _si_task_order[SI_MAX_TASKS];
-static UBaseType_t  _si_task_shown  = 0;
-static int          _si_task_y0     = 0;   // y de la 1re ligne de tâche
-static int          _si_chip_load_y = 0;   // y de la ligne "Charge" (page IDENTITE)
-static int          _si_mem_y0 = 0, _si_mem_y1 = 0;   // bornes du bloc vivant (page MEMOIRE)
-
-// Miroir des tailles de config.h (PILES FREERTOS) — TaskStatus_t ne donne que le
-// high-water, jamais la taille allouée : sans ce lookup, pas de pourcentage.
-static const struct { const char* name; uint16_t stack; } _si_stacks[] = {
-    { "loopTask",   STACK_BYTES_LOOP_TASK  },
-    { "audio_task", STACK_BYTES_AUDIO_TASK },
-    { "ai_task",    STACK_BYTES_AI_TASK    },
-    { "http_task",  STACK_BYTES_HTTP_TASK  },
-    { "mqtt_task",  STACK_BYTES_MQTT_TASK  },
-    { "ota_task",   STACK_BYTES_OTA_TASK   },
-};
-
-// ---- HELPERS ----
-
-// Helpers dessin de base
-static void _si_fill_bg() {
-    _si_sprite.fillScreen(C_BG);
-    for (int x = 0; x < SI_W; x += 16)
-        for (int y = 0; y < SI_H; y += 16)
-            _si_sprite.drawPixel(x, y, C_GRID);
+// Primitives de la surface — gfx sans avoir à répéter la cible.
+static inline void fill(uint16_t c)                                { gfx::fill(cv, c); }
+static inline void fill_rect(int x, int y, int w, int h, uint16_t c) { gfx::fill_rect(cv, x, y, w, h, c); }
+static inline void rect(int x, int y, int w, int h, uint16_t c)      { gfx::rect(cv, x, y, w, h, c); }
+static inline void hline(int x, int y, int w, uint16_t c)            { gfx::hline(cv, x, y, w, c); }
+static inline void vline(int x, int y, int h, uint16_t c)            { gfx::vline(cv, x, y, h, c); }
+static inline void pixel(int x, int y, uint16_t c)                   { gfx::pixel(cv, x, y, c); }
+static inline void text(int x, int y, const char* s, uint16_t fg, uint16_t bg, uint8_t sz = 1) {
+    gfx::text(cv, x, y, s, fg, bg, sz);
 }
 
-static void _si_hline(int y, uint16_t c = C_DIM) {
-    _si_sprite.drawFastHLine(SI_LX, y, SI_W - SI_LX * 2, c);
-}
-
-static void _si_header(int page) {
-    _si_sprite.fillRect(0, 0, SI_W, 26, C_BG);
-    _si_sprite.drawFastHLine(0, 0, SI_W, C_CYAN);
-    _si_sprite.drawFastHLine(0, 1, SI_W, C_DKCYAN);
-
-    char pgbuf[32];
-    snprintf(pgbuf, sizeof(pgbuf), "PG %d/%d", page + 1, SI_PAGE_COUNT);
-    _si_sprite.setTextColor(C_YELLOW, C_BG);
-    _si_sprite.setTextSize(1);
-    _si_sprite.setCursor(SI_LX, 5);
-    _si_sprite.print(pgbuf);
-
-    _si_sprite.setTextColor(C_CYAN, C_BG);
-    const char* t1 = "[ ES3C28P SYSTEM DIAGNOSTICS ]";
-    _si_sprite.setCursor((SI_W - strlen(t1) * 6) / 2, 5);
-    _si_sprite.print(t1);
-
-    _si_sprite.setTextColor(C_DIM, C_BG);
-    const char* t2 = "TFT_eSPI @ 40MHz  |  ILI9341V  |  ESP32-S3";
-    _si_sprite.setCursor((SI_W - strlen(t2) * 6) / 2, 15);
-    _si_sprite.print(t2);
-
-    _si_sprite.drawFastHLine(0, 24, SI_W, C_DKCYAN);
-    _si_sprite.drawFastHLine(0, 25, SI_W, C_CYAN);
-}
-
-static void _si_footer() {
-    _si_sprite.drawFastHLine(0, SI_H - 13, SI_W, C_DKCYAN);
-    _si_sprite.drawFastHLine(0, SI_H - 12, SI_W, C_CYAN);
-    _si_sprite.setTextColor(C_DIM, C_BG);
-    _si_sprite.setTextSize(1);
-
-    _si_sprite.setCursor(SI_LX, SI_H - 9);
-    _si_sprite.print("< PREV");
-
-    const char* mid = "TAP CENTER = EXIT";
-    _si_sprite.setCursor((SI_W - (int)strlen(mid) * 6) / 2, SI_H - 9);
-    _si_sprite.print(mid);
-
-    const char* right = "NEXT >";
-    _si_sprite.setCursor(SI_W - SI_LX - (int)strlen(right) * 6, SI_H - 9);
-    _si_sprite.print(right);
-}
-
-static void _si_clear_content() {
-    _si_sprite.fillRect(0, 27, SI_W, SI_H - 27 - 14, C_BG);
-}
-
-static void _si_uptime() {
-    unsigned long ms = millis();
-    unsigned long s  = ms / 1000;
-    unsigned long m  = s / 60;
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%02lu:%02lu.%03lu", m, s % 60, ms % 1000);
-    _si_sprite.setTextColor(C_YELLOW, C_BG);
-    _si_sprite.setTextSize(1);
-    _si_sprite.setCursor(SI_W - 64, 5);
-    _si_sprite.print(buf);
-}
-
-static void _si_progress_bar(int x, int y, int w, int h, float pct, uint16_t c) {
-    _si_sprite.drawRect(x, y, w, h, C_DIM);
-    int fill = (int)((w - 2) * constrain(pct, 0.0f, 1.0f));
-    _si_sprite.fillRect(x + 1, y + 1, fill,             h - 2, c);
-    _si_sprite.fillRect(x + 1 + fill, y + 1, w - 2 - fill, h - 2, C_BG);
-}
-
-// Ligne "clé : valeur", avec barre optionnelle. L'espace de 6 px après la clé
-// est la largeur de l'ancien curseur clignotant, gardée pour ne pas décaler la
-// mise en page.
-// barMaxW : largeur max de la barre en px, 0 = jusqu'à la marge droite.
-static void _si_row(int y, const char* key, const char* val,
-                    uint16_t valColor = C_GREEN, bool withBar = false,
-                    float barPct = 0, uint16_t barColor = C_CYAN,
-                    int barMaxW = 0, bool barRight = false) {
-    _si_sprite.setTextColor(C_DKCYAN, C_BG);
-    _si_sprite.setTextSize(1);
-    _si_sprite.setCursor(SI_LX, y);
-    _si_sprite.print(key);
-
-    _si_sprite.setCursor(_si_sprite.getCursorX() + 6, y);
-    _si_sprite.setTextColor(valColor, C_BG);
-    _si_sprite.print(val);
-
-    if (withBar) {
-        int bx, bw;
-        if (barRight && barMaxW > 0) {   // largeur FIXE, alignée sur la marge droite
-            bw = barMaxW;                 // (barres MEM : mêmes x/largeur malgré des valeurs de longueur variable)
-            bx = SI_W - SI_LX - barMaxW;
-        } else {                          // après le texte, éventuellement plafonnée (barres CPU IDENTITE)
-            bx = _si_sprite.getCursorX() + 4;
-            bw = SI_W - bx - SI_LX;
-            if (barMaxW > 0 && bw > barMaxW) bw = barMaxW;
-        }
-        if (bw > 10) _si_progress_bar(bx, y + 1, bw, 7, barPct, barColor);
-    }
-}
-
-static void _si_section(int y, const char* title) {
-    _si_sprite.setTextColor(C_CYAN, C_BG);
-    _si_sprite.setTextSize(1);
-    _si_sprite.setCursor(SI_LX, y);
-    _si_sprite.print(title);
-}
-
-// Sprite -> canvas. Même format des deux côtés (RGB565, ordre natif TFT_eSPI) :
+// Surface -> canvas. Même format des deux côtés (RGB565 ordre dalle) :
 // simple memcpy, aucune conversion.
-static void _si_blit() {
-    if (!_si_canvas_buf) return;
-    memcpy(_si_canvas_buf, _si_sprite.getPointer(), (size_t)SI_W * SI_H * 2);
-    lv_obj_invalidate(_si_canvas);
+static void blit() {
+    if (!canvas_buf) return;
+    memcpy(canvas_buf, buf, (size_t)SI_W * SI_H * 2);
+    lv_obj_invalidate(canvas);
 }
 
-// Ne recopie qu'un rectangle plutôt que les 150 Ko du canvas entier — c'est ce
-// qui rend les rafraîchissements 1 Hz abordables.
-static void _si_blit_rect(int x, int y, int w, int h) {
-    if (!_si_canvas_buf) return;
-    const uint8_t* srcBase = (const uint8_t*)_si_sprite.getPointer();
-    uint8_t*       dstBase = (uint8_t*)_si_canvas_buf;
+// Ne recopie qu'un rectangle plutôt que le canvas entier.
+// ⚠️ Découper en HAUTEUR (rangées pleine largeur, contiguës en PSRAM) est le
+// seul découpage rentable : rogner la LARGEUR ne rend presque rien, l'accès
+// PSRAM domine tout le reste.
+static void blit_rect(int x, int y, int w, int h) {
+    if (!canvas_buf) return;
+    const uint8_t* srcBase = (const uint8_t*)buf;
+    uint8_t*       dstBase = (uint8_t*)canvas_buf;
     for (int row = 0; row < h; row++) {
         size_t offset = (size_t)((y + row) * SI_W + x) * 2;
         memcpy(dstBase + offset, srcBase + offset, (size_t)w * 2);
     }
     lv_area_t area = { x, y, x + w - 1, y + h - 1 };
-    lv_obj_invalidate_area(_si_canvas, &area);
+    lv_obj_invalidate_area(canvas, &area);
 }
 
-// Helpers — formatage
-static const char* _si_chip_model_str(esp_chip_model_t m) {
+// Rangée(s) pleine largeur — la forme de blit partiel à privilégier.
+static void blit_rows(int y, int h) { blit_rect(0, y, SI_W, h); }
+
+}  // namespace surface
+
+
+// ════════════════════════════════════════════════════════════
+// DRAW — primitives de dessin, famille UNIQUE
+// ════════════════════════════════════════════════════════════
+
+namespace draw {
+
+static void fill_bg() {
+    surface::fill(C_BG);
+    for (int x = 0; x < SI_W; x += 16)
+        for (int y = 0; y < SI_H; y += 16)
+            surface::pixel(x, y, C_GRID);
+}
+
+static void hline(int y, uint16_t c = C_DIM) {
+    surface::hline(SI_LX, y, SI_W - SI_LX * 2, c);
+}
+
+// Titre de section : ">> NOM"
+static void section(int y, const char* title) {
+    surface::text(SI_LX, y, title, C_CYAN, C_BG);
+}
+
+// Trois hauteurs, trois rôles — et rien d'autre.
+constexpr int BAR_ROW  = 7;    // jauge dans une ligne de table
+constexpr int BAR_HERO = 12;   // jauge du bandeau vedette, UNE par page
+constexpr int RULE     = 2;    // filet de proportion sous une ligne de liste
+
+static void bar(int x, int y, int w, int h, float pct, uint16_t c) {
+    surface::rect(x, y, w, h, C_DIM);
+    int fill = (int)((w - 2) * constrain(pct, 0.0f, 1.0f));
+    surface::fill_rect(x + 1,        y + 1, fill,         h - 2, c);
+    surface::fill_rect(x + 1 + fill, y + 1, w - 2 - fill, h - 2, C_BG);
+}
+
+// "clé : valeur" posé à un x libre, sans barre — forme compacte, pour les
+// mises en page à deux colonnes.
+static void pair(int x, int y, const char* key, const char* val,
+                 uint16_t valColor = C_WHITE) {
+    surface::text(x, y, key, C_DKCYAN, C_BG);
+    surface::text(x + gfx::text_w(key), y, val, valColor, C_BG);
+}
+
+// Ligne "clé : valeur" pleine largeur, avec barre optionnelle.
+// barMaxW : largeur max de la barre en px, 0 = jusqu'à la marge droite.
+static void row(int y, const char* key, const char* val,
+                uint16_t valColor = C_GREEN, bool withBar = false,
+                float barPct = 0, uint16_t barColor = C_CYAN,
+                int barMaxW = 0) {
+    surface::text(SI_LX, y, key, C_DKCYAN, C_BG);
+
+    int vx = SI_LX + gfx::text_w(key) + 6;
+    surface::text(vx, y, val, valColor, C_BG);
+
+    if (withBar) {
+        int bx = vx + gfx::text_w(val) + 4;
+        int bw = SI_W - bx - SI_LX;
+        if (barMaxW > 0 && bw > barMaxW) bw = barMaxW;
+        if (bw > 10) bar(bx, y + 1, bw, BAR_ROW, barPct, barColor);
+    }
+}
+
+// Texte brut à une position — pour les tableaux, où les intitulés sont en tête
+// de colonne. bg : fond peint sous les glyphes, à passer dès qu'on écrit sur
+// autre chose que le fond de l'écran.
+static void text(int x, int y, const char* s, uint16_t c, uint16_t bg = C_BG) {
+    surface::text(x, y, s, c, bg);
+}
+
+// Pastille pleine — un état court qu'on doit voir avant de lire (partition
+// active, système non monté). Retourne sa largeur, pour en enchaîner plusieurs.
+static int badge(int x, int y, const char* s, uint16_t bg, uint16_t fg = C_BG) {
+    int w = gfx::text_w(s) + 6;
+    surface::fill_rect(x, y - 1, w, 10, bg);
+    surface::text(x + 3, y, s, fg, bg);
+    return w;
+}
+
+// Double taille (12x16) — réservé aux valeurs « hero » de la page IDENTITE.
+static void big(int x, int y, const char* s, uint16_t c, uint16_t bg = C_BG) {
+    surface::text(x, y, s, c, bg, 2);
+}
+
+// Aligné à DROITE sur xr (1re colonne interdite). Police fixe 6 px.
+static void text_right(int xr, int y, const char* s, uint16_t c, uint16_t bg = C_BG) {
+    text(xr - gfx::text_w(s), y, s, c, bg);
+}
+
+// Efface une bande pleine largeur — préalable à tout redessin de zone BLITTÉE.
+static void wipe_rows(int y, int h) {
+    surface::fill_rect(0, y, SI_W, h, C_BG);
+}
+
+}  // namespace draw
+
+
+// ════════════════════════════════════════════════════════════
+// FRAME — bandeau, pied de page, horodatage, zone de contenu
+// ════════════════════════════════════════════════════════════
+
+namespace frame {
+
+static void header(int page) {
+    surface::fill_rect(0, 0, SI_W, SI_HEADER_H, C_BG);
+    surface::hline(0, 0, SI_W, C_CYAN);
+    surface::hline(0, 1, SI_W, C_DKCYAN);
+
+    char buf[16];
+    snprintf(buf, sizeof(buf), "PG %d/%d", page + 1, SYSINFO_PAGE_COUNT);
+    draw::text(SI_LX, 4, buf, C_YELLOW);
+
+    const char* title = "[ ES3C28P SYSTEM DIAGNOSTICS ]";
+    draw::text((SI_W - gfx::text_w(title)) / 2, 4, title, C_CYAN);
+
+    surface::hline(0, SI_HEADER_H - 2, SI_W, C_DKCYAN);
+    surface::hline(0, SI_HEADER_H - 1, SI_W, C_CYAN);
+}
+
+static void footer() {
+    surface::hline(0, SI_H - 13, SI_W, C_DKCYAN);
+    surface::hline(0, SI_H - 12, SI_W, C_CYAN);
+
+    draw::text(SI_LX, SI_H - 9, "< PREV", C_DIM);
+
+    const char* mid = "TAP CENTER = EXIT";
+    draw::text((SI_W - gfx::text_w(mid)) / 2, SI_H - 9, mid, C_DIM);
+
+    const char* right = "NEXT >";
+    draw::text(SI_W - SI_LX - gfx::text_w(right), SI_H - 9, right, C_DIM);
+}
+
+static void clear_content() {
+    surface::fill_rect(0, SI_CONTENT_Y, SI_W, SI_CONTENT_H, C_BG);
+}
+
+// Horodatage mm:ss.mmm, réécrit à 20 Hz — environ 12 % de loopTask sur toutes
+// les pages SysInfo.
+static void clock() {
+    unsigned long ms = millis();
+    unsigned long s  = ms / 1000;
+    unsigned long m  = s / 60;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%02lu:%02lu.%03lu", m, s % 60, ms % 1000);
+    surface::fill_rect(SI_W - SI_CLOCK_W, 2, SI_CLOCK_W, SI_HEADER_H - 4, C_BG);
+    draw::text(SI_W - SI_CLOCK_W, 4, buf, C_YELLOW);
+}
+
+static void blit_clock() {
+    surface::blit_rect(SI_W - SI_CLOCK_W, 0, SI_CLOCK_W, SI_HEADER_H);
+}
+
+}  // namespace frame
+
+
+// ════════════════════════════════════════════════════════════
+// FMT — énumérations matérielles et tailles vers texte
+// ════════════════════════════════════════════════════════════
+
+namespace fmt {
+
+// Sous le kilo-octet, afficher en octets — sinon un poste de 256 o lit "0 KB".
+static void size(char* buf, size_t n, long bytes) {
+    if (bytes > -1024 && bytes < 1024) snprintf(buf, n, "%ld o",  bytes);
+    else                               snprintf(buf, n, "%ld KB", bytes / 1024);
+}
+
+static const char* chip_model(esp_chip_model_t m) {
     switch (m) {
         case CHIP_ESP32:   return "ESP32";
         case CHIP_ESP32S2: return "ESP32-S2";
@@ -277,7 +327,7 @@ static const char* _si_chip_model_str(esp_chip_model_t m) {
     }
 }
 
-static const char* _si_flash_mode_str(FlashMode_t m) {
+static const char* flash_mode(FlashMode_t m) {
     switch (m) {
         case FM_QIO:  return "QIO";
         case FM_QOUT: return "QOUT";
@@ -287,7 +337,7 @@ static const char* _si_flash_mode_str(FlashMode_t m) {
     }
 }
 
-static const char* _si_reset_reason_str(esp_reset_reason_t r) {
+static const char* reset_reason(esp_reset_reason_t r) {
     switch (r) {
         case ESP_RST_POWERON:   return "POWER-ON";
         case ESP_RST_EXT:       return "PIN EXTERNE";
@@ -303,7 +353,7 @@ static const char* _si_reset_reason_str(esp_reset_reason_t r) {
     }
 }
 
-static const char* _si_part_subtype_str(uint8_t type, uint8_t subtype) {
+static const char* part_subtype(uint8_t type, uint8_t subtype) {
     if (type == ESP_PARTITION_TYPE_APP) {
         if (subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY) return "factory";
         if (subtype >= ESP_PARTITION_SUBTYPE_APP_OTA_MIN &&
@@ -327,34 +377,66 @@ static const char* _si_part_subtype_str(uint8_t type, uint8_t subtype) {
     return "?";
 }
 
-// Taille de pile allouée, 0 si inconnue (tâche système)
-static uint16_t _si_stack_size(const char* name) {
-    for (auto const& s : _si_stacks)
-        if (strcmp(s.name, name) == 0) return s.stack;
-    return 0;
+static char task_state(eTaskState s) {
+    switch (s) {
+        case eRunning:   return 'X';
+        case eReady:     return 'R';
+        case eBlocked:   return 'B';
+        case eSuspended: return 'S';
+        case eDeleted:   return 'D';
+        default:         return '?';
+    }
 }
+
+// Rang de tri : running > ready > blocked > suspended.
+static uint8_t task_rank(eTaskState s) {
+    switch (s) {
+        case eRunning:   return 0;
+        case eReady:     return 1;
+        case eBlocked:   return 2;
+        case eSuspended: return 3;
+        case eDeleted:   return 4;
+        default:         return 5;
+    }
+}
+
+}  // namespace fmt
+
+
+// ════════════════════════════════════════════════════════════
+// CPU — %CPU par tâche et par cœur, mesuré en DELTA
+// ════════════════════════════════════════════════════════════
+
+namespace cpu {
+
+// Snapshot précédent des compteurs d'exécution FreeRTOS.
+// ⚠️ Le compteur est un u32 de MICROSECONDES : il déborde toutes les 71,6 min,
+// donc mesure en DELTA obligatoire. La soustraction non signée reste juste tant
+// que deux relevés sont plus rapprochés que ça.
+static struct { TaskHandle_t h; uint32_t run; } _prev[SI_MAX_TASKS];
+static UBaseType_t _prev_n  = 0;
+static uint32_t    _prev_us = 0;
 
 // Échantillonne les compteurs d'exécution et met à jour le snapshot.
 //   pct  (optionnel) : rempli avec le %CPU de chaque tâche de st[]
 //   core0/core1      : charge de chaque cœur, déduite du temps des tâches IDLE
 // Retourne false si la fenêtre de mesure n'est pas exploitable (premier relevé
 // au-delà du débordement du compteur, ou fenêtre trop courte).
-static bool _si_cpu_sample(TaskStatus_t* st, UBaseType_t n, uint8_t* pct,
-                           int* core0, int* core1) {
+static bool sample(TaskStatus_t* st, UBaseType_t n, uint8_t* pct,
+                   int* core0, int* core1) {
     uint32_t now_us = (uint32_t)esp_timer_get_time();   // même troncature u32 que le compteur
-    bool     first  = (_si_prev_n == 0);
-    uint32_t dt_us  = first ? now_us : (now_us - _si_prev_us);
+    bool     first  = (_prev_n == 0);
+    uint32_t dt_us  = first ? now_us : (now_us - _prev_us);
 
-    // Premier relevé : on ne peut rapporter qu'au temps depuis le boot, ce qui
-    // n'a plus de sens une fois le compteur rebouclé.
+    // Premier relevé : pas de fenêtre exploitable.
     bool valid = (dt_us > 1000) && !(first && millis() > 71UL * 60 * 1000);
 
     uint32_t idle_us[2] = { 0, 0 };
 
     for (UBaseType_t i = 0; i < n; i++) {
         uint32_t prev = 0;
-        for (UBaseType_t j = 0; j < _si_prev_n; j++) {
-            if (_si_prev[j].h == st[i].xHandle) { prev = _si_prev[j].run; break; }
+        for (UBaseType_t j = 0; j < _prev_n; j++) {
+            if (_prev[j].h == st[i].xHandle) { prev = _prev[j].run; break; }
         }
         uint32_t d = st[i].ulRunTimeCounter - prev;   // non signé : robuste au wrap
         uint32_t p = valid ? (uint32_t)(((uint64_t)d * 100) / dt_us) : 0;
@@ -371,366 +453,686 @@ static bool _si_cpu_sample(TaskStatus_t* st, UBaseType_t n, uint8_t* pct,
     if (core1 && *core1 < 0 && valid) *core1 = 0;
 
     // Nouveau snapshot
-    _si_prev_n = (n < SI_MAX_TASKS) ? n : SI_MAX_TASKS;
-    for (UBaseType_t i = 0; i < _si_prev_n; i++) {
-        _si_prev[i].h   = st[i].xHandle;
-        _si_prev[i].run = st[i].ulRunTimeCounter;
+    _prev_n = (n < SI_MAX_TASKS) ? n : SI_MAX_TASKS;
+    for (UBaseType_t i = 0; i < _prev_n; i++) {
+        _prev[i].h   = st[i].xHandle;
+        _prev[i].run = st[i].ulRunTimeCounter;
     }
-    _si_prev_us = now_us;
+    _prev_us = now_us;
 
     return valid;
 }
 
-// ---- API LOCALES ----
-
-// --- PAGE 1 — IDENTITE ---
-
-// Lignes "Charge" — un cœur par ligne, avec barre. Efface avant de réécrire :
-// appelée aussi en rafraîchissement, par-dessus les anciennes valeurs.
-static void _si_draw_cpu_load(int y, int c0, int c1) {
-    char buf[16];
-    const int   pct[2]  = { c0, c1 };
-    const char* keys[2] = { "  Charge Core 0 : ", "  Charge Core 1 : " };
-
-    _si_sprite.fillRect(0, y, SI_W, SI_LH * 2, C_BG);
-    for (int i = 0; i < 2; i++) {
-        if (pct[i] >= 0) snprintf(buf, sizeof(buf), "%3d%%", pct[i]);
-        else             snprintf(buf, sizeof(buf), "  --");
-        uint16_t c = (pct[i] < 0) ? C_DIM : (pct[i] > 90) ? C_ORANGE : C_GREEN;
-        _si_row(y + i * SI_LH, keys[i], buf, c,
-                pct[i] >= 0, pct[i] / 100.0f, c, SI_CPU_BAR_W);
-    }
+// Charge des deux cœurs seule (page IDENTITE).
+static bool load(int* core0, int* core1) {
+    TaskStatus_t st[SI_MAX_TASKS];
+    UBaseType_t  n = uxTaskGetSystemState(st, SI_MAX_TASKS, nullptr);
+    if (n == 0) { *core0 = *core1 = -1; return false; }
+    return sample(st, n, nullptr, core0, core1);
 }
 
-static void _si_page_chip() {
+}  // namespace cpu
+
+
+// ════════════════════════════════════════════════════════════
+// INV — inventaire mémoire : postes connus, piles, comptabilité
+// ════════════════════════════════════════════════════════════
+// Source unique des tailles affichées par la page MEMOIRE ET journalisées par
+// sysinfo_log_memory(). Chaque poste vient du header de son propriétaire.
+
+namespace inv {
+
+struct Alloc { const char* label; bool internal; uint32_t bytes; };
+
+static const Alloc allocs[] = {
+    { "LVGL",       true,  LV_BUF_BYTES * LV_BUF_N },
+    { "MQTT out",   true,  MQTT_OUT_BUFFER_SIZE },
+    { "MQTT in",    false, MQTT_BUFFER_SIZE },
+    { "MQTT build", false, MQTT_BUFFER_SIZE },
+    { "Capture",    false, AUDIO_RECORD_CAPACITY_SAMPLES * sizeof(int16_t) },
+    { "Avatar",     false, COMPANION_PSRAM_BYTES },
+    { "JSON",       false, JSON_TOTAL_SIZE },
+    { "Sprite",     false, (uint32_t)SI_W * SI_H * 2 },
+    { "Canvas",     false, (uint32_t)SI_W * SI_H * 2 },
+    { "Screenshot", false, (uint32_t)SCREEN_WIDTH * SCREEN_HEIGHT * 2 },
+};
+static const int alloc_count = sizeof(allocs) / sizeof(allocs[0]);
+
+// ⚠️ Miroir des tailles de config.h : TaskStatus_t ne donne que le high-water,
+// jamais la taille allouée — sans ce lookup, pas de pourcentage.
+struct Stack { const char* name; uint16_t stack; };
+
+static const Stack stacks[] = {
+    { "loopTask",   STACK_BYTES_LOOP_TASK  },
+    { "audio_task", STACK_BYTES_AUDIO_TASK },
+    { "ai_task",    STACK_BYTES_AI_TASK    },
+    { "http_task",  STACK_BYTES_HTTP_TASK  },
+    { "mqtt_task",  STACK_BYTES_MQTT_TASK  },
+    { "ota_task",   STACK_BYTES_OTA_TASK   },
+};
+
+// Taille de pile allouée, 0 si inconnue (tâche système)
+static uint16_t stack_size(const char* name) {
+    for (auto const& s : stacks)
+        if (strcmp(s.name, name) == 0) return s.stack;
+    return 0;
+}
+
+// Buffers alloués paresseusement : tant qu'ils n'existent pas, les compter
+// fausserait le "non tracé" PSRAM d'autant.
+static bool sysinfo_allocated() { return surface::canvas_buf != nullptr; }
+
+// Un seul endroit décide, sinon le total et le journal divergent.
+static bool alloc_pending(const Alloc& a) {
+    if (strcmp(a.label, "Sprite") == 0 || strcmp(a.label, "Canvas") == 0)
+        return !sysinfo_allocated();
+    if (strcmp(a.label, "Screenshot") == 0) return !panel_capture_allocated();
+    return false;
+}
+
+static uint32_t stacks_bytes() {
+    uint32_t sum = 0;
+    for (auto const& s : stacks) sum += s.stack;
+    return sum;
+}
+
+static uint32_t known_internal() {
+    uint32_t sum = stacks_bytes();
+    for (auto const& a : allocs) if (a.internal) sum += a.bytes;
+    return sum;
+}
+
+static uint32_t known_psram() {
+    uint32_t sum = 0;
+    for (auto const& a : allocs) {
+        if (a.internal) continue;
+        if (!alloc_pending(a)) sum += a.bytes;
+    }
+    return sum;
+}
+
+// Relevé complet, lu UNE fois par affichage : partagé par la page MEMOIRE et
+// par sysinfo_log_memory().
+struct Mem {
+    size_t   int_free, int_total, int_min, int_used, int_largest;
+    uint32_t dma_free, dma_min;
+    bool     has_ps;
+    size_t   ps_free, ps_total, ps_min, ps_largest;
+    uint32_t esp_sr;
+    long     untracked_int;   // interne utilisé - postes connus - ESP_SR
+    long     untracked_ps;    // PSRAM utilisée  - postes connus
+};
+
+static Mem read() {
+    Mem m{};
+    m.int_free    = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    m.int_total   = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
+    m.int_min     = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+    m.int_used    = m.int_total - m.int_free;
+    m.int_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+
+    m.dma_free = heap_caps_get_free_size(MALLOC_CAP_DMA);
+    m.dma_min  = heap_caps_get_minimum_free_size(MALLOC_CAP_DMA);
+
+    m.has_ps = psramFound();
+    if (m.has_ps) {
+        m.ps_free    = ESP.getFreePsram();
+        m.ps_total   = ESP.getPsramSize();
+        m.ps_min     = heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM);
+        m.ps_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+    }
+
+    m.esp_sr = wakeword_esp_sr_internal_bytes();
+
+    // Reste SIGNÉ : un négatif signalerait que la table sur-compte.
+    m.untracked_int = (long)m.int_used - (long)known_internal() - (long)m.esp_sr;
+    m.untracked_ps  = m.has_ps ? (long)(m.ps_total - m.ps_free) - (long)known_psram() : 0;
+    return m;
+}
+
+static float used_frac(size_t freeB, size_t totalB) {
+    return totalB ? 1.0f - (float)freeB / (float)totalB : 0.0f;
+}
+
+}  // namespace inv
+
+
+// ════════════════════════════════════════════════════════════
+// PAGE 1 — IDENTITE
+//   FIXE   : bandeau puce, cadres des 3 cartes, grilles MATERIEL et SYSTEME
+//   BLITTÉ : la valeur + la jauge des 3 cartes (CPU0 / CPU1 / TEMP) ET la
+//            ligne d'uptime, juste dessous — UNE bande contiguë
+//            -> 1 Hz, blit_rows(LIVE_Y, LIVE_H)
+//
+// ════════════════════════════════════════════════════════════
+
+namespace page_chip {
+
+// -- géométrie & état --
+constexpr int HERO_Y   = SI_PAGE_Y0;        // nom de puce en double taille
+constexpr int HERO_SUB = HERO_Y + 18;       // révision / cœurs / fréquence
+
+constexpr int CARD_Y   = HERO_SUB + 17;     // les 3 cartes de charge
+constexpr int CARD_W   = 99;
+constexpr int CARD_TH  = 11;                // bandeau titré
+constexpr int CARD_H   = CARD_TH + 21;
+constexpr int CARD_X[] = { SI_LX, 111, 214 };
+
+constexpr int VAL_Y    = CARD_Y + CARD_TH + 3;   // valeur en double taille
+constexpr int VAL_W    = 4 * 12;                 // "100%" / " 54C", largeur figée
+constexpr int GAU_X    = 4 + VAL_W + 4;          // jauge, relative à la carte
+constexpr int GAU_W    = CARD_W - 4 - GAU_X;
+
+constexpr int UP_Y     = CARD_Y + CARD_H + 4;    // uptime, dans la même bande
+constexpr int LIVE_Y   = VAL_Y - 1;
+constexpr int LIVE_H   = UP_Y + SI_LH - LIVE_Y;
+
+constexpr int GX[]     = { SI_LX, 164 };    // grilles de faits, 2 colonnes
+constexpr int GW       = 148;
+
+// ---- BLITTÉ ----
+// Une carte : valeur en gros, jauge à droite. pct < 0 = pas de fenêtre de mesure.
+static void card_value(int i, const char* val, float frac, uint16_t c) {
+    int cx = CARD_X[i];
+    draw::big(cx + 4, VAL_Y, val, c);
+    draw::bar(cx + GAU_X, VAL_Y + 3, GAU_W, draw::BAR_HERO, frac, c);
+}
+
+static void draw_live(int c0, int c1) {
+    char buf[32];
+
+    for (int i = 0; i < 3; i++)
+        surface::fill_rect(CARD_X[i] + 1, LIVE_Y, CARD_W - 2, VAL_Y + 16 - LIVE_Y, C_BG);
+    draw::wipe_rows(UP_Y, SI_LH);
+
+    const int pct[2] = { c0, c1 };
+    for (int i = 0; i < 2; i++) {
+        if (pct[i] < 0) { card_value(i, "  --", 0, C_DIM); continue; }
+        snprintf(buf, sizeof(buf), "%3d%%", pct[i]);
+        card_value(i, buf, pct[i] / 100.0f, pct[i] > 90 ? C_ORANGE : C_GREEN);
+    }
+
+    // Jauge de température bornée à 100 C : au-delà la puce a d'autres soucis.
+    int t = (int)temperatureRead();
+    snprintf(buf, sizeof(buf), "%3dC", t);
+    card_value(2, buf, t / 100.0f, t < 50 ? C_GREEN : t < 70 ? C_YELLOW : C_RED);
+
+    // Uptime — esp_timer (u64) et non millis(), qui reboucle à 49,7 jours.
+    uint64_t s = (uint64_t)(esp_timer_get_time() / 1000000);
+    unsigned long d = (unsigned long)(s / 86400);
+    if (d) snprintf(buf, sizeof(buf), "%lu j  %02lu:%02lu:%02lu", d,
+                    (unsigned long)(s / 3600 % 24), (unsigned long)(s / 60 % 60),
+                    (unsigned long)(s % 60));
+    else   snprintf(buf, sizeof(buf), "%02lu:%02lu:%02lu",
+                    (unsigned long)(s / 3600), (unsigned long)(s / 60 % 60),
+                    (unsigned long)(s % 60));
+    draw::text(SI_LX, UP_Y, "Uptime", C_DKCYAN);
+    draw::text(SI_LX + 66, UP_Y, buf, C_CYAN);
+}
+
+static void refresh() {
+    int c0 = -1, c1 = -1;
+    cpu::load(&c0, &c1);
+    draw_live(c0, c1);
+    surface::blit_rows(LIVE_Y, LIVE_H);
+}
+
+// ---- FIXE ----
+// Une case de grille : intitulé à gauche, valeur alignée à droite de la colonne.
+static void cell(int col, int y, const char* key, const char* val, uint16_t c) {
+    draw::text(GX[col], y, key, C_DKCYAN);
+    draw::text_right(GX[col] + GW, y, val, c);
+}
+
+static void draw_static() {
     esp_chip_info_t chip;
     esp_chip_info(&chip);
     char buf[48];
-    int y = 30;
 
-    _si_section(y, ">> IDENTITE"); y += SI_LH;
+    // -- bandeau puce --
+    draw::big(SI_LX, HERO_Y, fmt::chip_model(chip.model), C_CYAN);
+    snprintf(buf, sizeof(buf), "rev %d  -  %d coeurs @ %d MHz",
+             chip.revision, chip.cores, getCpuFrequencyMhz());
+    draw::text(SI_LX, HERO_SUB, buf, C_DIM);
 
-    _si_row(y, "  Modele        : ", _si_chip_model_str(chip.model), C_WHITE); y += SI_LH;
+    // -- cadres des 3 cartes (l'intérieur appartient à draw_live) --
+    const char* titles[3] = { "CPU 0", "CPU 1", "TEMP DIE" };
+    const uint16_t strips[3] = { C_DKCYAN, C_MAGENTA_DK, C_DIM };   // mêmes teintes
+    for (int i = 0; i < 3; i++) {                                   // que les badges
+        int cx = CARD_X[i];                                         // de la page TACHES
+        surface::rect(cx, CARD_Y, CARD_W, CARD_H, strips[i]);
+        surface::fill_rect(cx + 1, CARD_Y + 1, CARD_W - 2, CARD_TH - 1, strips[i]);
+        draw::text(cx + 4, CARD_Y + 3, titles[i], C_WHITE, strips[i]);
+    }
 
-    snprintf(buf, sizeof(buf), "rev %d", chip.revision);
-    _si_row(y, "  Silicium      : ", buf, C_WHITE); y += SI_LH;
+    int y = UP_Y + SI_LH + 4;
+    draw::hline(y); y += 5;
+    draw::section(y, ">> MATERIEL"); y += SI_LH + 2;
 
-    snprintf(buf, sizeof(buf), "%d coeurs @ %d MHz", chip.cores, getCpuFrequencyMhz());
-    _si_row(y, "  CPU           : ", buf, C_WHITE); y += SI_LH;
-
-    // Charge instantanée, mesurée entre cet affichage et le précédent
-    // (cf. _si_cpu_sample). "--" tant qu'aucune fenêtre exploitable.
-    TaskStatus_t st[SI_MAX_TASKS];
-    UBaseType_t  n = uxTaskGetSystemState(st, SI_MAX_TASKS, nullptr);
-    int c0 = -1, c1 = -1;
-    if (n > 0) _si_cpu_sample(st, n, nullptr, &c0, &c1);
-
-    _si_chip_load_y = y;
-    _si_draw_cpu_load(y, c0, c1); y += SI_LH * 2;
-
-    snprintf(buf, sizeof(buf), "%s", ESP.getSdkVersion());
-    _si_row(y, "  IDF/Arduino   : ", buf, C_YELLOW); y += SI_LH;
-
-    _si_hline(y); y += 3;
-    _si_section(y, ">> FLASH"); y += SI_LH;
-
+    cell(0, y, "Ecran", "ILI9341V", C_WHITE);
     snprintf(buf, sizeof(buf), "%d MB", ESP.getFlashChipSize() / (1024 * 1024));
-    _si_row(y, "  Taille        : ", buf, C_YELLOW); y += SI_LH;
+    cell(1, y, "Flash",      buf,  C_YELLOW);
+    y += SI_LH;
 
-    snprintf(buf, sizeof(buf), "%lu MHz - %s",
+    snprintf(buf, sizeof(buf), "%dx%d", SCREEN_WIDTH, SCREEN_HEIGHT);
+    cell(0, y, "Resolution", buf, C_WHITE);
+    snprintf(buf, sizeof(buf), "%lu MHz %s",
              (unsigned long)(ESP.getFlashChipSpeed() / 1000000),
-             _si_flash_mode_str(ESP.getFlashChipMode()));
-    _si_row(y, "  Frequence     : ", buf, C_WHITE); y += SI_LH;
+             fmt::flash_mode(ESP.getFlashChipMode()));
+    cell(1, y, "Mode flash", buf, C_WHITE);
+    y += SI_LH;
 
-    _si_hline(y); y += 3;
-    _si_section(y, ">> ETAT"); y += SI_LH;
+    // ⚠️ La fréquence RÉELLE, pas TFT_SPI_HZ : le contrôleur arrondit à un
+    // diviseur entier de l'APB, demander 60 MHz donne 40 (cf. display_driver.h).
+    snprintf(buf, sizeof(buf), "%lu MHz", (unsigned long)(panel_actual_hz() / 1000000));
+    cell(0, y, "Bus SPI", buf, C_YELLOW);
+    if (psramFound()) snprintf(buf, sizeof(buf), "%lu MB",
+                               (unsigned long)(ESP.getPsramSize() / (1024 * 1024)));
+    else              snprintf(buf, sizeof(buf), "absente");
+    cell(1, y, "PSRAM", buf, psramFound() ? C_YELLOW : C_RED);
+    y += SI_LH + 4;
 
-    float tempCpu = temperatureRead();
-    int   tempInt = (int)tempCpu;
-    uint16_t tempColor = tempInt < 50 ? C_GREEN : tempInt < 70 ? C_YELLOW : C_RED;
-    snprintf(buf, sizeof(buf), "%d C (die)", tempInt);
-    _si_row(y, "  Temp CPU      : ", buf, tempColor); y += SI_LH;
+    draw::hline(y); y += 5;
+    draw::section(y, ">> SYSTEME"); y += SI_LH + 2;
+
+    draw::pair(SI_LX, y, "Firmware    : ", __DATE__ " " __TIME__, C_WHITE); y += SI_LH;
+    draw::pair(SI_LX, y, "IDF/Arduino : ", ESP.getSdkVersion(),   C_YELLOW); y += SI_LH;
 
     esp_reset_reason_t rr = esp_reset_reason();
     bool bad = (rr == ESP_RST_PANIC || rr == ESP_RST_TASK_WDT ||
                 rr == ESP_RST_INT_WDT || rr == ESP_RST_WDT || rr == ESP_RST_BROWNOUT);
     uint16_t rrColor = bad ? C_RED : (rr == ESP_RST_POWERON || rr == ESP_RST_SW) ? C_GREEN : C_YELLOW;
-    _si_row(y, "  Dernier rst   : ", _si_reset_reason_str(rr), rrColor); y += SI_LH;
+    draw::pair(SI_LX, y, "Dernier rst : ", fmt::reset_reason(rr), rrColor);
 }
 
-// --- PAGE 2 — MEMOIRE ---
-
-// Postes d'allocation connus du firmware — buffers/objets UNIQUEMENT, PAS les
-// piles de tâches (celles-ci vivent dans _si_stacks, comptées à part dans le
-// bilan mémoire pour ne pas doublonner). La LISTE reste tenue à la main —
-// l'ESP-IDF ne sait pas dire qui a alloué quoi sans CONFIG_HEAP_TASK_TRACKING,
-// absent des libs Arduino précompilées — mais chaque TAILLE vient désormais du
-// header de son propriétaire : elles ne peuvent plus diverger sans que le
-// compilateur le voie. Les littéraux d'origine avaient déjà dérivé deux fois
-// (LVGL sous-déclaré de 3 840 o, payload MQTT compté en interne alors qu'il est
-// en PSRAM).
-static const struct { const char* label; bool internal; uint32_t bytes; } _si_alloc[] = {
-    { "LVGL",     true,  LV_BUF_BYTES },                       // buffer de dessin
-    { "MQTT out", true,  MQTT_OUT_BUFFER_SIZE },               // buffer d'émission (interne)
-    { "MQTT buf", false, MQTT_BUFFER_SIZE },                   // buffer RX (PSRAM via seuil ALWAYSINTERNAL)
-    { "Reassemb.",false, MQTT_BUFFER_SIZE },                   // staging PSRAM du payload
-    { "Capture",  false, AUDIO_RECORD_CAPACITY_SAMPLES * 2 },  // buffer d'enregistrement
-    { "Avatar",   false, COMPANION_PSRAM_BYTES },              // frames Companion
-    { "JSON",     false, JSON_TOTAL_SIZE },                    // tables
-    // Sprite/Canvas EN DERNIER : alloués seulement à la 1re ouverture de SysInfo
-    // (paresseux) — le bilan mémoire les affiche à 0 tant que _si_screen == null.
-    { "Sprite",   false, (uint32_t)SI_W * SI_H * 2 },          // sprite SysInfo
-    { "Canvas",   false, (uint32_t)SI_W * SI_H * 2 },          // canvas SysInfo
-};
-
-// Partie VIVANTE de la page (les postes connus en dessous sont une table
-// statique). Retourne le y atteint.
-static int _si_draw_mem_live(int y) {
-    char buf[48];
-
-    _si_section(y, ">> HEAP INTERNE"); y += SI_LH;
-
-    size_t intFree  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    size_t intTotal = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
-    size_t intMin   = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
-    float  intPct   = intTotal ? 1.0f - (float)intFree / intTotal : 0;
-
-    snprintf(buf, sizeof(buf), "%lu KB / %lu KB libre",
-             (unsigned long)intFree / 1024, (unsigned long)intTotal / 1024);
-    _si_row(y, "  Libre        : ", buf, C_GREEN, true, intPct, C_MEM_INT, SI_MEM_BAR_W, true); y += SI_LH;
-
-    snprintf(buf, sizeof(buf), "%lu KB (pire cas atteint)", (unsigned long)intMin / 1024);
-    _si_row(y, "  Min. atteint : ", buf, C_YELLOW); y += SI_LH;
-
-    size_t dmaFree = heap_caps_get_free_size(MALLOC_CAP_DMA);
-    snprintf(buf, sizeof(buf), "%lu KB libre", (unsigned long)dmaFree / 1024);
-    _si_row(y, "  Capable DMA  : ", buf, C_MEM_INT); y += SI_LH;   // sous-ensemble de l'interne
-
-    _si_hline(y); y += 3;
-    _si_section(y, ">> PSRAM"); y += SI_LH;
-
-    if (psramFound()) {
-        size_t psFree  = ESP.getFreePsram();
-        size_t psTotal = ESP.getPsramSize();
-        size_t psMin   = heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM);
-        float  psPct   = psTotal ? 1.0f - (float)psFree / psTotal : 0;
-
-        snprintf(buf, sizeof(buf), "%lu KB / %lu KB libre",
-                 (unsigned long)psFree / 1024, (unsigned long)psTotal / 1024);
-        _si_row(y, "  Libre        : ", buf, C_GREEN, true, psPct, C_MEM_EXT, SI_MEM_BAR_W, true); y += SI_LH;
-
-        snprintf(buf, sizeof(buf), "%lu KB (pire cas atteint)", (unsigned long)psMin / 1024);
-        _si_row(y, "  Min. atteint : ", buf, C_YELLOW); y += SI_LH;
-    } else {
-        _si_row(y, "  Etat         : ", "NON DETECTEE", C_RED); y += SI_LH;
-    }
-
-    size_t sketchSize  = ESP.getSketchSize();
-    size_t sketchTotal = ESP.getFreeSketchSpace() + sketchSize;
-    float  sketchPct   = sketchTotal ? (float)sketchSize / sketchTotal : 0;
-    snprintf(buf, sizeof(buf), "%lu KB / %lu KB",
-             (unsigned long)sketchSize / 1024, (unsigned long)sketchTotal / 1024);
-    _si_row(y, "  Firmware     : ", buf, C_YELLOW, true, sketchPct, C_MAGENTA, SI_MEM_BAR_W, true); y += SI_LH;
-
-    return y;
+// ---- ASSEMBLAGE ----
+static void draw() {
+    draw_static();
+    // Charge instantanée, mesurée entre cet affichage et le précédent
+    // (cf. cpu::sample). "--" tant qu'aucune fenêtre exploitable.
+    int c0 = -1, c1 = -1;
+    cpu::load(&c0, &c1);
+    draw_live(c0, c1);
 }
 
-static void _si_page_mem() {
-    char buf[48];
+}  // namespace page_chip
 
-    _si_mem_y0 = 30;
-    int y = _si_draw_mem_live(_si_mem_y0);
-    _si_mem_y1 = y;
 
-    _si_hline(y); y += 3;
-
-    // Titre + légende de couleur : les deux mots dans leur teinte SERVENT de clé
-    // aux postes en dessous (orange = interne, bleu = PSRAM). print() enchaîne
-    // depuis le curseur laissé par le précédent.
-    _si_sprite.setTextSize(1);
-    _si_sprite.setTextColor(C_CYAN, C_BG);
-    _si_sprite.setCursor(SI_LX, y);
-    _si_sprite.print(">> POSTES CONNUS   ");
-    _si_sprite.setTextColor(C_MEM_INT, C_BG);
-    _si_sprite.print("interne  ");
-    _si_sprite.setTextColor(C_MEM_EXT, C_BG);
-    _si_sprite.print("PSRAM");
-    y += SI_LH;
-
-    // Deux colonnes compactes : "LVGL 7K int" / "Avatar 886K"
-    // COL1 s'aligne sur _si_row, dont les clés commencent par deux espaces —
-    // sans ce décalage le bloc paraissait rentré à gauche du reste de la page.
-    const int COL1 = SI_LX + 2 * 6;
-    const int COL2 = COL1 + 152;
-    int nb = sizeof(_si_alloc) / sizeof(_si_alloc[0]);
-    for (int i = 0; i < nb; i++) {
-        int colX = (i % 2 == 0) ? COL1 : COL2;
-        int rowY = y + (i / 2) * SI_LH;
-
-        // Interne/externe est porté par la COULEUR (cf. légende) : plus de
-        // suffixe "int", il faisait doublon.
-        snprintf(buf, sizeof(buf), "%-8s %4luK", _si_alloc[i].label,
-                 (unsigned long)(_si_alloc[i].bytes / 1024));
-        _si_sprite.setTextColor(_si_alloc[i].internal ? C_MEM_INT : C_MEM_EXT, C_BG);
-        _si_sprite.setTextSize(1);
-        _si_sprite.setCursor(colX, rowY);
-        _si_sprite.print(buf);
-    }
-}
-
-// --- PAGE 3 — RESEAU ---
-
-static void _si_page_net() {
-    char buf[48];
-    int y = 30;
-
-    _si_section(y, ">> WIFI"); y += SI_LH;
-
-    if (wifi_is_connected()) {
-        _si_row(y, "  SSID        : ", WiFi.SSID().c_str(), C_GREEN); y += SI_LH;
-        _si_row(y, "  IP          : ", WiFi.localIP().toString().c_str(), C_WHITE); y += SI_LH;
-        _si_row(y, "  Passerelle  : ", WiFi.gatewayIP().toString().c_str(), C_WHITE); y += SI_LH;
-        _si_row(y, "  Masque      : ", WiFi.subnetMask().toString().c_str(), C_WHITE); y += SI_LH;
-        _si_row(y, "  DNS         : ", WiFi.dnsIP().toString().c_str(), C_WHITE); y += SI_LH;
-        _si_row(y, "  MAC         : ", WiFi.macAddress().c_str(), C_DIM); y += SI_LH;
-
-        snprintf(buf, sizeof(buf), "canal %d", WiFi.channel());
-        _si_row(y, "  Wifi canal  : ", buf, C_WHITE); y += SI_LH;
-
-        int rssi = WiFi.RSSI();
-        uint16_t rssiColor = rssi > -60 ? C_GREEN : rssi > -75 ? C_YELLOW : C_RED;
-        snprintf(buf, sizeof(buf), "%d dBm", rssi);
-        _si_row(y, "  RSSI        : ", buf, rssiColor); y += SI_LH;
-    } else {
-        _si_row(y, "  Etat        : ", "DECONNECTE", C_RED); y += SI_LH;
-    }
-
-    _si_hline(y); y += 3;
-    _si_section(y, ">> MQTT"); y += SI_LH;
-
-    if (mqtt_is_connected()) {
-        snprintf(buf, sizeof(buf), "%s:%d", MQTT_BROKER, MQTT_PORT);
-        _si_row(y, "  Broker       : ", buf, C_GREEN); y += SI_LH;
-        _si_row(y, "  Client ID    : ", MQTT_CLIENT_ID, C_WHITE); y += SI_LH;
-    } else {
-        _si_row(y, "  Etat         : ", "DECONNECTE", C_RED); y += SI_LH;
-    }
-}
-
-// --- PAGE 4 — TACHES ---
-// Une colonne riche : NOM, cœur, état, priorité, %CPU, pile.
-// Etats : X=actif  R=pret  B=bloque  S=suspendu  D=supprime
+// ════════════════════════════════════════════════════════════
+// PAGE 2 — MEMOIRE
+//   FIXE   : les deux cadres de carte + leur bandeau, la liste des postes
+//   BLITTÉ : l'intérieur des deux cartes — jauge empilée + 4 valeurs
+//            -> UNE bande pleine largeur, un tick sur EVERY_N
 //
-// Les tâches IDLE sont EXCLUES de la liste : leur temps d'exécution est
-// précisément ce qui sert à calculer la charge par cœur affichée en tête,
-// l'afficher deux fois ne dirait rien de plus et coûterait deux lignes.
-//
-// Tri par ÉTAT puis %CPU décroissant. 
-// La liste dépasse toujours la hauteur disponible : ce qui est coupé doit être
-// ce qui n'apprend rien, donc les tâches bloquées et inactives, jamais celles qui consomment.
+// Deux cartes jumelles, une par domaine : RAM interne à gauche, PSRAM à droite.
+// La jauge empile connu / non tracé / libre ; en dessous, les postes de chaque
+// domaine dans SA colonne, valeur alignée à droite et filet de proportion.
+// ⚠️ Page la plus chère : le coût est la RELECTURE de la zone invalidée depuis
+// la PSRAM, jamais ce qui est dessiné dedans. Seuls leviers : CADENCE et
+// HAUTEUR blittée.
+// ════════════════════════════════════════════════════════════
 
-static char _si_task_state_char(eTaskState s) {
-    switch (s) {
-        case eRunning:   return 'X';
-        case eReady:     return 'R';
-        case eBlocked:   return 'B';
-        case eSuspended: return 'S';
-        case eDeleted:   return 'D';
-        default:         return '?';
-    }
+namespace page_mem {
+
+// -- géométrie & état --
+constexpr int CARD_W  = 152;
+constexpr int CARD_H  = 80;
+constexpr int CARD_Y  = SI_PAGE_Y0 + SI_LH + 2;
+constexpr int CARD_LX = SI_LX - 2;
+constexpr int CARD_RX = SI_W - SI_LX + 2 - CARD_W;
+constexpr int PAD     = 5;
+
+constexpr int TITLE_H = 13;                       // bandeau de carte
+constexpr int BIG_Y   = TITLE_H + 3;              // tout ce qui suit est
+constexpr int GAUGE_Y = BIG_Y + 18;               // relatif au haut de la carte
+constexpr int GAUGE_H = draw::BAR_HERO;
+constexpr int VAL_Y   = GAUGE_Y + GAUGE_H + 3;
+constexpr int VAL_LH  = 10;
+constexpr int VAL_N   = 3;
+
+constexpr int LIVE_Y  = CARD_Y + BIG_Y - 1;                   // bande BLITTÉE
+constexpr int LIVE_H  = (VAL_Y + VAL_N * VAL_LH) - BIG_Y + 1;
+
+constexpr int LIST_Y  = CARD_Y + CARD_H + 22;     // 1re ligne de la liste
+constexpr int LIST_LH = 12;
+constexpr int COL_W   = CARD_W - PAD * 2;         // largeur utile d'une colonne
+
+constexpr int EVERY_N = 2;      // un rafraîchissement sur deux : le heap ne
+                                // bouge pas assez vite pour justifier 1 Hz
+
+// ---- BLITTÉ ----
+// Jauge empilée : connu (teinte sourde) | non tracé (teinte vive) | libre (fond).
+static void gauge(int x, int y, uint32_t known, long untracked, uint32_t total,
+                  uint16_t c, uint16_t cdk) {
+    const int iw = COL_W - 2;
+    surface::rect(x, y, COL_W, GAUGE_H, C_DIM);
+    if (!total) return;
+
+    uint32_t u  = untracked > 0 ? (uint32_t)untracked : 0;
+    int      wk = (int)((uint64_t)known * iw / total);
+    int      wu = (int)((uint64_t)u * iw / total);
+    if (wk > iw)      wk = iw;
+    if (wk + wu > iw) wu = iw - wk;
+
+    surface::fill_rect(x + 1,           y + 1, wk,           GAUGE_H - 2, cdk);
+    surface::fill_rect(x + 1 + wk,      y + 1, wu,           GAUGE_H - 2, c);
+    surface::fill_rect(x + 1 + wk + wu, y + 1, iw - wk - wu, GAUGE_H - 2, C_BG);
 }
 
-// Rang de tri : plus c'est bas, plus la tâche mérite d'être vue. Elle tourne >
-// elle attend son tour > elle dort sur un sémaphore > elle est suspendue.
-static uint8_t _si_task_state_rank(eTaskState s) {
-    switch (s) {
-        case eRunning:   return 0;
-        case eReady:     return 1;
-        case eBlocked:   return 2;
-        case eSuspended: return 3;
-        case eDeleted:   return 4;
-        default:         return 5;
-    }
+// Une ligne de valeur d'une carte : intitulé à gauche, valeur alignée à droite.
+static void val(int cx, int i, const char* key, const char* v, uint16_t c) {
+    int y = CARD_Y + VAL_Y + i * VAL_LH;
+    draw::text(cx + PAD, y, key, C_DKCYAN);
+    draw::text_right(cx + CARD_W - PAD, y, v, c);
 }
 
-// Colonnes VIVANTES d'une ligne (le nom et le cœur, eux, ne bougent pas).
-// Efface avant d'écrire : appelée aussi en rafraîchissement.
-static void _si_draw_task_live(int rowY, const TaskStatus_t* t, uint8_t pct, bool cpu_ok) {
-    char buf[32];
-    _si_sprite.fillRect(SI_TASK_LIVE_X, rowY, SI_W - SI_TASK_LIVE_X, SI_LH, C_BG);
-    _si_sprite.setTextSize(1);
+// LA valeur de la carte, en double taille : ce qui reste.
+static void hero(int cx, const char* v, uint16_t c) {
+    int y = CARD_Y + BIG_Y;
+    draw::big(cx + PAD, y, v, c);
+    draw::text(cx + PAD + gfx::text_w(v, 2) + 5, y + 8, "libre", C_DIM);
+}
 
-    if (!t) {   // tâche disparue depuis l'entrée sur la page
-        _si_sprite.setTextColor(C_DIM, C_BG);
-        _si_sprite.setCursor(SI_TASK_LIVE_X, rowY);
-        _si_sprite.print("(terminee)");
+static void draw_live(const inv::Mem& m) {
+    char buf[24];
+
+    surface::fill_rect(CARD_LX + 1, LIVE_Y, CARD_W - 2, LIVE_H, C_BG);
+    surface::fill_rect(CARD_RX + 1, LIVE_Y, CARD_W - 2, LIVE_H, C_BG);
+
+    // -- carte gauche : RAM interne --
+    snprintf(buf, sizeof(buf), "%lu KB", (unsigned long)(m.int_free / 1024));
+    hero(CARD_LX, buf, C_GREEN);
+
+    gauge(CARD_LX + PAD, CARD_Y + GAUGE_Y,
+          inv::known_internal() + m.esp_sr, m.untracked_int, m.int_total,
+          C_MEM_INT, C_MEM_INT_DK);
+
+    snprintf(buf, sizeof(buf), "%lu KB", (unsigned long)(m.int_min / 1024));
+    val(CARD_LX, 0, "Min. atteint", buf, C_YELLOW);
+
+    snprintf(buf, sizeof(buf), "%lu KB", (unsigned long)(m.dma_free / 1024));
+    val(CARD_LX, 1, "DMA libre", buf, C_WHITE);
+
+    fmt::size(buf, sizeof(buf), m.untracked_int);
+    val(CARD_LX, 2, "Non trace", buf, C_MEM_INT);
+
+    // -- carte droite : PSRAM --
+    if (!m.has_ps) {
+        draw::text(CARD_RX + PAD, CARD_Y + BIG_Y + 4, "NON DETECTEE", C_RED);
         return;
     }
 
-    _si_sprite.setTextColor(C_DKCYAN, C_BG);
-    _si_sprite.setCursor(SI_TASK_LIVE_X, rowY);
-    _si_sprite.print(_si_task_state_char(t->eCurrentState));
+    snprintf(buf, sizeof(buf), "%lu KB", (unsigned long)(m.ps_free / 1024));
+    hero(CARD_RX, buf, C_GREEN);
 
-    snprintf(buf, sizeof(buf), "%2u", (unsigned)t->uxCurrentPriority);
-    _si_sprite.setCursor(124, rowY);
-    _si_sprite.print(buf);
+    gauge(CARD_RX + PAD, CARD_Y + GAUGE_Y,
+          inv::known_psram(), m.untracked_ps, m.ps_total,
+          C_MEM_EXT, C_MEM_EXT_DK);
 
-    // %CPU — orange au-delà de 30 %, la tâche mérite alors qu'on la regarde
-    if (cpu_ok) {
-        snprintf(buf, sizeof(buf), "%3u%%", (unsigned)pct);
-        _si_sprite.setTextColor(pct > 30 ? C_ORANGE : C_WHITE, C_BG);
-    } else {
-        snprintf(buf, sizeof(buf), "  --");
-        _si_sprite.setTextColor(C_DIM, C_BG);
-    }
-    _si_sprite.setCursor(154, rowY);
-    _si_sprite.print(buf);
+    snprintf(buf, sizeof(buf), "%lu KB", (unsigned long)(m.ps_min / 1024));
+    val(CARD_RX, 0, "Min. atteint", buf, C_YELLOW);
 
-    // Pile : high-water (octets LIBRES). Rouge < 512 o, orange < 1 Ko.
-    // Le total n'est connu que pour NOS tâches (cf. _si_stacks).
-    unsigned long freeBytes = (unsigned long)t->usStackHighWaterMark * sizeof(StackType_t);
-    uint16_t stackTotal = _si_stack_size(t->pcTaskName);
-    if (stackTotal) snprintf(buf, sizeof(buf), "%lu/%u", freeBytes, (unsigned)stackTotal);
-    else            snprintf(buf, sizeof(buf), "%lu", freeBytes);
+    snprintf(buf, sizeof(buf), "%lu KB", (unsigned long)(m.ps_largest / 1024));
+    val(CARD_RX, 1, "Bloc max",  buf, C_WHITE);
 
-    _si_sprite.setTextColor((freeBytes < 512) ? C_RED : (freeBytes < 1024) ? C_ORANGE : C_GREEN, C_BG);
-    _si_sprite.setCursor(198, rowY);
-    _si_sprite.print(buf);
+    fmt::size(buf, sizeof(buf), m.untracked_ps);
+    val(CARD_RX, 2, "Non trace", buf, C_MEM_EXT);
 }
 
-static void _si_page_tasks() {
+static void refresh() {
+    inv::Mem m = inv::read();
+    draw_live(m);
+    surface::blit_rows(LIVE_Y, LIVE_H);
+}
+
+// ---- FIXE ----
+// Cadre + bandeau titré. L'intérieur reste vide : il appartient à draw_live().
+static void card_frame(int cx, const char* title, uint32_t total,
+                       uint16_t c, uint16_t cdk) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%lu KB", (unsigned long)(total / 1024));
+
+    surface::rect(cx, CARD_Y, CARD_W, CARD_H, cdk);
+    surface::fill_rect(cx + 1, CARD_Y + 1, CARD_W - 2, TITLE_H - 1, cdk);
+    draw::text(cx + PAD, CARD_Y + 4, title, C_WHITE, cdk);
+    draw::text_right(cx + CARD_W - PAD, CARD_Y + 4, buf, c, cdk);
+}
+
+// Postes d'un domaine, un par ligne. ⚠️ Filet normalisé sur le PLUS GROS poste
+// de la colonne, pas sur le total : sinon tout est écrasé à quelques pixels.
+struct Item { const char* label; uint32_t bytes; };
+
+static void list_col(int cx, const Item* it, int n, uint16_t c, uint16_t cdk) {
+    uint32_t max = 0;
+    for (int i = 0; i < n; i++) if (it[i].bytes > max) max = it[i].bytes;
+
+    for (int i = 0; i < n; i++) {
+        int  y = LIST_Y + i * LIST_LH;
+        char buf[16];
+        fmt::size(buf, sizeof(buf), (long)it[i].bytes);
+
+        draw::text(cx + PAD, y, it[i].label, C_DKCYAN);
+        draw::text_right(cx + CARD_W - PAD, y, buf, c);
+
+        // Plancher à 1 px : un poste présent ne doit jamais avoir un filet vide.
+        int fw = max ? (int)((uint64_t)it[i].bytes * COL_W / max) : 0;
+        if (fw == 0 && it[i].bytes) fw = 1;
+        surface::fill_rect(cx + PAD, y + 9, COL_W, draw::RULE, C_GRID);
+        if (fw > 0) surface::fill_rect(cx + PAD, y + 9, fw, draw::RULE, cdk);
+    }
+}
+
+static void draw_static(const inv::Mem& m) {
+    draw::section(SI_PAGE_Y0, ">> BILAN MEMOIRE");
+
+    card_frame(CARD_LX, "RAM INTERNE", m.int_total, C_MEM_INT, C_MEM_INT_DK);
+    card_frame(CARD_RX, "PSRAM",       m.ps_total,  C_MEM_EXT, C_MEM_EXT_DK);
+
+    draw::hline(CARD_Y + CARD_H + 5);
+    draw::section(CARD_Y + CARD_H + 9, ">> POSTES CONNUS");
+
+    // Piles et ESP_SR ne sont pas dans inv::allocs (somme et mesure au boot) :
+    // ils rejoignent ici la colonne interne, d'où le +2. ⚠️ Dimensionné sur la
+    // table, pas à la main — un poste de plus déborderait sans rien dire.
+    Item li[inv::alloc_count + 2], ri[inv::alloc_count];
+    int  nl = 0, nr = 0;
+    for (auto const& a : inv::allocs) {
+        if (a.internal) li[nl++] = { a.label, a.bytes };
+        else            ri[nr++] = { a.label, a.bytes };
+    }
+    li[nl++] = { "Piles x6", inv::stacks_bytes() };
+    li[nl++] = { "ESP_SR",   m.esp_sr };
+
+    list_col(CARD_LX, li, nl, C_MEM_INT, C_MEM_INT_DK);
+    list_col(CARD_RX, ri, nr, C_MEM_EXT, C_MEM_EXT_DK);
+}
+
+// ---- ASSEMBLAGE ----
+static void draw() {
+    inv::Mem m = inv::read();
+    draw_static(m);
+    draw_live(m);
+}
+
+}  // namespace page_mem
+
+
+
+
+// ════════════════════════════════════════════════════════════
+// PAGE 3 — TACHES
+//   FIXE   : titres de colonnes, NOM + badge cœur de chaque ligne
+//   BLITTÉ : le bandeau de charge (1 rangée pleine largeur) ET les colonnes
+//            ETAT / PRI / %CPU / PILE avec leurs jauges (x >= LIVE_X)
+//            -> 1 Hz, deux blits DISJOINTS
+//
+// Etats : X=actif  R=pret  B=bloque  S=suspendu  D=supprime — la LETTRE dit
+// quoi, la COULEUR dit à quel point ça compte.
+//
+// Tâches IDLE EXCLUES : leur temps sert déjà à la charge par cœur du bandeau.
+// Tri par ÉTAT puis %CPU décroissant, pour que ce qui déborde de la page soit
+// ce qui dort. ⚠️ Ordre FIGÉ à l'entrée : le rejouer ferait sauter les lignes.
+// ════════════════════════════════════════════════════════════
+
+namespace page_tasks {
+
+// -- géométrie & état --
+constexpr int COL_NAME  = SI_LX;        // 13 caractères
+constexpr int COL_CORE  = 88;           // badge cœur
+constexpr int LIVE_X    = 100;          // tout ce qui suit est BLITTÉ
+constexpr int COL_STATE = LIVE_X;
+constexpr int COL_PRI   = 110;
+constexpr int COL_CPU   = 128;
+constexpr int CPU_BAR_X = 156;
+constexpr int CPU_BAR_W = 52;
+constexpr int COL_STACK = 212;
+constexpr int STK_BAR_X = 270;
+constexpr int STK_BAR_W = SI_W - SI_LX - STK_BAR_X;
+
+// Bandeau vedette, BLITTÉ lui aussi : figé, il mentirait pendant que les
+// lignes se rafraîchissent.
+constexpr int HDR_Y      = SI_PAGE_Y0;
+constexpr int HDR_H      = 18;          // une seule rangée : la valeur-vedette
+constexpr int HERO_BIG_X = 36;          // et son intitulé tiennent sur la même
+constexpr int HERO_BAR_X = 92;          // ligne que le contexte, sinon c'est
+constexpr int HERO_BAR_W = 48;          // une ligne de tâche en moins
+
+static struct {
+    TaskHandle_t order[SI_MAX_TASKS];   // ordre figé, retrouvé par handle
+    UBaseType_t  shown;
+    int          y0;
+} L;
+
+static uint16_t state_color(eTaskState s) {
+    switch (s) {
+        case eRunning:   return C_GREEN;
+        case eReady:     return C_YELLOW;
+        case eBlocked:   return C_DKCYAN;
+        case eSuspended: return C_DIM;
+        default:         return C_RED;
+    }
+}
+
+// ---- BLITTÉ ----
+// Bandeau : une jauge par cœur, puis nombre de tâches et heap libre.
+static void draw_header(int c0, int c1, unsigned tasks) {
+    char buf[48];
+    draw::wipe_rows(HDR_Y, HDR_H);
+
+    // ⚠️ Vedette sur le cœur 0 seul : le cœur 1 lit ~100 % en permanence par
+    // artefact (loopTask prio 1 affame IDLE1), l'afficher en gros serait une
+    // alarme permanente.
+    draw::text(SI_LX, HDR_Y + 4, "CPU0", C_DKCYAN);
+
+    if (c0 >= 0) {
+        snprintf(buf, sizeof(buf), "%d%%", c0);
+        uint16_t c = c0 > 90 ? C_ORANGE : c0 > 30 ? C_YELLOW : C_GREEN;
+        draw::big(HERO_BIG_X, HDR_Y, buf, c);
+        draw::bar(HERO_BAR_X, HDR_Y + 2, HERO_BAR_W, draw::BAR_HERO, c0 / 100.0f, c);
+    } else {
+        draw::big(HERO_BIG_X, HDR_Y, "--", C_DIM);
+        draw::bar(HERO_BAR_X, HDR_Y + 2, HERO_BAR_W, draw::BAR_HERO, 0, C_DIM);
+    }
+
+    if (c1 >= 0) snprintf(buf, sizeof(buf), "CPU1 %d%%   %u taches", c1, tasks);
+    else         snprintf(buf, sizeof(buf), "CPU1 --   %u taches", tasks);
+    draw::text_right(SI_W - SI_LX, HDR_Y + 4, buf, C_DIM);
+}
+
+// Colonnes vivantes d'une ligne (le nom et le cœur, eux, ne bougent pas).
+static void draw_live_row(int rowY, const TaskStatus_t* t, uint8_t pct, bool cpu_ok) {
+    char buf[32];
+    surface::fill_rect(LIVE_X, rowY, SI_W - LIVE_X, SI_LH, C_BG);
+
+    if (!t) {   // tâche disparue depuis l'entrée sur la page
+        draw::text(LIVE_X, rowY, "(terminee)", C_DIM);
+        return;
+    }
+
+    char st[2] = { fmt::task_state(t->eCurrentState), '\0' };
+    draw::text(COL_STATE, rowY, st, state_color(t->eCurrentState));
+
+    snprintf(buf, sizeof(buf), "%2u", (unsigned)t->uxCurrentPriority);
+    draw::text(COL_PRI, rowY, buf, C_DKCYAN);
+
+    // %CPU — orange au-delà de 30 %, rouge au-delà de 70 %.
+    if (cpu_ok) {
+        uint16_t c = pct > 70 ? C_RED : pct > 30 ? C_ORANGE : C_GREEN;
+        snprintf(buf, sizeof(buf), "%3u%%", (unsigned)pct);
+        draw::text(COL_CPU, rowY, buf, pct > 30 ? c : C_WHITE);
+        draw::bar(CPU_BAR_X, rowY + 1, CPU_BAR_W, draw::BAR_ROW, pct / 100.0f, c);
+    } else {
+        draw::text(COL_CPU, rowY, "  --", C_DIM);
+    }
+
+    // Pile : high-water (octets LIBRES). Rouge < 512 o, orange < 1 Ko. Jauge
+    // seulement pour NOS tâches : le total alloué n'est connu que d'elles.
+    unsigned long freeBytes = (unsigned long)t->usStackHighWaterMark * sizeof(StackType_t);
+    uint16_t stackTotal = inv::stack_size(t->pcTaskName);
+    uint16_t sc = (freeBytes < 512) ? C_RED : (freeBytes < 1024) ? C_ORANGE : C_GREEN;
+
+    if (stackTotal) {
+        snprintf(buf, sizeof(buf), "%lu/%u", freeBytes, (unsigned)stackTotal);
+        draw::text(COL_STACK, rowY, buf, sc);
+        draw::bar(STK_BAR_X, rowY + 1, STK_BAR_W, draw::BAR_ROW,
+                  1.0f - (float)freeBytes / (float)stackTotal, sc);
+    } else {
+        snprintf(buf, sizeof(buf), "%lu", freeBytes);
+        draw::text(COL_STACK, rowY, buf, sc);
+    }
+}
+
+static void refresh() {
+    if (L.shown == 0) return;
+
+    TaskStatus_t st[SI_MAX_TASKS];
+    UBaseType_t  n = uxTaskGetSystemState(st, SI_MAX_TASKS, nullptr);
+    if (n == 0) return;
+
+    uint8_t pct[SI_MAX_TASKS];
+    int  c0 = -1, c1 = -1;
+    bool cpu_ok = cpu::sample(st, n, pct, &c0, &c1);
+
+    draw_header(c0, c1, (unsigned)n);
+    surface::blit_rows(HDR_Y, HDR_H);
+
+    for (UBaseType_t i = 0; i < L.shown; i++) {
+        const TaskStatus_t* found = nullptr;
+        uint8_t p = 0;
+        for (UBaseType_t j = 0; j < n; j++) {
+            if (st[j].xHandle == L.order[i]) { found = &st[j]; p = pct[j]; break; }
+        }
+        draw_live_row(L.y0 + (int)(i * SI_LH), found, p, cpu_ok);
+    }
+
+    surface::blit_rect(LIVE_X, L.y0, SI_W - LIVE_X, (int)(L.shown * SI_LH));
+}
+
+// ---- ASSEMBLAGE ----
+// ⚠️ Le FIXE dépend du relevé (noms triés par %CPU) : draw_static et draw_live
+// sont indissociables au premier rendu, d'où un draw() d'un seul tenant.
+static void draw() {
     char buf[64];
-    int y = 30;
+    int y = SI_PAGE_Y0;
+
+    L.shown = 0;
 
     TaskStatus_t st[SI_MAX_TASKS];
     UBaseType_t  n = uxTaskGetSystemState(st, SI_MAX_TASKS, nullptr);
 
     if (n == 0) {
-        _si_sprite.setTextColor(C_RED, C_BG);
-        _si_sprite.setCursor(SI_LX, y);
-        _si_sprite.print("(uxTaskGetSystemState: buffer trop petit)");
+        draw::text(SI_LX, y, "(uxTaskGetSystemState: buffer trop petit)", C_RED);
         return;
     }
 
     uint8_t pct[SI_MAX_TASKS];
     int c0 = -1, c1 = -1;
-    bool cpu_ok = _si_cpu_sample(st, n, pct, &c0, &c1);
+    bool cpu_ok = cpu::sample(st, n, pct, &c0, &c1);
 
-    // En-tête sur UNE ligne : la place manque ici (chaque ligne prise à
-    // l'en-tête est une tâche de moins affichée).
-    // Le détail par cœur, avec barres, est sur la page IDENTITE
-    size_t heapFree = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    if (cpu_ok) snprintf(buf, sizeof(buf), "Core0 %3d%%  Core1 %3d%%  |  %u tach.  |  heap %luK",
-                         c0, c1, (unsigned)n, (unsigned long)heapFree / 1024);
-    else        snprintf(buf, sizeof(buf), "Core --  (premiere mesure)  |  %u tach.  |  heap %luK",
-                         (unsigned)n, (unsigned long)heapFree / 1024);
-    _si_sprite.setTextColor(C_CYAN, C_BG);
-    _si_sprite.setTextSize(1);
-    _si_sprite.setCursor(SI_LX, y);
-    _si_sprite.print(buf);
-    y += SI_LH;
+    draw_header(c0, c1, (unsigned)n);
+    y += HDR_H;
 
-    _si_hline(y); y += 5;
+    draw::hline(y); y += 5;
 
     // Écarte les IDLE, en compactant st[]/pct[] au passage
     UBaseType_t m = 0;
@@ -741,12 +1143,11 @@ static void _si_page_tasks() {
         m++;
     }
 
-    // Tri : état croissant (running d'abord), puis %CPU décroissant. Ce qui
-    // déborde de la page est donc ce qui dort et ne consomme rien.
+    // Tri : état croissant (running d'abord), puis %CPU décroissant.
     for (UBaseType_t i = 0; i < m; i++) {
         for (UBaseType_t j = i + 1; j < m; j++) {
-            uint8_t ri = _si_task_state_rank(st[i].eCurrentState);
-            uint8_t rj = _si_task_state_rank(st[j].eCurrentState);
+            uint8_t ri = fmt::task_rank(st[i].eCurrentState);
+            uint8_t rj = fmt::task_rank(st[j].eCurrentState);
             bool swap = (rj < ri) || (rj == ri && pct[j] > pct[i]);
             if (swap) {
                 TaskStatus_t t = st[i]; st[i] = st[j]; st[j] = t;
@@ -756,111 +1157,94 @@ static void _si_page_tasks() {
     }
 
     // Titres de colonnes
-    _si_sprite.setTextColor(C_DKCYAN, C_BG);
-    _si_sprite.setCursor(SI_LX, y);  _si_sprite.print("NOM");
-    _si_sprite.setCursor(96,    y);  _si_sprite.print("C");
-    _si_sprite.setCursor(110,   y);  _si_sprite.print("E");
-    _si_sprite.setCursor(124,   y);  _si_sprite.print("PRI");
-    _si_sprite.setCursor(154,   y);  _si_sprite.print("%CPU");
-    _si_sprite.setCursor(198,   y);  _si_sprite.print("PILE LIBRE/TOTAL");
+    draw::text(COL_NAME,  y, "NOM",          C_DKCYAN);
+    draw::text(COL_CORE,  y, "C",            C_DKCYAN);
+    draw::text(COL_STATE, y, "E",            C_DKCYAN);
+    draw::text(COL_PRI,   y, "PRI",          C_DKCYAN);
+    draw::text(COL_CPU,   y, "%CPU",         C_DKCYAN);
+    draw::text(COL_STACK, y, "PILE LIB/TOT", C_DKCYAN);
     y += SI_LH;
 
-    UBaseType_t maxRows = (UBaseType_t)((SI_H - 14 - y) / SI_LH);
-    // Si tout ne tient pas, la DERNIÈRE ligne sert au compteur de reste : il doit
-    // rester dans la zone effacée par _si_clear_content (jusqu'à y=226), sinon il
-    // se dessine sur le pied de page et n'en repart jamais.
+    UBaseType_t maxRows = (UBaseType_t)((SI_PAGE_YMAX - y) / SI_LH);
+    // ⚠️ Le compteur de reste doit rester dans la zone effacée par
+    // frame::clear_content, sinon il s'imprime sur le pied de page.
     UBaseType_t shown = (m <= maxRows) ? m : (maxRows > 0 ? maxRows - 1 : 0);
 
-    // Ordre figé pour les rafraîchissements 1 Hz (cf. _si_refresh_tasks)
-    _si_task_y0    = y;
-    _si_task_shown = shown;
+    L.y0    = y;
+    L.shown = shown;
 
     for (UBaseType_t i = 0; i < shown; i++) {
         int rowY = y + (int)(i * SI_LH);
-        _si_task_order[i] = st[i].xHandle;
+        L.order[i] = st[i].xHandle;
 
-        _si_sprite.setTextColor(C_WHITE, C_BG);
-        snprintf(buf, sizeof(buf), "%.14s", st[i].pcTaskName ? st[i].pcTaskName : "?");
-        _si_sprite.setCursor(SI_LX, rowY);
-        _si_sprite.print(buf);
+        // -- FIXE de la ligne : nom + badge cœur --
+        snprintf(buf, sizeof(buf), "%.13s", st[i].pcTaskName ? st[i].pcTaskName : "?");
+        draw::text(COL_NAME, rowY, buf, C_WHITE);
 
-        int core = (int)st[i].xCoreID;
-        _si_sprite.setTextColor(C_DKCYAN, C_BG);
-        _si_sprite.setCursor(96, rowY);
-        _si_sprite.print((core == 0 || core == 1) ? (char)('0' + core) : '*');
+        // '*' = sans affinité (ordonnancée sur l'un ou l'autre).
+        int  core = (int)st[i].xCoreID;
+        bool pinned = (core == 0 || core == 1);
+        char cbuf[2] = { pinned ? (char)('0' + core) : '*', '\0' };
+        uint16_t badge = !pinned ? C_DIM : (core == 0) ? C_DKCYAN : C_MAGENTA_DK;
+        surface::fill_rect(COL_CORE - 1, rowY - 1, 8, 10, badge);
+        draw::text(COL_CORE, rowY, cbuf, C_WHITE, badge);
 
-        _si_draw_task_live(rowY, &st[i], pct[i], cpu_ok);
+        // -- BLITTÉ de la ligne --
+        draw_live_row(rowY, &st[i], pct[i], cpu_ok);
     }
 
     if (m > shown) {
-        _si_sprite.setTextColor(C_DIM, C_BG);
-        _si_sprite.setCursor(SI_LX, y + (int)(shown * SI_LH));
         snprintf(buf, sizeof(buf), "+ %u autre(s) non affichee(s)", (unsigned)(m - shown));
-        _si_sprite.print(buf);
+        draw::text(SI_LX, y + (int)(shown * SI_LH), buf, C_DIM);
     }
 }
 
-// --- Rafraîchissements 1 Hz (blit PARTIEL, seule la zone réécrite est invalidée) ---
+}  // namespace page_tasks
+
+
+// ════════════════════════════════════════════════════════════
+// PAGE 4 — PARTITIONS FLASH
+//   FIXE   : tout
+//   BLITTÉ : néant
 //
-// ⚠️ Le %CPU est mesuré ENTRE DEUX RENDUS : rafraîchir à 1 Hz donne donc une
-// charge instantanée (c'est le but), mais le coût du rendu lui-même compte dans
-// loopTask, qui apparaît plus chargée qu'au repos. Même biais que htop.
+// Pastilles ACTIF/BOOT, table des partitions avec jauge d'occupation par ligne,
+// puis un graphe en barre empilée représentant l'occupation de la flash entière.
+// ════════════════════════════════════════════════════════════
 
-static void _si_refresh_chip() {
-    TaskStatus_t st[SI_MAX_TASKS];
-    UBaseType_t  n = uxTaskGetSystemState(st, SI_MAX_TASKS, nullptr);
-    if (n == 0) return;
+namespace page_part {
 
-    int c0 = -1, c1 = -1;
-    _si_cpu_sample(st, n, nullptr, &c0, &c1);
+// -- géométrie --
+constexpr int COL_LABEL = SI_LX;
+constexpr int COL_TYPE  = 72;
+constexpr int COL_SIZE  = 168;   // aligné à DROITE
+constexpr int COL_USED  = 204;   // aligné à DROITE
+constexpr int BAR_X     = 210;
+constexpr int BAR_W     = 42;
+constexpr int COL_OFF   = 258;
+constexpr int HERO_Y    = SI_PAGE_Y0 + 14;   // capacité en double taille
+constexpr int GRAPH_Y    = SI_PAGE_Y0 + 36;  // la carte de la flash, EN TÊTE
+constexpr int TABLE_Y    = SI_PAGE_Y0 + 85;  // 1re ligne de la table
+constexpr int GRAPH_H   = 16;
+constexpr int LEGEND_H  = 18;
+constexpr int MAX_GRAPH_PARTS = 16;
 
-    _si_draw_cpu_load(_si_chip_load_y, c0, c1);
-    _si_blit_rect(0, _si_chip_load_y, SI_W, SI_LH * 2);
-}
+// ⚠️ Relevé fait EN UNE FOIS avant tout dessin : le graphe, en tête de page, a
+// besoin de la liste complète alors que la table n'est pas encore tracée.
+struct Entry {
+    uint32_t address;
+    uint32_t size;
+    uint16_t color;
+    bool     isRunning;
+    float    usedFrac;   // 0..1 = occupé ; -1 = inconnu. Sert au GRAPHE, qui ne
+                         // surimprime que les partitions marquées overlay.
+    bool     overlay;    // spiffs/fat seulement : la teinte C_MAGENTA_DK de la
+                         // surimpression est celle de la légende, l'étendre aux
+                         // app dirait "spiffs" sur un segment applicatif.
+    char     label[18];
+    uint8_t  type, subtype;
+};
 
-// ⚠️ Blit PLEINE LARGEUR, volontairement. Restreindre aux seules colonnes de
-// valeurs (x >= 110) a été essayé et MESURÉ : -33 % de pixels pour -3 % de
-// temps seulement. Le coût du canvas est dominé par l'accès PSRAM, pas par le
-// nombre de pixels — une bande pleine largeur se lit en 640 octets contigus par
-// ligne, une tranche étroite lit 420 octets puis en saute 220, et l'efficacité
-// des rafales s'effondre. Ne pas refaire : ici, découper en largeur COÛTE.
-static void _si_refresh_mem() {
-    if (_si_mem_y1 <= _si_mem_y0) return;
-    int h = _si_mem_y1 - _si_mem_y0;
-    _si_sprite.fillRect(0, _si_mem_y0, SI_W, h, C_BG);
-    _si_draw_mem_live(_si_mem_y0);
-    _si_blit_rect(0, _si_mem_y0, SI_W, h);
-}
-
-static void _si_refresh_tasks() {
-    if (_si_task_shown == 0) return;
-
-    TaskStatus_t st[SI_MAX_TASKS];
-    UBaseType_t  n = uxTaskGetSystemState(st, SI_MAX_TASKS, nullptr);
-    if (n == 0) return;
-
-    uint8_t pct[SI_MAX_TASKS];
-    bool cpu_ok = _si_cpu_sample(st, n, pct, nullptr, nullptr);
-
-    // Ordre figé : on retrouve chaque tâche par son handle.
-    for (UBaseType_t i = 0; i < _si_task_shown; i++) {
-        const TaskStatus_t* found = nullptr;
-        uint8_t p = 0;
-        for (UBaseType_t j = 0; j < n; j++) {
-            if (st[j].xHandle == _si_task_order[i]) { found = &st[j]; p = pct[j]; break; }
-        }
-        _si_draw_task_live(_si_task_y0 + (int)(i * SI_LH), found, p, cpu_ok);
-    }
-
-    _si_blit_rect(SI_TASK_LIVE_X, _si_task_y0,
-                  SI_W - SI_TASK_LIVE_X, (int)(_si_task_shown * SI_LH));
-}
-
-// --- PAGE 5 — PARTITIONS FLASH ---
-// Table des partitions + partition de boot, puis un graphe en barre empilée
-// représentant l'occupation de la flash entière.
-
-static uint16_t _si_part_color(uint8_t type, uint8_t subtype, bool isRunning) {
+static uint16_t color_of(uint8_t type, uint8_t subtype, bool isRunning) {
     if (type == ESP_PARTITION_TYPE_APP) return isRunning ? C_GREEN : C_DKCYAN;
     switch (subtype) {
         case ESP_PARTITION_SUBTYPE_DATA_NVS:      return C_YELLOW;
@@ -872,218 +1256,307 @@ static uint16_t _si_part_color(uint8_t type, uint8_t subtype, bool isRunning) {
     }
 }
 
-static void _si_page_partitions() {
-    char buf[64];
-    int y = 30;
+// Taille réelle du binaire d'une partition applicative, en suivant l'en-tête
+// d'image ESP : 24 o d'en-tête, N segments (8 o + data_len), un checksum aligné
+// sur 16 o, puis le SHA256 s'il est annexé.
+// -1 si pas d'image valide — cas normal d'un slot OTA jamais écrit.
+static long image_size(const esp_partition_t* p) {
+    esp_image_header_t hdr;
+    if (esp_partition_read(p, 0, &hdr, sizeof(hdr)) != ESP_OK) return -1;
+    if (hdr.magic != ESP_IMAGE_HEADER_MAGIC) return -1;
+    if (hdr.segment_count == 0 || hdr.segment_count > ESP_IMAGE_MAX_SEGMENTS) return -1;
 
-    const esp_partition_t* running = esp_ota_get_running_partition();
-    const esp_partition_t* boot    = esp_ota_get_boot_partition();
-
-    _si_section(y, ">> BOOT"); y += SI_LH;
-
-    if (running) {
-        snprintf(buf, sizeof(buf), "%s (offset 0x%06X)", running->label, (unsigned)running->address);
-        _si_row(y, "  Active (en cours) : ", buf, C_GREEN); y += SI_LH;
-    } else {
-        _si_row(y, "  Active (en cours) : ", "INCONNU", C_RED); y += SI_LH;
+    size_t off = sizeof(esp_image_header_t);
+    for (int i = 0; i < hdr.segment_count; i++) {
+        esp_image_segment_header_t seg;
+        if (off + sizeof(seg) > p->size) return -1;
+        if (esp_partition_read(p, off, &seg, sizeof(seg)) != ESP_OK) return -1;
+        // Flash vierge lue comme des segments : sortir par -1, jamais boucler.
+        if (seg.data_len > p->size) return -1;
+        off += sizeof(seg) + seg.data_len;
+        if (off > p->size) return -1;
     }
 
-    if (boot && boot != running) {
-        snprintf(buf, sizeof(buf), "%s (prochain reboot)", boot->label);
-        _si_row(y, "  Boot programme     : ", buf, C_YELLOW); y += SI_LH;
-    }
+    off = (off + 1 + 15) & ~(size_t)15;   // octet de checksum, aligné sur 16 o
+    if (hdr.hash_appended) off += 32;     // SHA256 "simple hash", inclus dans l'image
 
-    _si_hline(y); y += 5;
+    return (off <= p->size) ? (long)off : -1;
+}
 
-    _si_sprite.setTextColor(C_DKCYAN, C_BG);
-    _si_sprite.setTextSize(1);
-    _si_sprite.setCursor(SI_LX, y);   _si_sprite.print("LABEL");
-    _si_sprite.setCursor(95, y);      _si_sprite.print("TYPE");
-    _si_sprite.setCursor(150, y);     _si_sprite.print("TAILLE");
-    _si_sprite.setCursor(210, y);     _si_sprite.print("OFFSET");
-    y += SI_LH;
+// Octets réellement occupés dans une partition. -1 quand la question n'a pas de
+// réponse lisible — affiché "--" plutôt qu'un 0 trompeur.
+//   app en cours : ESP.getSketchSize(), l'API éprouvée du core
+//   app inactive : image_size() ci-dessus
+//   littlefs     : littlefs_used_bytes()
+//   nvs / otadata / coredump / model : format interne, pas de notion
+//                  d'occupation lisible au runtime
+//
+// ⚠️ Reconnaissance par LABEL, pas par subtype : `partitions.csv` déclare DEUX
+// partitions de subtype `spiffs` (`littlefs` et `model`), et filtrer sur le
+// subtype attribue l'occupation de LittleFS aux deux.
+static long used_bytes(const esp_partition_t* p, bool isRunning) {
+    if (p->type == ESP_PARTITION_TYPE_APP)
+        return isRunning ? (long)ESP.getSketchSize() : image_size(p);
 
-    // Réserve la place du graphe avant de compter les lignes de tableau
-    const int graphH     = 16;
-    const int legendH    = 18;
-    const int graphBlock = 8 + graphH + 4 + legendH;
-    int maxRows = (SI_H - 14 - graphBlock - y) / SI_LH;
-    if (maxRows < 1) maxRows = 1;
+    // Le label est celui passé à LittleFS.begin() dans littlefs_manager.cpp.
+    if (strcmp(p->label, "littlefs") == 0 && littlefs_is_mounted())
+        return (long)littlefs_used_bytes();
 
-    int shown = 0;
+    return -1;
+}
 
-    struct PartGraphEntry {
-        uint32_t address;
-        uint32_t size;
-        uint16_t color;
-        bool     isRunning;
-        float    usedFrac;   // 0..1 = occupé (spiffs/fat) ; -1 = non applicable
-    };
-    static const int MAX_GRAPH_PARTS = 16;
-    PartGraphEntry graphEntries[MAX_GRAPH_PARTS];
-    int graphCount = 0;
-    uint32_t flashTotal = ESP.getFlashChipSize();
+// Barre empilée = flash entière, à l'échelle des adresses réelles.
+static void draw_graph(const Entry* e, int count, uint32_t flashTotal, int gy) {
+    const int gx = SI_LX;
+    const int gw = SI_W - SI_LX * 2;
 
-    esp_partition_iterator_t it = esp_partition_find(
-        ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, nullptr);
-
-    while (it != nullptr) {
-        const esp_partition_t* p = esp_partition_get(it);
-        bool isRunning = running && (p->address == running->address);
-
-        if (shown < maxRows) {
-            _si_sprite.setTextColor(isRunning ? C_GREEN : C_WHITE, C_BG);
-            _si_sprite.setCursor(SI_LX, y);
-            _si_sprite.print(p->label);
-            if (isRunning) _si_sprite.print("*");
-
-            _si_sprite.setTextColor(C_CYAN, C_BG);
-            _si_sprite.setCursor(95, y);
-            _si_sprite.print(_si_part_subtype_str(p->type, p->subtype));
-
-            _si_sprite.setTextColor(C_YELLOW, C_BG);
-            _si_sprite.setCursor(150, y);
-            snprintf(buf, sizeof(buf), "%lu KB", (unsigned long)(p->size / 1024));
-            _si_sprite.print(buf);
-
-            _si_sprite.setTextColor(C_DIM, C_BG);
-            _si_sprite.setCursor(210, y);
-            snprintf(buf, sizeof(buf), "0x%06X", (unsigned)p->address);
-            _si_sprite.print(buf);
-
-            y += SI_LH;
-            shown++;
-        }
-
-        if (graphCount < MAX_GRAPH_PARTS) {
-            graphEntries[graphCount].address   = p->address;
-            graphEntries[graphCount].size      = p->size;
-            graphEntries[graphCount].color     = _si_part_color(p->type, p->subtype, isRunning);
-            graphEntries[graphCount].isRunning = isRunning;
-
-            bool isSpiffs = (p->subtype == ESP_PARTITION_SUBTYPE_DATA_SPIFFS ||
-                             p->subtype == ESP_PARTITION_SUBTYPE_DATA_FAT);
-            if (isSpiffs && littlefs_is_mounted() && littlefs_total_bytes() > 0) {
-                graphEntries[graphCount].usedFrac =
-                    (float)littlefs_used_bytes() / (float)littlefs_total_bytes();
-            } else {
-                graphEntries[graphCount].usedFrac = -1.0f;
-            }
-            graphCount++;
-        }
-
-        it = esp_partition_next(it);   // libère l'itérateur en interne au dernier appel
-    }
-
-    // --- Graphe : barre empilée = flash entière ---
-    int gy = SI_H - 14 - legendH - 4 - graphH;
-    int gx = SI_LX;
-    int gw = SI_W - SI_LX * 2;
-
-    _si_sprite.drawRect(gx, gy, gw, graphH, C_DIM);
+    surface::rect(gx, gy, gw, GRAPH_H, C_DIM);
 
     uint32_t cursorAddr = 0;
     int      cursorX    = gx + 1;
-    int      barInnerW  = gw - 2;
+    int      innerW     = gw - 2;
 
-    for (int i = 0; i < graphCount; i++) {
+    for (int i = 0; i < count; i++) {
         // Espace non alloué avant cette partition (bootloader, table de part.)
-        if (graphEntries[i].address > cursorAddr) {
-            uint32_t gap = graphEntries[i].address - cursorAddr;
-            int gapW = (int)((uint64_t)gap * barInnerW / flashTotal);
+        if (e[i].address > cursorAddr) {
+            uint32_t gap = e[i].address - cursorAddr;
+            int gapW = (int)((uint64_t)gap * innerW / flashTotal);
             if (gapW > 0) {
-                _si_sprite.fillRect(cursorX, gy + 1, gapW, graphH - 2, C_GRID);
+                surface::fill_rect(cursorX, gy + 1, gapW, GRAPH_H - 2, C_GRID);
                 cursorX += gapW;
             }
         }
 
-        int segW = (int)((uint64_t)graphEntries[i].size * barInnerW / flashTotal);
+        int segW = (int)((uint64_t)e[i].size * innerW / flashTotal);
         if (segW < 1) segW = 1;
-        _si_sprite.fillRect(cursorX, gy + 1, segW, graphH - 2, graphEntries[i].color);
+        surface::fill_rect(cursorX, gy + 1, segW, GRAPH_H - 2, e[i].color);
 
         // Surimpression : portion réellement occupée (spiffs/fat, réservé large)
-        if (graphEntries[i].usedFrac >= 0.0f) {
-            int usedW = (int)(segW * constrain(graphEntries[i].usedFrac, 0.0f, 1.0f));
-            if (usedW > 0) _si_sprite.fillRect(cursorX, gy + 1, usedW, graphH - 2, C_MAGENTA_DK);
+        if (e[i].overlay && e[i].usedFrac >= 0.0f) {
+            int usedW = (int)(segW * constrain(e[i].usedFrac, 0.0f, 1.0f));
+            if (usedW > 0) surface::fill_rect(cursorX, gy + 1, usedW, GRAPH_H - 2, C_MAGENTA_DK);
         }
 
-        // Délimiteur sur CHAQUE segment (blanc pour la partition active) : sans
-        // ça, deux partitions de même couleur se lisaient comme un seul bloc.
-        _si_sprite.drawRect(cursorX, gy + 1, segW, graphH - 2,
-                            graphEntries[i].isRunning ? C_WHITE : C_DKCYAN);
+        // Délimiteur sur CHAQUE segment : sans ça, deux partitions de même
+        // couleur se lisent comme un seul bloc.
+        surface::rect(cursorX, gy + 1, segW, GRAPH_H - 2,
+                              e[i].isRunning ? C_WHITE : C_DKCYAN);
 
         cursorX += segW;
-        cursorAddr = graphEntries[i].address + graphEntries[i].size;
+        cursorAddr = e[i].address + e[i].size;
     }
 
-    if (cursorX < gx + 1 + barInnerW) {
-        _si_sprite.fillRect(cursorX, gy + 1, gx + 1 + barInnerW - cursorX, graphH - 2, C_GRID);
-    }
+    if (cursorX < gx + 1 + innerW)
+        surface::fill_rect(cursorX, gy + 1, gx + 1 + innerW - cursorX, GRAPH_H - 2, C_GRID);
+}
 
-    // --- Légende ---
-    int ly = gy + graphH + 4;
-    int lx = gx;
+static void draw_legend(int ly) {
     const int swatch = 8;
+    int lx = SI_LX;
 
-    auto drawLegendItem = [&](uint16_t color, const char* label) {
+    auto item = [&](uint16_t color, const char* label) {
         if (lx + swatch + (int)strlen(label) * 6 + 10 > SI_W - SI_LX) {
-            lx = gx;
+            lx = SI_LX;
             ly += 9;
         }
-        _si_sprite.fillRect(lx, ly, swatch, swatch, color);
-        _si_sprite.drawRect(lx, ly, swatch, swatch, C_DIM);
-        _si_sprite.setTextColor(C_DIM, C_BG);
-        _si_sprite.setCursor(lx + swatch + 2, ly);
-        _si_sprite.print(label);
+        surface::fill_rect(lx, ly, swatch, swatch, color);
+        surface::rect(lx, ly, swatch, swatch, C_DIM);
+        draw::text(lx + swatch + 2, ly, label, C_DIM);
         lx += swatch + (int)strlen(label) * 6 + 10;
     };
 
-    drawLegendItem(C_YELLOW, "nvs");
-    drawLegendItem(C_DKCYAN, "app inactif");
-    drawLegendItem(C_GREEN, "app actif");
-    drawLegendItem(C_MAGENTA, "spiffs/fat");
-    drawLegendItem(C_GRID, "libre/system");
+    item(C_YELLOW,     "nvs");
+    item(C_DKCYAN,     "app inactif");
+    item(C_GREEN,      "app actif");
+    item(C_MAGENTA,    "spiffs/fat");
+    // Entrée de légende de la surimpression sombre.
+    item(C_MAGENTA_DK, "littlefs occupe");
+    item(C_GRID,       "libre/system");
 }
 
-// --- PAGE 6 — LITTLEFS ---
-// Sous-répertoires affichés en une ligne agrégée "[DIR] nom (N)". Pattern
-// d'itération conforme à l'exemple officiel listDir() : openNextFile() est
-// TOUJOURS rappelé sur le handle du répertoire, jamais sur l'entrée renvoyée —
-// et un sous-répertoire doit être rouvert par chemin pour obtenir son propre
-// curseur. Pas de récursion plus profonde : la hiérarchie est plate.
-static void _si_page_fs() {
-    char buf[48];
-    int y = 30;
+static void draw() {
+    char buf[64];
 
-    _si_section(y, ">> LITTLEFS"); y += SI_LH;
+    const esp_partition_t* running = esp_ota_get_running_partition();
+    const esp_partition_t* boot    = esp_ota_get_boot_partition();
+    uint32_t flashTotal = ESP.getFlashChipSize();
+
+    // -- relevé complet, avant tout dessin --
+    Entry entries[MAX_GRAPH_PARTS];
+    int   count = 0;
+
+    esp_partition_iterator_t it = esp_partition_find(
+        ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, nullptr);
+
+    while (it != nullptr && count < MAX_GRAPH_PARTS) {
+        const esp_partition_t* p = esp_partition_get(it);
+        bool isRunning = running && (p->address == running->address);
+
+        // Occupation réelle — lue UNE fois, partagée par la colonne UTIL% et par
+        // la surimpression du graphe.
+        long  usedB    = used_bytes(p, isRunning);
+        Entry& e = entries[count++];
+        e.address   = p->address;
+        e.size      = p->size;
+        e.color     = color_of(p->type, p->subtype, isRunning);
+        e.isRunning = isRunning;
+        e.usedFrac  = (usedB >= 0 && p->size) ? (float)usedB / (float)p->size : -1.0f;
+        e.overlay   = (strcmp(p->label, "littlefs") == 0);
+        e.type      = p->type;
+        e.subtype   = p->subtype;
+        snprintf(e.label, sizeof(e.label), "%s%s", p->label, isRunning ? "*" : "");
+
+        it = esp_partition_next(it);   // libère l'itérateur au dernier appel
+    }
+
+    // -- bandeau vedette : la capacité, puis la carte de la flash --
+    int y = SI_PAGE_Y0;
+    draw::section(y, ">> MEMOIRE FLASH");
+
+    snprintf(buf, sizeof(buf), "%lu MB", (unsigned long)(flashTotal / (1024 * 1024)));
+    draw::big(SI_LX, HERO_Y, buf, C_YELLOW);
+
+    // Pastilles : ce qui tourne, et ce qui tournera au prochain reboot.
+    int bx = SI_LX + gfx::text_w(buf, 2) + 12;
+    if (running) {
+        snprintf(buf, sizeof(buf), "ACTIF  %s  @ 0x%06X", running->label, (unsigned)running->address);
+        bx += draw::badge(bx, HERO_Y + 4, buf, C_GREEN) + 8;
+    } else {
+        bx += draw::badge(bx, HERO_Y + 4, "ACTIF  INCONNU", C_RED, C_WHITE) + 8;
+    }
+    if (boot && boot != running) {
+        snprintf(buf, sizeof(buf), "BOOT  %s", boot->label);
+        draw::badge(bx, HERO_Y + 4, buf, C_YELLOW);
+    }
+
+    draw_graph(entries, count, flashTotal, GRAPH_Y);
+    draw_legend(GRAPH_Y + GRAPH_H + 4);
+
+    // -- table des partitions --
+    y = TABLE_Y;
+    draw::hline(y - 5);
+
+    draw::text(COL_LABEL, y, "LABEL",  C_DKCYAN);
+    draw::text(COL_TYPE,  y, "TYPE",   C_DKCYAN);
+    draw::text_right(COL_SIZE, y, "TAILLE", C_DKCYAN);
+    draw::text_right(COL_USED, y, "UTIL%",  C_DKCYAN);
+    draw::text(COL_OFF,   y, "OFFSET", C_DKCYAN);
+    y += SI_LH;
+
+    int maxRows = (SI_PAGE_YMAX - y) / SI_LH;
+
+    for (int i = 0; i < count && i < maxRows; i++) {
+        const Entry& e = entries[i];
+
+        draw::text(COL_LABEL, y, e.label, e.isRunning ? C_GREEN : C_WHITE);
+        draw::text(COL_TYPE,  y, fmt::part_subtype(e.type, e.subtype), C_CYAN);
+
+        snprintf(buf, sizeof(buf), "%lu KB", (unsigned long)(e.size / 1024));
+        draw::text_right(COL_SIZE, y, buf, C_YELLOW);
+
+        // Rampe de criticité : ici l'orange/rouge dit bien "ça se remplit".
+        if (e.usedFrac >= 0.0f) {
+            unsigned pctUsed = (unsigned)(e.usedFrac * 100.0f + 0.5f);
+            uint16_t c = pctUsed >= 90 ? C_RED : pctUsed >= 70 ? C_ORANGE : C_GREEN;
+            snprintf(buf, sizeof(buf), "%u%%", pctUsed);
+            draw::text_right(COL_USED, y, buf, c);
+            draw::bar(BAR_X, y + 1, BAR_W, draw::BAR_ROW, e.usedFrac, c);
+        } else {
+            // nvs/otadata/model : format interne, pas d'occupation lisible.
+            draw::text_right(COL_USED, y, "--", C_DIM);
+            surface::rect(BAR_X, y + 1, BAR_W, draw::BAR_ROW, C_GRID);
+        }
+
+        snprintf(buf, sizeof(buf), "0x%06X", (unsigned)e.address);
+        draw::text(COL_OFF, y, buf, C_DIM);
+        y += SI_LH;
+    }
+}
+
+}  // namespace page_part
+
+
+// ════════════════════════════════════════════════════════════
+// PAGE 5 — LITTLEFS
+//   FIXE   : tout
+//   BLITTÉ : néant
+//
+// Jauge d'occupation en tête, puis une ligne par entrée de la racine avec un
+// filet donnant sa part de l'occupation. Sous-répertoires agrégés en une ligne
+// "[DIR] nom (N)".
+// ⚠️ openNextFile() est TOUJOURS rappelé sur le handle du répertoire, jamais sur
+// l'entrée renvoyée, et un sous-répertoire doit être rouvert par chemin pour
+// obtenir son propre curseur.
+// ════════════════════════════════════════════════════════════
+
+namespace page_fs {
+
+// -- géométrie --
+constexpr int COL_NAME = SI_LX;
+constexpr int COL_SIZE = SI_W - SI_LX;          // aligné à DROITE
+constexpr int HERO_Y   = SI_PAGE_Y0 + SI_LH + 2;
+constexpr int GAU_X    = 70;
+constexpr int GAU_W    = SI_W - SI_LX - GAU_X;
+
+// Une entrée de la racine : nom, taille à droite, filet de part d'occupation.
+static void entry_row(int y, const char* name, uint16_t nameColor,
+                      uint16_t barColor, size_t bytes, size_t used) {
+    char buf[16];
+    fmt::size(buf, sizeof(buf), (long)bytes);
+
+    draw::text(COL_NAME, y, name, nameColor);
+    draw::text_right(COL_SIZE, y, buf, C_GREEN);
+
+    // Part de l'OCCUPATION, pas de la capacité : rapporté à la partition
+    // entière, chaque fichier ferait un filet invisible.
+    int w  = COL_SIZE - COL_NAME;
+    int fw = used ? (int)((uint64_t)bytes * w / used) : 0;
+    if (fw == 0 && bytes) fw = 1;
+    surface::fill_rect(COL_NAME, y + 9, w, draw::RULE, C_GRID);
+    if (fw > 0) surface::fill_rect(COL_NAME, y + 9, fw, draw::RULE, barColor);
+}
+
+static void draw() {
+    char buf[48];
+    int y = SI_PAGE_Y0;
+
+    draw::section(y, ">> LITTLEFS");
 
     if (!littlefs_is_mounted()) {
-        _si_row(y, "  Etat        : ", "NON MONTE", C_RED);
+        draw::badge(SI_LX, HERO_Y, "SYSTEME DE FICHIERS NON MONTE", C_RED, C_WHITE);
         return;
     }
 
-    size_t total = littlefs_total_bytes();
-    size_t used  = littlefs_used_bytes();
-    snprintf(buf, sizeof(buf), "%lu KB / %lu KB",
-             (unsigned long)(used / 1024), (unsigned long)(total / 1024));
-    _si_row(y, "  Occupation  : ", buf, C_YELLOW); y += SI_LH;
+    size_t   total = littlefs_total_bytes();
+    size_t   used  = littlefs_used_bytes();
+    unsigned pct   = total ? (unsigned)((uint64_t)used * 100 / total) : 0;
 
-    _si_hline(y); y += 5;
+    // -- jauge d'occupation, en gros --
+    uint16_t c = pct >= 90 ? C_RED : pct >= 70 ? C_ORANGE : C_GREEN;
+    snprintf(buf, sizeof(buf), "%3u%%", pct);
+    draw::big(SI_LX, HERO_Y, buf, c);
+    draw::bar(GAU_X, HERO_Y + 3, GAU_W, draw::BAR_HERO, pct / 100.0f, c);
 
-    _si_sprite.setTextColor(C_DKCYAN, C_BG);
-    _si_sprite.setTextSize(1);
-    _si_sprite.setCursor(SI_LX, y);  _si_sprite.print("FICHIER");
-    _si_sprite.setCursor(220, y);    _si_sprite.print("TAILLE");
+    snprintf(buf, sizeof(buf), "%lu KB occupes  /  %lu KB  -  libre %lu KB",
+             (unsigned long)(used / 1024), (unsigned long)(total / 1024),
+             (unsigned long)((total - used) / 1024));
+    draw::text(GAU_X, HERO_Y + 20, buf, C_DIM);
+
+    y = HERO_Y + 32;
+    draw::hline(y); y += 5;
+
+    draw::text(COL_NAME, y, "FICHIER", C_DKCYAN);
+    draw::text_right(COL_SIZE, y, "TAILLE", C_DKCYAN);
     y += SI_LH;
 
     fs::File root = littlefs_open("/", "r");
     if (!root || !root.isDirectory()) {
-        _si_row(y, "  Erreur      : ", "racine invalide", C_RED);
+        draw::badge(SI_LX, y, "RACINE INVALIDE", C_RED, C_WHITE);
         return;
     }
 
-    const int footerBlock = SI_LH * 2 + 8;   // 2 lignes de résumé + séparateur
-    const int maxY = SI_H - 14 - footerBlock;
+    // Réserve : la ligne "... suite ...", le séparateur et la ligne de résumé.
+    const int maxY = SI_PAGE_YMAX - (SI_LH * 2 + 11);
 
     uint16_t fileCount = 0;   // fichiers réels, sous-répertoires inclus
     fs::File file = root.openNextFile();
@@ -1108,27 +1581,11 @@ static void _si_page_fs() {
             }
 
             snprintf(name, sizeof(name), "[DIR] %.16s (%u)", file.name(), subCount);
-            _si_sprite.setTextColor(C_MEM_EXT, C_BG);   // bleu : distingue les répertoires des fichiers
-            _si_sprite.setCursor(SI_LX, y);
-            _si_sprite.print(name);
-
-            snprintf(buf, sizeof(buf), "%lu KB", (unsigned long)((subSize + 1023) / 1024));
-            _si_sprite.setTextColor(C_GREEN, C_BG);
-            _si_sprite.setCursor(220, y);
-            _si_sprite.print(buf);
-
+            entry_row(y, name, C_MEM_EXT, C_MEM_EXT_DK, subSize, used);   // bleu : repertoire
             fileCount += subCount;
         } else {
-            snprintf(name, sizeof(name), "%.20s", file.name());
-            _si_sprite.setTextColor(C_WHITE, C_BG);
-            _si_sprite.setCursor(SI_LX, y);
-            _si_sprite.print(name);
-
-            snprintf(buf, sizeof(buf), "%lu KB", (unsigned long)((file.size() + 1023) / 1024));
-            _si_sprite.setTextColor(C_GREEN, C_BG);
-            _si_sprite.setCursor(220, y);
-            _si_sprite.print(buf);
-
+            snprintf(name, sizeof(name), "%.24s", file.name());
+            entry_row(y, name, C_WHITE, C_DKCYAN, file.size(), used);
             fileCount++;
         }
 
@@ -1140,168 +1597,321 @@ static void _si_page_fs() {
     }
 
     if (file) {
-        _si_sprite.setTextColor(C_ORANGE, C_BG);
-        _si_sprite.setCursor(SI_LX, y);
-        _si_sprite.print("... suite ...");
+        draw::text(SI_LX, y, "... suite ...", C_ORANGE);
         y += SI_LH;
         file.close();
     }
     root.close();
 
-    _si_hline(y); y += 4;
+    draw::hline(y); y += 4;
 
-    snprintf(buf, sizeof(buf), "%u fichier(s)  |  Libre : %lu KB",
-             fileCount, (unsigned long)((total - used) / 1024));
-    _si_sprite.setTextColor(C_CYAN, C_BG);
-    _si_sprite.setCursor(SI_LX, y);
-    _si_sprite.print(buf);
+    snprintf(buf, sizeof(buf), "%u fichier(s)", fileCount);
+    draw::text(SI_LX, y, buf, C_CYAN);
 }
 
-// --- Dispatcher ---
+}  // namespace page_fs
 
-static void _si_render_page(int page) {
-    // Seule la page TÂCHES le renseignera : point de passage commun à toutes
-    // les navigations, donc le seul endroit où le remettre à zéro.
-    _si_task_shown = 0;
-    switch (page) {
-        case SI_PAGE_CHIP:  _si_page_chip();       break;
-        case SI_PAGE_MEM:   _si_page_mem();        break;
-        case SI_PAGE_NET:   _si_page_net();        break;
-        case SI_PAGE_TASKS: _si_page_tasks();      break;
-        case SI_PAGE_PART:  _si_page_partitions(); break;
-        case SI_PAGE_FS:    _si_page_fs();         break;
+
+// ════════════════════════════════════════════════════════════
+// PAGE 6 — RESEAU
+//   FIXE   : tout
+//   BLITTÉ : néant
+//
+// Pastilles d'état, carte SIGNAL (RSSI en gros + jauge + qualité), grille
+// d'adressage en deux colonnes, puis le bloc MQTT.
+// ════════════════════════════════════════════════════════════
+
+namespace page_net {
+
+// -- géométrie --
+constexpr int CARD_Y   = SI_PAGE_Y0 + 32;
+constexpr int CARD_X   = SI_LX - 2;
+constexpr int CARD_W   = SI_W - CARD_X * 2;
+constexpr int CARD_TH  = 11;
+constexpr int CARD_H   = CARD_TH + 22;
+constexpr int VAL_Y    = CARD_Y + CARD_TH + 4;
+constexpr int GAU_X    = 108;
+constexpr int GAU_W    = 90;
+
+constexpr int GX[]     = { SI_LX, 164 };   // grille d'adressage
+constexpr int GW       = 148;
+
+// RSSI -> fraction de jauge. -90 dBm = plancher exploitable, -30 = collé à l'AP.
+static float rssi_frac(int rssi) {
+    return constrain((rssi + 90) / 60.0f, 0.0f, 1.0f);
+}
+
+static const char* rssi_label(int rssi) {
+    if (rssi > -60) return "EXCELLENT";
+    if (rssi > -70) return "BON";
+    if (rssi > -80) return "FAIBLE";
+    return "CRITIQUE";
+}
+
+static void cell(int col, int y, const char* key, const char* val, uint16_t c) {
+    draw::text(GX[col], y, key, C_DKCYAN);
+    draw::text_right(GX[col] + GW, y, val, c);
+}
+
+static void draw() {
+    char buf[48];
+    int  y = SI_PAGE_Y0;
+
+    draw::section(y, ">> RESEAU");
+
+    // -- pastilles d'état, avant toute lecture --
+    bool wifiUp = wifi_is_connected();
+    bool mqttUp = mqtt_is_connected();
+    int  bx = SI_LX;
+    bx += draw::badge(bx, SI_PAGE_Y0 + 16, wifiUp ? "WIFI  CONNECTE" : "WIFI  DECONNECTE",
+                      wifiUp ? C_GREEN : C_RED, wifiUp ? C_BG : C_WHITE) + 8;
+    draw::badge(bx, SI_PAGE_Y0 + 16, mqttUp ? "MQTT  CONNECTE" : "MQTT  DECONNECTE",
+                mqttUp ? C_GREEN : C_RED, mqttUp ? C_BG : C_WHITE);
+
+    if (!wifiUp) {
+        // Sprite = police GFX ASCII pure : pas d'accent ni de cadratin ici.
+        draw::text(SI_LX, CARD_Y + 6, "Pas d'association WiFi - adressage indisponible.", C_DIM);
+        return;
+    }
+
+    // -- carte SIGNAL --
+    int      rssi = WiFi.RSSI();
+    uint16_t rc   = rssi > -60 ? C_GREEN : rssi > -75 ? C_YELLOW : C_RED;
+
+    surface::rect(CARD_X, CARD_Y, CARD_W, CARD_H, C_DKCYAN);
+    surface::fill_rect(CARD_X + 1, CARD_Y + 1, CARD_W - 2, CARD_TH - 1, C_DKCYAN);
+    draw::text(CARD_X + 4, CARD_Y + 3, "SIGNAL", C_WHITE, C_DKCYAN);
+
+    snprintf(buf, sizeof(buf), "%d", rssi);
+    draw::big(SI_LX + 2, VAL_Y, buf, rc);
+    draw::text(SI_LX + 2 + (int)strlen(buf) * 12 + 4, VAL_Y + 8, "dBm", C_DIM);
+    draw::bar(GAU_X, VAL_Y + 3, GAU_W, draw::BAR_HERO, rssi_frac(rssi), rc);
+    draw::text(GAU_X + GAU_W + 8, VAL_Y + 4, rssi_label(rssi), rc);
+
+    y = CARD_Y + CARD_H + 6;
+    draw::hline(y); y += 5;
+    draw::section(y, ">> ADRESSAGE"); y += SI_LH + 2;
+
+    // SSID tronqué : valeur alignée à droite, un nom long chevaucherait son
+    // propre intitulé.
+    snprintf(buf, sizeof(buf), "%.18s", WiFi.SSID().c_str());
+    cell(0, y, "SSID", buf, C_WHITE);
+    snprintf(buf, sizeof(buf), "canal %d", WiFi.channel());
+    cell(1, y, "Radio", buf, C_WHITE);
+    y += SI_LH;
+
+    cell(0, y, "IP",         WiFi.localIP().toString().c_str(),   C_GREEN);
+    cell(1, y, "Passerelle", WiFi.gatewayIP().toString().c_str(), C_WHITE);
+    y += SI_LH;
+
+    cell(0, y, "Masque", WiFi.subnetMask().toString().c_str(), C_WHITE);
+    cell(1, y, "DNS",    WiFi.dnsIP().toString().c_str(),      C_WHITE);
+    y += SI_LH;
+
+    cell(0, y, "Hote", WIFI_HOSTNAME,             C_WHITE);
+    cell(1, y, "MAC",  WiFi.macAddress().c_str(), C_DIM);
+    y += SI_LH + 4;
+
+    draw::hline(y); y += 5;
+    draw::section(y, ">> MQTT"); y += SI_LH + 2;
+
+    if (mqttUp) {
+        snprintf(buf, sizeof(buf), "%s:%d", MQTT_BROKER, MQTT_PORT);
+        draw::pair(SI_LX, y, "Broker    : ", buf,            C_GREEN); y += SI_LH;
+        draw::pair(SI_LX, y, "Client ID : ", MQTT_CLIENT_ID, C_WHITE);
+    } else {
+        snprintf(buf, sizeof(buf), "%s:%d", MQTT_BROKER, MQTT_PORT);
+        draw::pair(SI_LX, y, "Broker    : ", buf,        C_DIM); y += SI_LH;
+        draw::pair(SI_LX, y, "Etat      : ", "DECONNECTE", C_RED);
     }
 }
 
-// --- Intégration LVGL (sprite hors-écran → canvas) ---
+}  // namespace page_net
 
-static void _si_full_redraw(int page) {
-    _si_fill_bg();
-    _si_header(page);
-    _si_footer();
-    _si_clear_content();
-    _si_render_page(page);
-    _si_blit();
-}
 
-static void _si_redraw_page(int page) {
-    _si_header(page);
-    _si_clear_content();
-    _si_render_page(page);
-    _si_blit();
-}
+// ════════════════════════════════════════════════════════════
+// TABLE DES PAGES
+// ════════════════════════════════════════════════════════════
+// Source unique de l'ordre, du rendu et de la cadence. Ajouter une page =
+// une ligne ici + un bloc namespace ci-dessus.
 
-// Détruit le timer d'horodatage. ⚠️ Doit être appelé sur TOUTE sortie de
-// l'écran, pas seulement par _si_hide : display_show_home/nas/ai() font un
-// lv_scr_load() nu, et une détection "Jarvis" bascule aussi sur l'écran IA.
-// Un timer survivant continuait de blitter dans un canvas invisible, ET un
-// second était créé au retour — deux timers font avancer le compteur de ticks
-// deux fois trop vite, ce qui a faussé trois campagnes de mesure d'affilée.
-static void _si_stop_timer() {
-    if (_si_uptime_timer) {
-        lv_timer_del(_si_uptime_timer);
-        _si_uptime_timer = nullptr;
+struct PageDesc {
+    void  (*draw)();      // rendu complet dans le sprite
+    void  (*refresh)();   // colonnes vivantes + blit partiel ; nullptr = statique
+    uint8_t every_n;      // rafraîchissements de 1 Hz entre deux appels à refresh
+};
+
+static const PageDesc _pages[] = {
+    { page_chip::draw,  page_chip::refresh,  1                 },
+    { page_mem::draw,   page_mem::refresh,   page_mem::EVERY_N },
+    { page_tasks::draw, page_tasks::refresh, 1                 },
+    { page_part::draw,  nullptr,             0                 },
+    { page_fs::draw,    nullptr,             0                 },
+    { page_net::draw,   nullptr,             0                 },
+};
+
+static const int _page_count = sizeof(_pages) / sizeof(_pages[0]);
+
+static_assert(sizeof(_pages) / sizeof(_pages[0]) == SYSINFO_PAGE_COUNT,
+              "SYSINFO_PAGE_COUNT (sysinfo_manager.h) doit suivre la table _pages[]");
+
+static int _page = 0;   // page courante
+
+
+// ════════════════════════════════════════════════════════════
+// TICKER — horodatage 20 Hz + rafraîchissements 1 Hz
+// ════════════════════════════════════════════════════════════
+// ⚠️ %CPU mesuré ENTRE DEUX RENDUS : le coût du rendu compte donc dans
+// loopTask, qui apparaît plus chargée quand on la regarde. Même biais que htop.
+
+namespace ticker {
+
+static lv_timer_t* _timer = nullptr;
+static uint8_t     _ticks = 0;
+static uint8_t     _skip  = 0;
+
+// ⚠️ Doit être appelé sur TOUTE sortie d'écran, pas seulement par screen::hide :
+// display_show_home/nas/ai() font un lv_scr_load() nu. Un timer survivant blitte
+// dans un canvas invisible ET un second est créé au retour, ce qui fait avancer
+// le compteur de ticks deux fois trop vite. Idempotent.
+static void stop() {
+    if (_timer) {
+        lv_timer_del(_timer);
+        _timer = nullptr;
     }
 }
 
-static void _si_screen_unloaded_cb(lv_event_t* e) {
-    _si_stop_timer();
+static void cb(lv_timer_t* t) {
+    frame::clock();
+    frame::blit_clock();
+
+    if (++_ticks < SI_REFRESH_TICKS) return;
+    _ticks = 0;
+
+    const PageDesc& p = _pages[_page];
+    if (!p.refresh) return;                       // page statique
+    if (++_skip < p.every_n) return;
+    _skip = 0;
+    p.refresh();
 }
 
-static void _si_hide() {
-    _si_stop_timer();
-    _si_task_shown = 0;
-    if (_si_return_screen) lv_scr_load(_si_return_screen);
+static void start() {
+    stop();
+    _ticks = 0;
+    _skip  = 0;
+    _timer = lv_timer_create(cb, 50, nullptr);
 }
 
-// Horodatage à chaque tick, puis valeurs vivantes une fois par seconde. Tourne
-// via un lv_timer, donc sur loopTask. Blits partiels pour ne pas saturer le SPI.
-static void _si_uptime_timer_cb(lv_timer_t* t) {
-    _si_uptime();
-    _si_blit_rect(SI_W - 64, 0, 64, 26);
+// Changement de page : la cadence repart de zéro.
+static void reset_cadence() { _skip = 0; }
 
-    static uint8_t ticks = 0;
-    if (++ticks < SI_REFRESH_TICKS) return;
-    ticks = 0;
+}  // namespace ticker
 
-    switch (_si_page) {
-        case SI_PAGE_CHIP:  _si_refresh_chip();  break;
 
-        // MEMOIRE est la page la plus chère (~250 ms : gros bloc, et le canvas
-        // est relu depuis la PSRAM). Le heap ne bouge pas assez vite pour
-        // justifier 1 Hz — on l'espace, c'est le seul levier qui n'ait pas
-        // empiré les choses (cf. l'avertissement sur _si_refresh_mem).
-        case SI_PAGE_MEM: {
-            static uint8_t skip = 0;
-            if (++skip >= SI_MEM_EVERY_N) { skip = 0; _si_refresh_mem(); }
-            break;
-        }
+// ════════════════════════════════════════════════════════════
+// SCREEN — écran LVGL, canvas, navigation tactile
+// ════════════════════════════════════════════════════════════
 
-        case SI_PAGE_TASKS: _si_refresh_tasks(); break;
-        default: break;   // NET / PART / FS : rien ne bouge
-    }
+namespace screen {
+
+static lv_obj_t* obj           = nullptr;   // écran LVGL dédié (créé une fois)
+static lv_obj_t* return_screen = nullptr;   // écran à restaurer à la sortie
+
+// Rendu complet d'une page, décor compris. Utilisé à l'entrée sur l'écran.
+static void full_redraw() {
+    draw::fill_bg();
+    frame::header(_page);
+    frame::footer();
+    frame::clear_content();
+    _pages[_page].draw();
+    surface::blit();
 }
 
-static void _si_next_page() {
-    _si_page = (_si_page + 1) % SI_PAGE_COUNT;
-    _si_redraw_page(_si_page);
+// Changement de page : le fond et le pied ne bougent pas.
+static void redraw_page() {
+    frame::header(_page);
+    frame::clear_content();
+    _pages[_page].draw();
+    surface::blit();
+}
+
+static void goto_page(int page) {
+    _page = ((page % _page_count) + _page_count) % _page_count;
+    ticker::reset_cadence();
+    redraw_page();
+}
+
+static void hide() {
+    ticker::stop();
+    if (return_screen) lv_scr_load(return_screen);
+}
+
+// Couvre TOUTES les sorties d'écran, y compris celles qui ne passent pas par
+// hide() (page:home, bascule sur l'écran IA au réveil).
+static void unloaded_cb(lv_event_t* e) {
+    ticker::stop();
 }
 
 // Tap : gauche = page précédente, droite = suivante, centre = sortie.
-// LVGL a déjà résolu l'appui/relâchement en un CLICKED unique, pas de débounce.
-static void _si_canvas_click_cb(lv_event_t* e) {
+static void click_cb(lv_event_t* e) {
     lv_indev_t* indev = lv_indev_get_act();
     if (!indev) return;
     lv_point_t p;
     lv_indev_get_point(indev, &p);
 
-    if (p.x < 110) {
-        _si_page = (_si_page - 1 + SI_PAGE_COUNT) % SI_PAGE_COUNT;
-        _si_redraw_page(_si_page);
-    } else if (p.x > 210) {
-        _si_next_page();
-    } else {
-        _si_hide();
-    }
+    if      (p.x < 110) goto_page(_page - 1);
+    else if (p.x > 210) goto_page(_page + 1);
+    else                hide();
 }
 
-// Créé une seule fois, à la première ouverture de l'écran.
-static void _si_ensure_created() {
-    if (_si_screen) return;
+// Créé une seule fois, à la première ouverture de l'écran, et jamais rendu.
+// Coût : ~311 Ko de PSRAM et ~10 Ko de RAM interne (les objets LVGL).
+static void ensure_created() {
+    if (obj) return;
 
-    _si_sprite.setColorDepth(16);
-    _si_sprite.createSprite(SI_W, SI_H);   // ~150 Ko, en PSRAM automatiquement
-
-    _si_canvas_buf = (lv_color_t*)heap_caps_malloc((size_t)SI_W * SI_H * 2, MALLOC_CAP_SPIRAM);
-    if (!_si_canvas_buf) {
-        // Sans buffer, lv_canvas_set_buffer et les memcpy de _si_blit
-        // déréférenceraient nullptr : on renonce à l'écran plutôt que planter.
-        log_line("[SysInfo] PSRAM KO pour le canvas (%u o) — ecran indisponible",
+    surface::buf = (uint16_t*)heap_caps_malloc((size_t)SI_W * SI_H * 2, MALLOC_CAP_SPIRAM);
+    if (!surface::buf) {
+        log_line("[SysInfo] PSRAM KO pour la surface (%u o) — écran indisponible",
                  (unsigned)((size_t)SI_W * SI_H * 2));
-        _si_sprite.deleteSprite();
+        return;
+    }
+    surface::cv.px = surface::buf;
+
+    surface::canvas_buf =
+        (lv_color_t*)heap_caps_malloc((size_t)SI_W * SI_H * 2, MALLOC_CAP_SPIRAM);
+    if (!surface::canvas_buf) {
+        // On renonce à l'écran plutôt que de déréférencer nullptr.
+        log_line("[SysInfo] PSRAM KO pour le canvas (%u o) — écran indisponible",
+                 (unsigned)((size_t)SI_W * SI_H * 2));
+        free(surface::buf);
+        surface::buf   = nullptr;
+        surface::cv.px = nullptr;
         return;
     }
 
-    _si_screen = lv_obj_create(nullptr);
-    lv_obj_set_style_bg_color(_si_screen, lv_color_black(), 0);
-    lv_obj_set_style_pad_all(_si_screen, 0, 0);
-    lv_obj_set_style_border_width(_si_screen, 0, 0);
+    obj = lv_obj_create(nullptr);
+    lv_obj_set_style_bg_color(obj, lv_color_black(), 0);
+    lv_obj_set_style_pad_all(obj, 0, 0);
+    lv_obj_set_style_border_width(obj, 0, 0);
+    lv_obj_add_event_cb(obj, unloaded_cb, LV_EVENT_SCREEN_UNLOADED, nullptr);
 
-    // Filet couvrant TOUTES les sorties d'écran, y compris celles qui ne
-    // passent pas par _si_hide (page:home, bascule sur l'écran IA au réveil).
-    lv_obj_add_event_cb(_si_screen, _si_screen_unloaded_cb, LV_EVENT_SCREEN_UNLOADED, nullptr);
-
-    _si_canvas = lv_canvas_create(_si_screen);
-    lv_canvas_set_buffer(_si_canvas, _si_canvas_buf, SI_W, SI_H, LV_COLOR_FORMAT_RGB565_SWAPPED);
-    lv_obj_set_pos(_si_canvas, 0, 0);
-    lv_obj_add_flag(_si_canvas, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(_si_canvas, _si_canvas_click_cb, LV_EVENT_CLICKED, nullptr);
+    surface::canvas = lv_canvas_create(obj);
+    lv_canvas_set_buffer(surface::canvas, surface::canvas_buf, SI_W, SI_H,
+                         LV_COLOR_FORMAT_RGB565_SWAPPED);
+    lv_obj_set_pos(surface::canvas, 0, 0);
+    lv_obj_add_flag(surface::canvas, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(surface::canvas, click_cb, LV_EVENT_CLICKED, nullptr);
 }
+
+static bool is_active() { return obj && lv_scr_act() == obj; }
+
+}  // namespace screen
+
 
 // ---- API PUBLIQUES ----
 
 // Séparateur titré à largeur fixe : "=== TITRE ===…===(NN% libre)".
-static void _si_mem_sep(const char* title, unsigned pctFree) {
+static void _log_sep(const char* title, unsigned pctFree) {
     const int W = 45;
     char line[W + 1];
     char suffix[16];
@@ -1315,53 +1925,32 @@ static void _si_mem_sep(const char* title, unsigned pctFree) {
 }
 
 // Séparateur plein (fermeture).
-static void _si_mem_sep_plain() {
+static void _log_sep_plain() {
     char line[46];
     memset(line, '=', 45);
     line[45] = '\0';
     log_line("[MEM] %s", line);
 }
 
-// Journalise l'état mémoire (cmd "mem"). Volontairement en octets : le pire cas
-// interne se joue à quelques Ko près, l'arrondi Ko de la page MÉMOIRE est trop
-// grossier pour le suivi. Trois sections : RAM (postes internes → bilan → marges),
-// PSRAM (postes → bilan → marge), puis le plus gros bloc contigu.
+// Journalise l'état mémoire (cmd "mem"). En OCTETS : le pire cas interne se
+// joue à quelques Ko près, l'arrondi Ko de la page MÉMOIRE est trop grossier.
 void sysinfo_log_memory() {
-    size_t   intFree  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    size_t   intTotal = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
-    size_t   intMin   = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
-    size_t   intUsed  = intTotal - intFree;
-    unsigned intPct   = intTotal ? (unsigned)(100u * intFree / intTotal) : 0;
+    inv::Mem m = inv::read();
 
-    uint32_t dmaFree = heap_caps_get_free_size(MALLOC_CAP_DMA);
-    uint32_t dmaMin  = heap_caps_get_minimum_free_size(MALLOC_CAP_DMA);
-
-    bool     hasPs   = psramFound();
-    uint32_t psTotal = hasPs ? ESP.getPsramSize() : 0;
-    uint32_t psFree  = hasPs ? ESP.getFreePsram() : 0;
-    uint32_t psMin   = hasPs ? heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM) : 0;
-    unsigned psPct   = psTotal ? (unsigned)(100u * psFree / psTotal) : 0;
-
-    // Comptabilité interne : intUsed = postes connus (_si_alloc internes + les 6
-    // piles _si_stacks) + ESP_SR (mesuré à part) + reste (non tracé : WiFi/lwIP,
-    // cœur, FreeRTOS…). Reste SIGNÉ : un négatif signalerait que la table sur-compte.
-    uint32_t knownInt = 0;
-    for (auto const& a : _si_alloc)  if (a.internal) knownInt += a.bytes;
-    for (auto const& s : _si_stacks)                 knownInt += s.stack;
-    uint32_t espSr = wakeword_esp_sr_internal_bytes();
-    long     reste = (long)intUsed - (long)knownInt - (long)espSr;
+    unsigned intPct = m.int_total ? (unsigned)(100u * m.int_free / m.int_total) : 0;
+    unsigned psPct  = m.ps_total  ? (unsigned)(100u * m.ps_free  / m.ps_total)  : 0;
 
     TaskStatus_t st[SI_MAX_TASKS];
     UBaseType_t  n = uxTaskGetSystemState(st, SI_MAX_TASKS, nullptr);
 
     // === RAM (interne) : postes → bilan → marges ===
-    _si_mem_sep("RAM", intPct);
+    // int_used = postes connus + ESP_SR + reste non tracé (WiFi/lwIP, cœur…).
+    _log_sep("HEAP", intPct);
     if (n == 0) {
-        log_line("[MEM] %-20s : uxTaskGetSystemState a echoue", "Piles");
+        log_line("[MEM] %-20s : uxTaskGetSystemState a échoué", "Piles");
     } else {
-        // High-water : le plus petit reste JAMAIS atteint depuis le boot (pas le
-        // libre courant) — un min bas = le pic a DÉJÀ frôlé le débordement.
-        for (auto const& s : _si_stacks) {
+        // High-water : le plus petit reste JAMAIS atteint depuis le boot.
+        for (auto const& s : inv::stacks) {
             for (UBaseType_t i = 0; i < n; i++) {
                 if (strcmp(st[i].pcTaskName, s.name) != 0) continue;
                 unsigned freeBytes = (unsigned)st[i].usStackHighWaterMark * sizeof(StackType_t);
@@ -1373,79 +1962,71 @@ void sysinfo_log_memory() {
             }
         }
     }
-    for (auto const& a : _si_alloc)
-        if (a.internal) log_line("[MEM] Buf. %-15s : %u o", a.label, (unsigned)a.bytes);
-    log_line("[MEM] %-20s : %u o d'interne (mesure au boot)", "ESP_SR occupe", (unsigned)espSr);
-    log_line("[MEM] %-20s : %ld o", "Systeme (non trace)", reste);
-    log_line("[MEM] %-20s : %u o utilise / %u o", "   Bilan HEAP", (unsigned)intUsed, (unsigned)intTotal);
-    log_line("[MEM] %-20s : %u o libre (pire cas : %u o)", "Interne", (unsigned)intFree, (unsigned)intMin);
-    log_line("[MEM] %-20s : %u o libre (pire cas : %u o)", "DMA", (unsigned)dmaFree, (unsigned)dmaMin);
+    for (auto const& a : inv::allocs)
+        if (a.internal) log_line("[MEM] Buffer %-13s : %u o", a.label, (unsigned)a.bytes);
+    log_line("[MEM] %-20s : %u o d'interne (mesuré au boot)", "ESP_SR utilise", (unsigned)m.esp_sr);
+    log_line("[MEM] %-22s : %ld o", "Système (non tracé)", m.untracked_int);
+    log_line("[MEM] %-20s : %u o utilise / %u o", "   Bilan HEAP", (unsigned)m.int_used, (unsigned)m.int_total);
+    log_line("[MEM] %-20s : %u o libre (pire cas : %u o)", "Interne", (unsigned)m.int_free, (unsigned)m.int_min);
+    log_line("[MEM] %-20s : %u o libre (pire cas : %u o)", "DMA", (unsigned)m.dma_free, (unsigned)m.dma_min);
     // Un total libre confortable ne garantit pas qu'une alloc d'un seul tenant passe.
-    log_line("[MEM] %-20s : %u o", "Plus gros bloc libre",
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    log_line("[MEM] %-20s : %u o", "Plus gros bloc libre", (unsigned)m.int_largest);
 
     // === PSRAM : postes → bilan → marge ===
-    if (hasPs) {
-        _si_mem_sep("PSRAM", psPct);
-        uint32_t knownPs = 0;
-        for (auto const& a : _si_alloc) {
+    if (m.has_ps) {
+        _log_sep("PSRAM", psPct);
+        for (auto const& a : inv::allocs) {
             if (a.internal) continue;
-            uint32_t bytes = a.bytes;
-            // Sprite/Canvas SysInfo : alloués seulement à la 1re ouverture — gatés
-            // pour que le reste PSRAM reste exact dans les deux états.
-            if (!_si_screen && (strcmp(a.label, "Sprite") == 0 || strcmp(a.label, "Canvas") == 0))
-                bytes = 0;
-            knownPs += bytes;
-            log_line("[MEM] Buf. %-15s : %u o", a.label, (unsigned)bytes);
+            // Buffers alloués paresseusement : "(pas encore calculé)" plutôt
+            // que "0 o", et exclus du total tant qu'ils n'existent pas.
+            bool pending = inv::alloc_pending(a);
+            if (pending) log_line("[MEM] Buffer %-13s : (pas encore calculé)", a.label);
+            else         log_line("[MEM] Buffer %-13s : %u o", a.label, (unsigned)a.bytes);
         }
         // Non tracé : modèles ESP_SR chargés en PSRAM + framework.
-        log_line("[MEM] %-20s : %ld o", "Systeme (non trace)", (long)(psTotal - psFree) - (long)knownPs);
-        log_line("[MEM] %-20s : %u o utilise / %u o", "   Bilan PSRAM", (unsigned)(psTotal - psFree), (unsigned)psTotal);
-        log_line("[MEM] %-20s : %u o libre (pire cas : %u o)", "PSRAM", (unsigned)psFree, (unsigned)psMin);
-        log_line("[MEM] %-20s : %u o", "Plus gros bloc libre",
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+        log_line("[MEM] %-22s : %ld o", "Système (non tracé)", m.untracked_ps);
+        log_line("[MEM] %-20s : %u o utilisés / %u o", "   Bilan PSRAM",
+                 (unsigned)(m.ps_total - m.ps_free), (unsigned)m.ps_total);
+        log_line("[MEM] %-20s : %u o libre (pire cas : %u o)", "PSRAM",
+                 (unsigned)m.ps_free, (unsigned)m.ps_min);
+        log_line("[MEM] %-20s : %u o", "Plus gros bloc libre", (unsigned)m.ps_largest);
     } else {
-        _si_mem_sep("PSRAM", 0);
+        _log_sep("PSRAM", 0);
         log_line("[MEM] %-20s : NON DETECTEE", "PSRAM");
     }
 
-    _si_mem_sep_plain();   // ferme le dernier bloc
+    _log_sep_plain();   // ferme le dernier bloc
 }
 
 void display_show_sysinfo() {
-    if (_si_screen && lv_scr_act() == _si_screen) {
-        // Déjà affiché (rappel via esp32/cmd ou POST /cmd) : le bouton sert
-        // alors à parcourir les pages, faute d'écran tactile distant.
-        _si_next_page();
+    if (screen::is_active()) {
+        // Déjà affiché : le rappel sert alors à parcourir les pages.
+        screen::goto_page(_page + 1);
         return;
     }
-    display_show_sysinfo_page(SI_PAGE_CHIP);
+    display_show_sysinfo_page(0);
 }
 
 void display_show_sysinfo_page(int page) {
-    if (page < 0 || page >= SI_PAGE_COUNT) {
-        log_line("[SysInfo] page hors plage : %d (0-%d)", page, SI_PAGE_COUNT - 1);
+    if (page < 0 || page >= _page_count) {
+        log_line("[SysInfo] page hors plage : %d (0-%d)", page, _page_count - 1);
         return;
     }
 
-    if (_si_screen && lv_scr_act() == _si_screen) {
+    if (screen::is_active()) {
         // Écran déjà en place : on ne fait que changer de page.
-        if (page != _si_page) {
-            _si_page = page;
-            _si_redraw_page(_si_page);
-        }
+        if (page != _page) screen::goto_page(page);
         return;
     }
 
-    _si_ensure_created();
-    if (!_si_screen) return;   // allocation PSRAM échouée
+    screen::ensure_created();
+    if (!screen::obj) return;   // allocation PSRAM échouée
 
-    _si_return_screen = lv_scr_act();
-    _si_page = page;
+    screen::return_screen = lv_scr_act();
+    _page = page;
 
-    lv_scr_load(_si_screen);
-    _si_full_redraw(_si_page);
+    lv_scr_load(screen::obj);
+    screen::full_redraw();
 
-    _si_stop_timer();   // idempotent : jamais deux timers, quoi qu'il arrive
-    _si_uptime_timer = lv_timer_create(_si_uptime_timer_cb, 50, nullptr);
+    ticker::start();
 }

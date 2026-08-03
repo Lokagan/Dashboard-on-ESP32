@@ -2,9 +2,8 @@
 // WIFI_MANAGER.CPP — connexion WiFi et surveillance périodique de la
 // liaison, avec reconnexion automatique.
 //
-// wifi_connect() est NON bloquant : la connexion se termine en
-// arrière-plan, suivie par wifi_loop(). Le reste de setup() (OTA, MQTT,
-// HTTP, LEDs, audio, IA) ne dépend donc pas du WiFi pour démarrer.
+// wifi_connect() est NON bloquant : la connexion se termine en arrière-plan,
+// suivie par wifi_loop(). Le reste de setup() ne l'attend pas.
 // ============================================================
 
 // ---- BIBLIOTHÈQUES ----
@@ -37,8 +36,7 @@ static void _wifi_check() {
 // ---- API PUBLIQUES ----
 
 void wifi_connect() {
-    // Modem sleep désactivé : évite le retard sur les premiers paquets
-    // OTA/MQTT après une période d'inactivité réseau.
+    // Modem sleep désactivé : retarde sinon les premiers paquets OTA/MQTT.
     WiFi.setSleep(false);
     WiFi.setHostname(WIFI_HOSTNAME);
     log_line("[WiFi] Connexion à %s en cours...", WIFI_SSID);

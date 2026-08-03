@@ -1,16 +1,10 @@
 // ============================================================
 // WAKEWORD_MANAGER.CPP — Détection du mot-clé "Jarvis" (ESP_SR / WakeNet)
 //
-// Wrapper Arduino officiel ESP_SR (core 3.x). ESP_SR.begin() reçoit le bus I2S
-// partagé (audio_get_i2s()) et lance SA propre tâche de détection, qui lit le
-// micro en continu. Sur wake word, ESP_SR appelle notre callback depuis cette
-// tâche interne — on ne peut donc RIEN y faire qui touche LVGL ou l'état IA. Le
-// callback se contente de lever un drapeau, drainé par wakeword_loop() depuis
-// loop() (même règle que ai_manager.cpp::_post_state_async).
-//
-// Accès exclusif au bus : audio_manager encadre toute opération I2S par
-// wakeword_pause()/wakeword_resume() (cf. _audio_task) — ESP_SR n'écoute donc
-// que quand audio_manager est au repos, jamais deux lecteurs I2S en même temps.
+// ESP_SR lance SA propre tâche de détection et appelle notre callback depuis
+// elle : le callback lève un drapeau, drainé par wakeword_loop() sur loopTask.
+// Bus I2S partagé avec audio_manager, qui encadre ses opérations par
+// wakeword_pause()/wakeword_resume().
 // ============================================================
 
 // ---- BIBLIOTHÈQUES ----
@@ -26,25 +20,21 @@
 #include "log_manager.h"
 
 // ---- OBJETS GLOBAUX ----
-// Vrai une fois ESP_SR.begin() réussi — garde les pause/resume appelés tôt
-// (audio_manager peut jouer un son avant wakeword_init()).
+// Vrai une fois ESP_SR.begin() réussi — garde les pause/resume appelés trop tôt.
 static bool _sr_started = false;
 
-// Interne consommé par ESP_SR (delta libre avant/après begin), pour le bilan
-// mémoire de sysinfo_manager. 0 tant que begin() n'a pas réussi.
+// Verrou OTA : maintient ESP_SR en pause pendant tout le flash.
+static bool _ota_suspended = false;
+
+// Interne consommé par ESP_SR (delta autour de begin), lu par sysinfo_manager.
 static uint32_t _esp_sr_internal_bytes = 0;
 
 // ---- HELPERS ----
 
-// Détection en attente de traitement. Simple drapeau : il n'y a aucune donnée à
-// transporter, et une détection de plus pendant qu'une autre attend n'apporte
-// rien. `volatile` car écrit par la tâche ESP_SR et lu par loopTask.
+// Écrit par la tâche ESP_SR, lu par loopTask.
 static volatile bool _trigger_pending = false;
 
-// Callback ESP_SR — appelé depuis SA tâche interne, PAS depuis loopTask.
-// On n'y fait donc RIEN d'autre que lever le drapeau : ni LVGL, ni état IA.
-// (L'ancienne version appelait lv_async_call() ici — cause racine de panics,
-//  cf. le commentaire détaillé dans ai_manager.cpp::_post_state_async.)
+// Appelé depuis la tâche ESP_SR : lever le drapeau, rien d'autre (ni LVGL, ni état IA).
 static void _on_sr_event(sr_event_t event, int command_id, int phrase_id) {
     if (event != SR_EVENT_WAKEWORD) return;   // wake word seul (pas de commandes MultiNet)
     log_line("[Wakeword] \"Jarvis\" détecté");
@@ -53,9 +43,7 @@ static void _on_sr_event(sr_event_t event, int command_id, int phrase_id) {
 
 // ---- API PUBLIQUES ----
 void wakeword_init() {
-    // Diagnostic RAM interne — les tâches d'ESP_SR (feed/detect/handler + AFE)
-    // s'allouent en RAM interne ; on veut voir la marge avant begin() ET mesurer
-    // ce qu'ESP_SR consomme (delta avant/après, pour le bilan mémoire de SysInfo).
+    // Marge d'interne avant ESP_SR, et mesure de ce qu'il consomme.
     uint32_t freeBefore = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     log_line("[Wakeword] RAM interne libre avant ESP_SR : %u o (plus gros bloc : %u o)",
              (unsigned)freeBefore,
@@ -63,10 +51,8 @@ void wakeword_init() {
 
     ESP_SR.onEvent(_on_sr_event);
 
-    // Bus I2S partagé, déjà démarré par audio_init(). Défauts ESP_SR : rx_chan
-    // = SR_CHANNELS_STEREO (notre I2S est stéréo, micro sur le canal gauche),
-    // mode = SR_MODE_WAKEWORD, input_format = "MN" (canal 0 = micro, 1 = inutilisé).
-    // Modèle "jarvis" lu depuis la partition flash "model" (esp_srmodel_init en interne).
+    // Bus I2S partagé, déjà démarré par audio_init(). Défauts ESP_SR : stéréo
+    // (micro sur le canal gauche), wake word seul, modèle lu en partition "model".
     if (!ESP_SR.begin(audio_get_i2s(), NULL, 0)) {
         log_line("[Wakeword] ESP_SR.begin a échoué — partition 'model' vide ? modèle absent ?");
         return;
@@ -81,14 +67,9 @@ uint32_t wakeword_esp_sr_internal_bytes() {
     return _esp_sr_internal_bytes;
 }
 
-// Traite une détection en attente. Appelée depuis loop() (main.cpp), donc sur
-// loopTask — seul thread autorisé à toucher LVGL et l'état IA.
-//
-// Même condition que le bouton tactile (display_manager.cpp) : déclenche sauf si
-// listening/thinking/speaking (donc y compris AI_ERROR, dont on doit pouvoir
-// sortir à la voix). Séquence écran Companion -> jingle -> écoute : les deux
-// commandes audio sont des dépôts FIFO dans _audio_task, le jingle finit avant
-// que l'enregistrement démarre, sans callback de fin de lecture à gérer.
+// Appelée depuis loop(), donc sur loopTask — seul thread autorisé à toucher LVGL
+// et l'état IA. Déclenche sauf si listening/thinking/speaking : AI_ERROR compris,
+// on doit pouvoir en sortir à la voix.
 void wakeword_loop() {
     if (!_trigger_pending) return;
     _trigger_pending = false;
@@ -99,7 +80,7 @@ void wakeword_loop() {
         audio_wakeword_ack();
         ai_start_listening();
     } else {
-        log_line("[Wakeword] Ignore — IA deja occupee");
+        log_line("[Wakeword] Ignore — IA déjà occupée");
     }
 }
 
@@ -108,5 +89,10 @@ void wakeword_pause() {
 }
 
 void wakeword_resume() {
-    if (_sr_started) ESP_SR.resume();
+    // Respecte le verrou OTA : _audio_task émet un resume après le click de début d'OTA.
+    if (_sr_started && !_ota_suspended) ESP_SR.resume();
 }
+
+// Suspension DURE réservée à l'OTA, malgré les pause/resume de _audio_task.
+void wakeword_ota_suspend() { _ota_suspended = true;  if (_sr_started) ESP_SR.pause();  }
+void wakeword_ota_resume()  { _ota_suspended = false; if (_sr_started) ESP_SR.resume(); }

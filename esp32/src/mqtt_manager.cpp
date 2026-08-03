@@ -38,7 +38,7 @@ static size_t _rx_len = 0;
 
 // Aides des messages d'erreur de esp32/cmd.
 // ⚠️ Doivent tenir dans LOG_LINE_LEN (100 OCTETS, dont 10 d'horodatage)
-static const char* CMD_HELP      = "page:X, brightness, volume, loop:on|off, mem, saverec, spy, tree, reboot";
+static const char* CMD_HELP      = "page:X, brightness, volume, loop:on|off, mem, saverec, spy, tree, shot, reboot";
 static const char* CMD_HELP_PAGE = "home, nas, freebox, ai, sysinfo[1-6], disks, downloads, connections, devices, activity";
 
 // ---- API LOCALES ----
@@ -95,8 +95,8 @@ static void _rx_enqueue(const char* topic, const char* payload, size_t plen) {
     if (xQueueSend(_rx_queue, &m, 0) != pdTRUE) { heap_caps_free(t); heap_caps_free(p); }
 }
 
-// Dispatch — s'exécute sur loopTask (drainé par mqtt_loop). Ancien corps de
-// _mqtt_on_message : recopie sans ré-alloc, un String dupliquerait en interne.
+// Dispatch — s'exécute sur loopTask (drainé par mqtt_loop). Recopie sans
+// ré-alloc : un String dupliquerait en interne.
 static void _dispatch(const char* topic, const char* value) {
     // --- NAS ---
     if      (strcmp(topic, TOPIC_NAS_CPU) == 0)             display_update_nas_cpu(atoi(value));
@@ -167,8 +167,13 @@ static void _mqtt_event_handler(void*, esp_event_base_t, int32_t id, void* data)
             size_t n = (size_t)e->data_len < space ? (size_t)e->data_len : space;
             memcpy(_payload_buf + _rx_len, e->data, n);
             _rx_len += n;
-            // Dernier fragment : termine et empile.
+            // Dernier fragment : termine et empile. Un payload tronqué donne un
+            // JSON invalide, donc une table vide : sans cette ligne (UNE par
+            // message, pas une par fragment) la panne n'a aucune trace.
             if (e->current_data_offset + e->data_len >= e->total_data_len) {
+                if ((size_t)e->total_data_len > _rx_len)
+                    log_line("[MQTT] %s TRONQUE : %d o recus sur %d, augmenter MQTT_BUFFER_SIZE",
+                             _rx_topic, (int)_rx_len, e->total_data_len);
                 _payload_buf[_rx_len] = '\0';
                 _rx_enqueue(_rx_topic, _payload_buf, _rx_len);
             }
@@ -258,15 +263,18 @@ void mqtt_handle_esp_cmd(const char* cmd) {
         ai_upload_last_record();
 
     } else if (strcmp(buf, "spy") == 0) {
-        // log_clear d'abord : le journal ne fait que 40 lignes et les "slow
-        // frame" en ajoutent ~5/s — sans ça le résultat est évacué avant
-        // d'avoir pu être copié.
+        // log_clear d'abord : 40 lignes seulement, le résultat serait évacué
+        // par les "slow frame" avant d'avoir pu être copié.
         log_clear();
         display_spy_invalidations(24);
 
     } else if (strcmp(buf, "tree") == 0) {
         log_clear();                     // même raison que "spy"
         display_dump_tree();
+
+    } else if (strcmp(buf, "shot") == 0) {
+        if (display_capture_screen()) log_line("[MQTT] Capture armée — GET /screen.bmp");
+        else                          log_line("[MQTT] Capture KO (PSRAM)");
 
     } else if (strcmp(buf, "reboot") == 0) {
         log_line("[MQTT] Redémarrage...");
@@ -324,3 +332,8 @@ void mqtt_publish(const char* topic, const char* payload) {
 bool mqtt_is_connected() {
     return _connected;
 }
+
+// Coupe le client le temps d'un flash OTA : le broker saturerait sinon l'airtime
+// 2,4 GHz avec nas/#/freebox/#. onError relance ; le succès reboote.
+void mqtt_ota_suspend() { if (_client) esp_mqtt_client_stop(_client); }
+void mqtt_ota_resume()  { if (_client) esp_mqtt_client_start(_client); }

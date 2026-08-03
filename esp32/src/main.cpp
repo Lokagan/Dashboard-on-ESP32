@@ -23,15 +23,14 @@
 #include "http_manager.h"
 #include "wakeword_manager.h"
 
-// Pile de loopTask fixée explicitement (STACK_BYTES_LOOP_TASK, = défaut Arduino).
+// Pile de loopTask (STACK_BYTES_LOOP_TASK).
 // ⚠️ À portée globale : la macro définit un symbole lu au démarrage.
 SET_LOOP_TASK_STACK_SIZE(STACK_BYTES_LOOP_TASK);
 
 // ---- OBJETS GLOBAUX ----
 
 // Chronométrage des managers : tous partagent loopTask, celui qui traîne
-// retarde TOUS les autres. Seuil à 20 ms, en dessous aucun impact perceptible.
-// Coût au repos : deux micros() par manager.
+// retarde TOUS les autres.
 #define LOOP_SLOW_MS    20
 #define LOOP_REPORT_MS  10000
 
@@ -44,16 +43,16 @@ static uint32_t      _loop_us[L_COUNT];   // cumul sur la fenêtre
 static uint32_t      _loop_turns;         // tours de boucle sur la fenêtre
 static unsigned long _loop_t0;            // début de la fenêtre
 
-// La MESURE tourne toujours (deux micros(), négligeables) ; seule la SORTIE est
-// conditionnée — sinon réactiver donnerait une fenêtre tronquée.
-#define TIMED(idx, call) do {                                        \
-        uint32_t _t0 = micros();                                     \
-        call;                                                        \
-        uint32_t _dt = micros() - _t0;                               \
-        _loop_us[idx] += _dt;                                        \
-        if (_dt > LOOP_SLOW_MS * 1000UL && log_loop_measure())       \
-            log_line("[LOOP] %s : %lums", _loop_names[idx],          \
-                     (unsigned long)(_dt / 1000));                   \
+// La MESURE tourne toujours ; seule la SORTIE est conditionnée — sinon
+// réactiver donnerait une fenêtre tronquée.
+#define TIMED(idx, call) do {                                               \
+        uint32_t _t0 = micros();                                            \
+        call;                                                               \
+        uint32_t _dt = micros() - _t0;                                      \
+        _loop_us[idx] += _dt;                                               \
+        if (_dt > LOOP_SLOW_MS * 1000UL && log_loop_measure())              \
+            log_line("[LOOP] slow %s : %lums (>%ims)", _loop_names[idx],    \
+                     (unsigned long)(_dt / 1000), LOOP_SLOW_MS);            \
     } while (0)
 
 // Variante muette, pour les managers qui signalent eux-mêmes leurs lenteurs.
@@ -63,16 +62,13 @@ static unsigned long _loop_t0;            // début de la fenêtre
         _loop_us[idx] += micros() - _t0;                             \
     } while (0)
 
-// Le %CPU par cœur de SysInfo ne peut RIEN dire du core 1 : loopTask y est
-// prioritaire sur IDLE1 et ne se bloque jamais, donc le cœur lit 100 % en
-// permanence, travail réel ou boucle à vide. Seul le temps effectivement passé
-// dans les managers le dit.
+// Le %CPU par cœur de SysInfo ne dit RIEN du core 1 (loopTask y affame IDLE1,
+// qui lit donc 100 % en permanence) : seul le temps passé ici le dit.
 static void _loop_report() {
     unsigned long now = millis();
     if (now - _loop_t0 < LOOP_REPORT_MS) return;
 
-    // La fenêtre est roulée dans tous les cas : mesure coupée, seule la ligne
-    // de synthèse disparaît du journal.
+    // Fenêtre roulée dans tous les cas : mesure coupée, seule la ligne disparaît.
     if (log_loop_measure()) {
         uint32_t total = 0;
         for (int i = 0; i < L_COUNT; i++) total += _loop_us[i];
@@ -99,10 +95,8 @@ static void _loop_report() {
 void setup() {
     Serial.begin(115200);
 
-    // Écritures série NON BLOQUANTES. Sur USB CDC, write() attend que l'hôte
-    // vide son tampon (250 ms de timeout par défaut) — et log_line() tourne sur
-    // loopTask. Sans lecteur attaché, chaque ligne gelait la boucle : boot
-    // mesuré à 62 s au lieu de 6. Le journal est un confort, la boucle non.
+    // Écritures série NON BLOQUANTES : sur USB CDC, write() attend que l'hôte
+    // vide son tampon (250 ms), et log_line() tourne sur loopTask.
     Serial.setTxTimeoutMs(0);
 
     delay(2000); // laisse l'énumération USB se faire avant les premiers logs
@@ -137,20 +131,17 @@ void loop() {
     TIMED_ACC(L_LVGL, display_loop());   // se logge lui-même ("[LVGL] slow")
     TIMED(L_LED, led_loop());
     TIMED(L_AI,  ai_loop());
-    // Traite une détection "Jarvis" en attente. Doit être sur loopTask : le
-    // callback d'ESP_SR tourne dans sa propre tâche et ne lève qu'un drapeau.
+    // Doit être sur loopTask : le callback d'ESP_SR ne lève qu'un drapeau.
     TIMED(L_WW, wakeword_loop());
-    // Vides — conservées pour la symétrie du pattern manager (*_init/*_loop) :
-    // audio et OTA tournent sur leur propre tâche, LVGL fait le polling tactile.
-    // Pas chronométrées : mesurer une fonction vide ne donnerait jamais rien.
+    // Vides, conservées pour la symétrie du pattern manager : audio et OTA
+    // tournent sur leur propre tâche, LVGL fait le polling tactile.
     touch_loop();
     audio_loop();
     ota_loop();
     _loop_turns++;
     _loop_report();
-    // Rend la main à IDLE1. La boucle Arduino ne cède JAMAIS sur dual-core :
-    // yieldIfNecessary() est sous #if CONFIG_FREERTOS_UNICORE, qui n'est pas
-    // défini. Sans ce tick, loopTask (pri 1) affame IDLE1 (pri 0) et le %CPU du
-    // core 1 reste collé à 100 %, quoi qu'il fasse. 1 tick = 1 ms (FREERTOS_HZ).
+    // Rend la main à IDLE1 : la boucle Arduino ne cède JAMAIS sur dual-core
+    // (yieldIfNecessary() est sous #if CONFIG_FREERTOS_UNICORE, non défini).
+    // 1 tick = 1 ms (FREERTOS_HZ).
     vTaskDelay(1);
 }

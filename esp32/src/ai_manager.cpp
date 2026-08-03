@@ -4,10 +4,9 @@
 // L'état est partagé entre _audio_task, _ai_task et loopTask : seul
 // loopTask l'applique (_apply), les autres passent par _post_state_async.
 //
-// L'audio uploadé reste en PSRAM (buffer singleton d'audio_manager) et
-// part directement en HTTP, sans jamais toucher la flash. Il reste valable
-// tant qu'un nouvel enregistrement n'est pas lancé — ce que la machine à
-// états interdit pendant THINKING/SPEAKING.
+// L'audio uploadé reste en PSRAM (buffer singleton d'audio_manager) et part
+// directement en HTTP. Il reste valable tant qu'un nouvel enregistrement n'est
+// pas lancé — ce que la machine à états interdit pendant THINKING/SPEAKING.
 // ============================================================
 
 // ---- BIBLIOTHÈQUES ----
@@ -35,6 +34,15 @@ static char        _transcript[200] = "";
 static char        _answer[200]     = "";
 static ai_state_cb _cb              = nullptr;
 
+// Réponse enchaînée demandée par le bridge (confirmation d'une commande) : on
+// ré-arme l'écoute sans re-dire « Jarvis ». Posé depuis X-Listen-After.
+static bool _await_reply = false;
+
+// ⚠️ Le HTTPClient d'Arduino ne mémorise QUE les en-têtes déclarés ici — sans
+// collectHeaders(), http.header(...) renvoie toujours "". X-Listen-After seul :
+// transcript/answer arrivent déjà par MQTT, les collecter aussi les doublerait.
+static const char* _RESP_HEADERS[] = {"X-Listen-After"};
+
 struct _PostMsg {
     AiState state;
     char    transcript[200];
@@ -56,8 +64,7 @@ static QueueHandle_t _post_queue = nullptr;   // états à appliquer sur loopTas
 static uint32_t _last_ask_request_ms = 0;
 static const uint32_t ASK_REQUEST_COOLDOWN_MS = 2000;
 
-// Dernière capture reçue, y compris celles écartées faute de parole : ce sont
-// justement celles qu'on veut pouvoir inspecter.
+// Dernière capture reçue, y compris celles écartées faute de parole.
 static const int16_t* _last_pcm     = nullptr;
 static size_t         _last_samples = 0;
 
@@ -74,8 +81,7 @@ static const char* _state_name(AiState s) {
     return "idle";
 }
 
-// Le bridge encode X-Transcript/X-Answer en %XX (les headers HTTP
-// n'autorisent que de l'ISO-8859-1).
+// Le bridge encode X-Transcript/X-Answer en %XX (headers HTTP en ISO-8859-1).
 static int _hex(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -124,8 +130,7 @@ static void _apply(AiState s, const char* transcript, const char* answer) {
     bool state_changed = (s != _state);
     _state = s;
     if (transcript) {
-        // Le transcript arrive par 3 canaux (écho local, MQTT ai/transcript,
-        // en-tête X-Transcript) : ne logger qu'au CHANGEMENT évite le triple.
+        // Le transcript arrive par 3 canaux : ne logger qu'au CHANGEMENT.
         bool changed = strncmp(_transcript, transcript, sizeof(_transcript) - 1) != 0;
         strncpy(_transcript, transcript, sizeof(_transcript) - 1);
         _transcript[sizeof(_transcript) - 1] = '\0';
@@ -137,8 +142,7 @@ static void _apply(AiState s, const char* transcript, const char* answer) {
         if (_answer[0]) log_line("[AI] Réponse : %s", _answer);
     }
     if (_cb) _cb(_state);
-    // Seul un VRAI changement est republié : sinon chaque chunk de texte
-    // republiait le statut en boucle.
+    // Seul un VRAI changement est republié.
     if (state_changed) {
         log_line("[AI] État -> %s", _state_name(s));
         mqtt_publish(TOPIC_AI_STATUS, _state_name(_state));
@@ -162,16 +166,14 @@ static void _post_state_async(AiState s, const char* transcript, const char* ans
     if (transcript) { strncpy(m.transcript, transcript, sizeof(m.transcript) - 1); m.transcript[sizeof(m.transcript) - 1] = '\0'; }
     if (answer)     { strncpy(m.answer, answer, sizeof(m.answer) - 1); m.answer[sizeof(m.answer) - 1] = '\0'; }
 
-    // Sans attente : mieux vaut perdre un rafraîchissement d'affichage que
-    // bloquer _audio_task (temps réel) sur une file pleine.
+    // Sans attente : ne jamais bloquer _audio_task (temps réel) sur file pleine.
     if (xQueueSend(_post_queue, &m, 0) != pdTRUE) {
-        log_line("[AI] File d'etats pleine — mise a jour ignoree");
+        log_line("[AI] File d'états pleine — mise à jour ignorée");
     }
 }
 
 // Lit le PCM de la réponse en PSRAM et le joue. Aucune écriture flash : elle
-// suspendait le cache d'instructions et figeait LVGL ~2,9 s après CHAQUE
-// réponse (ancien /tts.wav). Le rejeu passe par ai_say().
+// suspendrait le cache d'instructions, donc LVGL.
 static void _handle_bridge_response(HTTPClient& http, int http_code, const char* known_transcript) {
     if (http_code != HTTP_CODE_OK) {
         log_line("[AI] Bridge HTTP %d", http_code);
@@ -182,6 +184,10 @@ static void _handle_bridge_response(HTTPClient& http, int http_code, const char*
     String transcript = _url_decode(http.header("X-Transcript"));
     String answer     = _url_decode(http.header("X-Answer"));
     if (transcript.length() == 0 && known_transcript) transcript = known_transcript;
+
+    // Suite enchaînée demandée par le bridge : on ré-écoutera à la fin de la
+    // lecture. Absent ⇒ false, ce qui repart propre à chaque réponse.
+    _await_reply = (_url_decode(http.header("X-Listen-After")) == "1");
 
     int total = http.getSize();
     size_t buf_capacity = (total > 0) ? (size_t)total : (size_t)PSRAM_STREAM_FALLBACK_BYTES;
@@ -233,6 +239,7 @@ static void _run_request_audio(const int16_t* pcm_buf, size_t samples) {
     HTTPClient http;
     http.setTimeout(15000);
     http.begin(AI_BRIDGE_URL);
+    http.collectHeaders(_RESP_HEADERS, 1);
     http.addHeader("Content-Type", "application/octet-stream");
     http.addHeader("X-Sample-Rate", "16000");
     http.addHeader("X-Samples", String((unsigned)samples));
@@ -252,6 +259,7 @@ static void _run_request_text(const char* question) {
     HTTPClient http;
     http.setTimeout(15000);
     http.begin(AI_BRIDGE_TEXT_URL);
+    http.collectHeaders(_RESP_HEADERS, 1);
     http.addHeader("Content-Type", "application/json");
 
     String body = String("{\"text\":\"") + _json_escape(question) + "\"}";
@@ -261,8 +269,7 @@ static void _run_request_text(const char* question) {
     http.end();
 }
 
-// TTS seul, sans mémorisation côté bridge : pour les invites système, qui ne
-// sont pas des échanges.
+// TTS seul, sans mémorisation côté bridge : pour les invites système.
 static void _run_say(const char* text) {
     if (!wifi_is_connected()) {
         log_line("[AI] WiFi non connecté, invite vocale abandonnée");
@@ -273,6 +280,7 @@ static void _run_say(const char* text) {
     HTTPClient http;
     http.setTimeout(15000);
     http.begin(AI_BRIDGE_SAY_URL);
+    http.collectHeaders(_RESP_HEADERS, 1);
     http.addHeader("Content-Type", "application/json");
 
     String body = String("{\"text\":\"") + _json_escape(text) + "\"}";
@@ -282,8 +290,7 @@ static void _run_say(const char* text) {
     http.end();
 }
 
-// Archivage WAV horodaté côté NAS. ~100 ms de HTTP, contre ~3 s d'écriture
-// flash qui gelaient LVGL — et le NAS garde un historique.
+// Archivage WAV horodaté côté NAS.
 static void _run_upload_record(const int16_t* pcm, size_t samples) {
     if (!wifi_is_connected()) {
         log_line("[AI] WiFi non connecté, envoi de la capture annulé");
@@ -328,8 +335,7 @@ static void _ai_task(void* pv) {
 // Appelé DEPUIS _audio_task, avec le buffer PSRAM d'audio_manager.
 static void _on_record_done(const int16_t* pcm_buf, size_t samples, bool cancelled, bool ok,
                             uint16_t speech_ms) {
-    // Mémorisé AVANT tout tri : les captures écartées sont celles qu'on veut
-    // pouvoir envoyer au NAS pour inspection.
+    // Mémorisé AVANT tout tri : les captures écartées sont inspectables.
     _last_pcm     = pcm_buf;
     _last_samples = samples;
 
@@ -342,9 +348,8 @@ static void _on_record_done(const int16_t* pcm_buf, size_t samples, bool cancell
         return;
     }
 
-    // Pas de parole -> on n'envoie RIEN : Whisper hallucine sur autre chose que
-    // de la parole, et la fausse question polluerait ensuite l'historique du
-    // bridge. Le critère est la DURÉE de parole, jamais le pic d'amplitude.
+    // Pas de parole -> on n'envoie RIEN : Whisper hallucine sur du non-parlé.
+    // ⚠️ Le critère est la DURÉE de parole, jamais le pic d'amplitude.
     if (speech_ms < AUDIO_MIN_SPEECH_MS) {
         log_line("[AI] Aucune parole (%u ms < %d) — aucune requête envoyée",
                  (unsigned)speech_ms, AUDIO_MIN_SPEECH_MS);
@@ -365,15 +370,14 @@ static void _on_record_done(const int16_t* pcm_buf, size_t samples, bool cancell
 void ai_init() {
     _ai_queue   = xQueueCreate(2, sizeof(AiCmdMsg));
     _post_queue = xQueueCreate(3, sizeof(_PostMsg));
-    if (!_post_queue) log_line("[AI] FATAL: file d'etats non creee");
-    // Pile : STACK_BYTES_AI_TASK. Pic mesuré 2984 o (identique météo/actus).
-    // High-water trompeur, relever APRÈS un échange vocal complet.
+    if (!_post_queue) log_line("[AI] FATAL: file d'états non créée");
+    // ⚠️ High-water trompeur : relever APRÈS un échange vocal complet.
     xTaskCreate(_ai_task, "ai_task", STACK_BYTES_AI_TASK, nullptr, 1, nullptr);
     log_line("[AI] Init OK");
 }
 
 // Draine la file d'états. Appelée depuis loop(), seul thread autorisé à
-// toucher LVGL. Les états sont cumulatifs : on vide tout d'un coup.
+// toucher LVGL.
 void ai_loop() {
     if (!_post_queue) return;
 
@@ -386,6 +390,7 @@ void ai_loop() {
 
 void ai_start_listening() {
     if (_state == AI_LISTENING || _state == AI_THINKING || _state == AI_SPEAKING) return;
+    _await_reply = false;   // sécurité : un X-Listen-After orphelin ne survit pas à une nouvelle écoute
     _apply(AI_LISTENING, "", "");
     audio_record_file(AUDIO_RECORD_MAX_SECONDS * 1000, _on_record_done);
 }
@@ -403,10 +408,14 @@ void ai_cancel_listening() {
 void ai_notify_speaking_done() {
     if (_state != AI_SPEAKING) return;
     _apply(AI_IDLE, nullptr, nullptr);
+    if (_await_reply) {            // suite d'une commande vocale : on ré-écoute sans « Jarvis »
+        _await_reply = false;
+        audio_wakeword_ack();     // bip d'invitation à parler, comme le wake word
+        ai_start_listening();
+    }
 }
 
-// Refait synthétiser la réponse par le bridge plutôt que de relire un WAV
-// local : plus rien n'est écrit sur la flash. ai_say() pose l'état lui-même.
+// Refait synthétiser la réponse par le bridge. ai_say() pose l'état lui-même.
 void ai_replay_answer() {
     if (_state == AI_LISTENING || _state == AI_THINKING) return;
     if (_answer[0] == '\0') return;
@@ -420,11 +429,10 @@ const char* ai_get_answer()     { return _answer; }
 void ai_set_state_callback(ai_state_cb cb) { _cb = cb; }
 
 // Non bloquant : le HTTP part de _ai_task. Le buffer doit rester valable
-// jusque-là — vrai pour le buffer singleton d'audio_manager, tant qu'aucun
-// nouvel enregistrement ne démarre.
+// jusque-là — vrai tant qu'aucun nouvel enregistrement ne démarre.
 void ai_upload_pcm(const int16_t* pcm, size_t samples) {
     if (!pcm || samples == 0) {
-        log_line("[AI] Aucune capture a envoyer");
+        log_line("[AI] Aucune capture à envoyer");
         return;
     }
     AiCmdMsg msg;
@@ -440,8 +448,7 @@ void ai_upload_last_record() {
 }
 
 // Non bloquant : dépose une commande pour _ai_task, d'où le HTTP part
-// réellement — appelable depuis n'importe quelle tâche, y compris
-// _audio_task dont la pile est étroite.
+// réellement — appelable depuis n'importe quelle tâche.
 void ai_say(const char* text) {
     if (!text || !text[0]) return;
 

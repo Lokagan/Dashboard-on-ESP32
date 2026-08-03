@@ -44,36 +44,40 @@ Synology DS1522+
 
 ESP32-S3 (ES3C28P)
   ├── WiFi → MQTT → Synology
-  ├── TFT_eSPI + LVGL 9.x → ILI9341 (affichage)
+  ├── esp_lcd + LVGL 9.x → ILI9341 (affichage)
   ├── FT6336G (touch I2C 400KHz)
   └── ES8311 (audio)
 ```
 
 ---
 
-## État actuel
+## État actuel (par ordre d'implémentation)
 
 - ✅ Collecte des métriques NAS via `nas_monitor.py`
 - ✅ Collecte des métriques Freebox via `freebox_monitor.py`
 - ✅ Broker MQTT Mosquitto en container
-- ✅ Interface graphique LVGL 9.x sur ESP32 via TFT_eSPI
+- ✅ Interface graphique LVGL 9.x sur ESP32 via `esp_lcd` (pilote ILI9341 maison, `display_driver.cpp`)
 - ✅ Gestion du tactile FT6336G (I2C 400KHz)
 - ✅ Écran tableau générique dynamique (disques, downloads, connexions, appareils Freebox)
-- ✅ Écran « Activité réseau » — service en cours par appareil (YouTube, Steam…) déduit du journal DNS d'AdGuard Home (`activity_monitor.py`, port 8091)
 - ✅ Réglage luminosité backlight via slider tactile
 - ✅ Réglage du volume via slider tactile
+- ✅ Écran de diagnostic système (SysInfo) — identité chip, mémoire, réseau, tâches FreeRTOS, partitions flash, système de fichiers LittleFS (6 pages)
 - ✅ Audio ES8311 + I2S (sons d'interface, fanfare, test loopback micro/haut-parleur) — tourne sur une tâche FreeRTOS dédiée (cœur 1)
 - ✅ LED WS2812B — indicateur d'état (WiFi/MQTT/enregistrement audio)
 - ✅ Mise à jour OTA (ArduinoOTA) — tâche dédiée, avec écran de progression
-- ✅ Écran de diagnostic système (SysInfo) — identité chip, mémoire, réseau, tâches FreeRTOS, partitions flash, système de fichiers LittleFS (6 pages)
 - ✅ Assistant IA (écran Companion) — enregistrement vocal (coupure sur silence), upload direct du buffer PSRAM vers un bridge HTTP (STT/LLM/TTS),
      lecture de la réponse audio et affichage question/réponse. Déclenchement également possible en texte via MQTT (`ai/ask`)
-- ✅ Assistant IA — intentions **météo** (Open-Meteo ; prévisions demain / semaine, conditions décodées) et **actualités** (flux RSS résumés à l'oral) détectées par mots-clés et injectées au LLM ;
-     page de config web à chaud (`http://<NAS>:8090/`) : voix, personnalité, modèle, météo, actualités
-- ✅ Détection par mot-clé (wake word) « Jarvis » via ESP_SR natif (`wakeword_manager.cpp`) — déclenche l'assistant IA sans appui bouton, en plus du bouton Rec et de MQTT
-- ✅ Commandes `esp32/cmd` (navigation à distance, luminosité, volume, reboot) pleinement exécutées via `mqtt_handle_esp_cmd()` — appelable depuis le topic MQTT `esp32/cmd` 
-     ou depuis le panneau web "Commandes ESP32" (`POST /cmd`)
 - ✅ Interface web embarquée (port 80, `http_manager.cpp`) : gestionnaire de fichiers LittleFS (liste/téléchargement/suppression), visualiseur de logs circulaire (`GET /serial`), panneau de commandes ESP32
+- ✅ Assistant IA — outils appelés par le LLM lui-même (function calling) : **météo** (Open-Meteo ; prévisions demain / semaine, conditions décodées),
+     **actualités** (flux RSS résumés à l'oral) et **recherche web** (DuckDuckGo) ;
+     page de config web à chaud (`http://<NAS>:8090/`) : voix, personnalité, modèle, météo, actualités, commandes vocales
+- ✅ Détection par mot-clé (wake word) « Jarvis » via ESP_SR natif (`wakeword_manager.cpp`) — déclenche l'assistant IA sans appui bouton, en plus du bouton Rec et de MQTT
+- ✅ Écran « Activité réseau » — service en cours par appareil (YouTube, Steam…) déduit du journal DNS d'AdGuard Home (`activity_monitor.py`, port 8091)
+- ✅ Commandes `esp32/cmd` (navigation à distance, luminosité, volume, reboot, outils de diagnostic) pleinement exécutées via `mqtt_handle_esp_cmd()` — appelable depuis le topic MQTT `esp32/cmd` 
+     ou depuis la colonne de commandes de la page web (`POST /cmd`)
+- ✅ Commandes vocales — une phrase contenant un mot-clé de pilotage (« pilote… ») est traduite en action `esp32/cmd` par le LLM ;
+     les réglages (volume, luminosité) demandent une confirmation vocale, la navigation s'exécute directement
+
 
 ---
 
@@ -99,11 +103,11 @@ dashboard-projet/
 ├── esp32/
 │   ├── platformio.ini             # Configuration pioarduino (extra_configs → ota.local.ini)
 │   ├── partitions.csv             # Table de partitions 16MB (app0/app1/model/littlefs)
-│   ├── extra_scripts/             # Scripts de build (patch couleur TFT, png→bin)
+│   ├── model/                     # srmodels_jarvis.bin — modèle ESP-SR du wake word
+│   ├── data/                      # Contenu de LittleFS (sprites de l'avatar Companion)
+│   ├── extra_scripts/             # Scripts de build (flash du modèle ESP-SR + LittleFS, png→bin et bin→png)
 │   ├── include/                   # Headers bas niveau
-│   │   ├── lv_conf.h              # Configuration LVGL
-│   │   ├── User_Setup.h           # Configuration TFT_eSPI
-│   │   └── ILI9341_Init.h         # Séquence d'init ILI9341
+│   │   └── lv_conf.h              # Configuration LVGL
 │   ├── squareline/
 │   │   └── ui/                    # Sources générées Squareline Studio 1.6.1
 │   │       ├── screens/           # Un fichier .c/.h par écran
@@ -122,7 +126,9 @@ dashboard-projet/
 │       ├── ai_companion.cpp / .h      # Sprites/état visuel de l'écran Companion
 │       ├── ai_manager.cpp / .h        # Assistant IA — bridge HTTP (STT/LLM/TTS), état Companion
 │       ├── audio_manager.cpp / .h     # ES8311 + I2S + FM8002E
-│       ├── display_manager.cpp / .h   # LVGL, TFT_eSPI, tableaux dynamiques, graphiques
+│       ├── display_driver.cpp / .h    # Dalle ILI9341 sur esp_lcd — seul propriétaire du bus SPI
+│       ├── display_gfx.cpp / .h       # Rastériseur logiciel RGB565 (dessin hors-écran)
+│       ├── display_manager.cpp / .h   # LVGL, tableaux dynamiques, graphiques
 │       ├── http_manager.cpp / .h      # Serveur web : fichiers LittleFS, logs, commandes ESP32
 │       ├── led_manager.cpp / .h       # WS2812B — indicateur d'état
 │       ├── littlefs_manager.cpp / .h  # Montage LittleFS + accès fichiers génériques
@@ -131,6 +137,7 @@ dashboard-projet/
 │       ├── ota_manager.cpp / .h       # Mise à jour OTA (ArduinoOTA)
 │       ├── sysinfo_manager.cpp / .h   # Écran diagnostic système
 │       ├── touch_manager.cpp / .h     # FT6336G I2C
+│       ├── wakeword_manager.cpp / .h  # Mot-clé « Jarvis » (ESP-SR)
 │       └── wifi_manager.cpp / .h      # Connexion WiFi
 └── synology/
     ├── Dockerfile               # Dépendances Python (installées à l'image)
@@ -188,7 +195,7 @@ cp synology/monitor.env.example synology/monitor.env
 
 > Ne stockez jamais vos identifiants secrets publiquement.
 
-Les paramètres de l'assistant IA (voix, modèle, personnalité, météo, actualités) ne sont **pas** dans `monitor.env` : leurs défauts vivent dans `synology/scripts/bridge_defaults.json` (versionné, sans secret) et se modifient à chaud depuis la page `http://<NAS>:8090/`. `bridge_settings.json` garde les réglages sauvés côté NAS (hors dépôt).
+Les paramètres de l'assistant IA (voix, modèle, personnalité, météo, actualités, commandes vocales) ne sont **pas** dans `monitor.env` : leurs défauts vivent dans `synology/scripts/bridge_defaults.json` (versionné, sans secret) et se modifient à chaud depuis la page `http://<NAS>:8090/`. `bridge_settings.json` garde les réglages sauvés côté NAS (hors dépôt).
 
 L'écran **« Activité réseau »** (voir plus bas) s'appuie sur [AdGuard Home](https://adguard.com/adguard-home.html) installé sur le NAS comme résolveur DNS du réseau : renseignez `AGH_URL` / `AGH_USER` / `AGH_PASS` dans `monitor.env`. Le service `activity_monitor.py` interroge son journal DNS (page servie sur le port `8091`). Sans AdGuard, tout le reste fonctionne — seule la colonne « service » reste vide.
 
@@ -213,8 +220,8 @@ cp esp32/src/config.h.example esp32/src/config.h
 
 Mettez à jour `esp32/src/config.h` avec :
 - les identifiants WiFi (`WIFI_SSID`/`WIFI_PASSWORD`)
-- l'adresse du NAS (`NAS_HOST`)
-- l'URL du bridge IA (`AI_BRIDGE_URL` pour l'audio, `AI_BRIDGE_TEXT_URL` pour le texte) — pointe vers le service HTTP `bridge_monitor.py` (STT/LLM/TTS), déployé avec le reste du monitoring sur le NAS (`synology/`, port 8090)
+- l'adresse du NAS (`NAS_HOST`) — **à changer là et nulle part ailleurs** : l'adresse du broker MQTT et les cinq URL du bridge IA (`AI_BRIDGE_URL` pour l'audio, `AI_BRIDGE_TEXT_URL` pour le texte…) en découlent par concaténation, elles pointent vers le service HTTP `bridge_monitor.py` (STT/LLM/TTS) déployé avec le reste du monitoring sur le NAS (`synology/`, port 8090)
+- le mot de passe OTA (`OTA_PASSWORD`)
 
 Le mot de passe OTA n'est **pas** versionné dans `platformio.ini`. Créez un fichier `esp32/ota.local.ini` (ignoré par git, fusionné automatiquement par PlatformIO via `extra_configs`) avec la même valeur que `OTA_PASSWORD` de `config.h` :
 
@@ -231,19 +238,24 @@ Compilez et téléversez sur l'ESP32 depuis PlatformIO.
 
 ```bash
 cd esp32
-# Compilation
-pio run
-# Téléversement mémoire FLASH
-pio run -t uploadfs
-# Téléversement sketch
-pio run -t upload
 # Nettoyer le build
 pio run -t clean
+# Compilation
+pio run
+# Compilation + téléversement (firmware, et en USB : modèle ESP_SR + LittleFS)
+pio run -t upload
 # Monitor série
 pio device monitor -b 115200
 ```
 
 ### Notes de compilation
+
+**Un seul `upload` écrit tout (flash USB)** — `extra_scripts/flash_assets.py` ajoute le modèle ESP_SR (`model/srmodels_jarvis.bin`) et l'image LittleFS (construite depuis `data/`) à la liste des images passées à esptool, aux offsets lus dans `partitions.csv`. Ni `pio run -t uploadfs` ni un `esptool write-flash` manuel ne sont donc nécessaires. ⚠️ Sans ce script, la partition `model` reste vierge et **le wake word ne démarre pas, sans erreur explicite**.
+
+**En OTA, seule la partition applicative est écrite** — c'est le fonctionnement normal d'`espota`, et le script se désactive alors de lui-même. Conséquence : **toute modification de `partitions.csv`, du contenu de `data/` ou du modèle ESP_SR impose un flash USB complet.**
+
+**Premier flash (USB)** — dans `platformio.ini` : passer `upload_protocol = esptool` **et commenter `extra_configs`**, car `ota.local.ini` porte `upload_flags = --auth=…` qu'esptool ne connaît pas et qui le fait échouer. Vérifier dans le tableau d'esptool que les offsets de `model` et `littlefs` sont bien listés, puis ne revenir à `espota` (**en décommentant `extra_configs`**, sinon l'OTA part sans mot de passe et se fait refuser) qu'après avoir vérifié que « Jarvis » répond et que l'avatar s'anime.
+
 **Client MQTT** — `mqtt_manager.cpp` utilise **esp-mqtt** (natif ESP-IDF, migré depuis PubSubClient en 07/2026) : réception/parsing sur sa propre tâche `mqtt_task`, hors `loop()`, le dispatch vers l'UI étant marshallé sur `loop()` par une file FreeRTOS. Les gros payloads JSON (notamment `freebox/devices`, > 4KB) sont absorbés par `cfg.buffer.size = 5120` (alloué en PSRAM) et un tampon de réassemblage PSRAM.
 
 **Upload OTA par défaut** — `platformio.ini` est configuré avec `upload_protocol = espota` et `upload_port = Dashboard.local` : `pio run -t upload` téléverse donc par WiFi (ArduinoOTA) une fois le firmware initial flashé, sans câble. Pour le tout premier flash (ou en cas de perte de connexion WiFi), basculez temporairement sur `upload_protocol = esptool` avec le port série USB-C.
@@ -275,7 +287,7 @@ pio device monitor -b 115200
 | Table          | Tableau générique : disques / downloads / connexions / appareils Freebox |
 | Activité réseau | Par appareil : service en cours (YouTube, Steam…) + débits DL/UP — via le journal DNS d'AdGuard Home |
 | Companion (IA) | Assistant vocal : bouton Rec (enregistrement), bouton Play (rejouer la dernière réponse), sous-titres question/réponse |
-| SysInfo        | Diagnostic système (6 pages, écran LVGL via canvas + TFT_eSprite) : identité chip, mémoire, réseau, tâches FreeRTOS, partitions flash, système de fichiers LittleFS |
+| SysInfo        | Diagnostic système (6 pages, écran LVGL via canvas + buffer PSRAM hors-écran) : identité chip, mémoire, tâches FreeRTOS, partitions flash, système de fichiers LittleFS, réseau |
 
 ### Navigation tableau
 
@@ -285,17 +297,17 @@ Les tableaux Disques et Freebox supportent le scroll horizontal pour accéder au
 
 ### Écran SysInfo
 
-Accessible depuis le bouton dédié sur l'écran Home (`display_show_sysinfo()`). Chaque page est dessinée dans un `TFT_eSprite` hors-écran puis copiée dans un `lv_canvas` affiché comme un écran LVGL normal (`lv_scr_load()`) — WiFi, MQTT et le reste de LVGL continuent de tourner normalement pendant l'affichage. Navigation tactile : zone gauche = page précédente, zone droite = page suivante, zone centrale = retour à l'UI LVGL. Un rappel de `display_show_sysinfo()` alors que l'écran est déjà affiché (commande `page:sysinfo` via MQTT ou le panneau web "Commandes ESP32") fait avancer d'une page, pour parcourir les 6 pages à distance sans écran tactile.
+Accessible depuis le bouton dédié sur l'écran Home (`display_show_sysinfo()`). Chaque page est dessinée par le rastériseur `display_gfx` dans un buffer PSRAM hors-écran, puis copiée dans un `lv_canvas` affiché comme un écran LVGL normal (`lv_scr_load()`) — WiFi, MQTT et le reste de LVGL continuent de tourner normalement pendant l'affichage. Navigation tactile : zone gauche = page précédente, zone droite = page suivante, zone centrale = retour à l'UI LVGL. Un rappel de `display_show_sysinfo()` alors que l'écran est déjà affiché (commande `page:sysinfo` via MQTT ou la page web) fait avancer d'une page ; `page:sysinfo1` à `page:sysinfo6` ouvrent directement la page voulue.
 
 ### Écran Companion (IA)
 
 Accessible depuis le bouton dédié sur l'écran Home. Fonctionnement :
-- **Bouton Rec** : démarre l'enregistrement micro (coupure automatique après un silence prolongé, ou durée max définie par `RECORD_MAX_SECONDS`). Le buffer audio capturé reste en PSRAM et est uploadé directement en HTTP vers le bridge IA (`AI_BRIDGE_URL`), sans jamais transiter par la flash.
+- **Bouton Rec** : démarre l'enregistrement micro (coupure automatique après un silence prolongé, ou durée max définie par `AUDIO_RECORD_MAX_SECONDS`). Le buffer audio capturé reste en PSRAM et est uploadé directement en HTTP vers le bridge IA (`AI_BRIDGE_URL`), sans jamais transiter par la flash.
 - Le bridge répond avec la transcription (STT) et la réponse texte (LLM) dans des en-têtes HTTP, suivies du flux audio TTS en **PCM brut** (pas de WAV). Le firmware le lit directement depuis la PSRAM et le joue immédiatement — **rien n'est écrit sur la flash**. L'écriture d'un `/tts.wav` après lecture a été retirée : une écriture flash suspend le cache d'instructions et gelait LVGL ~2,9 s après chaque réponse. Le bouton Play redemande la synthèse au bridge (`POST /say`).
 - **Bouton Play** : rejoue la dernière réponse TTS reçue.
 - La question peut aussi être posée en texte via le topic MQTT `ai/ask` (bridge → ESP32 → `AI_BRIDGE_TEXT_URL`), avec un anti-doublon de 2s entre deux requêtes.
 - **Déclenchement mains-libres** : mot-clé « Jarvis » (ESP_SR natif, `wakeword_manager.cpp`), en plus du bouton Rec et de `ai/ask`.
-- **Intentions** : le bridge détecte la **météo** (Open-Meteo ; actuel / demain / semaine) et les **actualités** (flux RSS) par mots-clés et les injecte au LLM. Réglages à chaud sur `http://<NAS>:8090/` (voix, personnalité, modèle, météo, actualités).
+- **Outils** : le LLM décide seul d'appeler la **météo** (Open-Meteo ; actuel / demain / après-demain / semaine), les **actualités** (flux RSS) ou la **recherche web** (DuckDuckGo), le bridge exécute et lui renvoie le résultat pour qu'il rédige. Réglages à chaud sur `http://<NAS>:8090/` (voix, personnalité, modèle, outils, météo, actualités, commandes vocales). ⚠️ L'appel spontané d'outils dépend du **modèle** choisi, pas du prompt.
 - États affichés : `idle`, `listening`, `thinking`, `speaking`, `error` — publiés sur `ai/status`.
 
 ### Écran Activité réseau (AdGuard Home)
@@ -304,11 +316,18 @@ Table « qui fait quoi sur le réseau » : pour chaque appareil, le **service** 
 
 ### Interface web ESP32
 
-Accessible sur `http://<IP_ESP32>/` (port 80, `http_manager.cpp`, tâche FreeRTOS dédiée). Trois panneaux :
-- **Fichiers** : liste, téléchargement et suppression des fichiers LittleFS (`/list`, `/data`, `/delete`)
-- **Logs** : dernières lignes du journal circulaire (`GET /serial`), tenu par `log_manager.cpp` en remplacement de `Serial.print*` — survit à un reset logiciel/crash (pas à une coupure d'alimentation)
-- **Commandes ESP32** : mêmes commandes que le topic MQTT `esp32/cmd` (navigation, luminosité, volume, reboot), envoyées via `POST /cmd`
-- **Config NAS** : boutons « ⚙ Config IA » (`http://<NAS>:8090/`) et « ⚙ Config Services / AdGuard » (`http://<NAS>:8091/`) ouvrant les pages de paramétrage servies par le NAS
+Accessible sur `http://<IP_ESP32>/` (port 80, `http_manager.cpp`, tâche FreeRTOS dédiée). Deux colonnes.
+
+Colonne de gauche :
+- **Assistant IA** : poser une question en texte, ou lancer une écoute vocale (champ vide + « Demander », même séquence que le wake word)
+- **Faire parler Jarvis** : synthèse vocale d'un texte libre
+- **Logs (Serial)** : dernières lignes du journal circulaire (`GET /serial`), tenu par `log_manager.cpp` en remplacement de `Serial.print*` — survit à un reset logiciel/crash (pas à une coupure d'alimentation)
+- **LittleFS** : liste, téléchargement et suppression des fichiers (`/list`, `/data`, `/delete`)
+
+Colonne de droite, les mêmes commandes que le topic MQTT `esp32/cmd`, envoyées via `POST /cmd` :
+- **Navigation** : accès direct à chaque écran
+- **Paramètres** : luminosité, volume, et les boutons « ⚙ Config IA », « ⚙ Config ACTIVITÉS » et « ⚙ Config ADGUARD » qui ouvrent les pages de paramétrage servies par le NAS
+- **Diagnostic** : 6 boutons vers les pages SysInfo, plus les outils embarqués (état mémoire, mesure de boucle, capture d'écran, espion LVGL, arbre des widgets, capture IA → NAS) et le redémarrage
 
 ---
 
@@ -336,10 +355,13 @@ Pour plus de détails, voir `docs/mqtt_topics.md`.
 ## Notes importantes
 
 - **Touch FT6336G** : le bus I2C doit être configuré à 400KHz maximum. Une fréquence trop élevée provoque des blocages du contrôleur tactile.
-- **Backlight** : géré via `analogWrite()` après l'init TFT_eSPI. Ne pas initialiser LEDC manuellement — TFT_eSPI s'en charge en interne.
+- **Backlight** : géré via `analogWrite(TFT_BL, …)` dans `display_init()`, après l'init de la dalle.
+- **Horloge SPI de l'écran** : `TFT_SPI_HZ` dans `config.h`. ⚠️ Ce n'est qu'une **demande** : le contrôleur dérive l'APB (80 MHz) par un diviseur entier et retient le plus grand candidat ≤ la demande (80 / 40 / 26,7 / 20 MHz…, rien entre 40 et 80). `panel_actual_hz()` rend la valeur réellement appliquée. **80 MHz ne fonctionne pas sur ce câblage** en transfert DMA continu : 40 MHz est le plafond du montage.
 - **`%f` dans LVGL** : newlib nano ne supporte pas `printf` flottant. Tous les affichages de flottants passent par des macros `FLOAT_INT` / `FLOAT_DEC` dans `display_manager.cpp`.
 - Si vous changez `FREEBOX_API`, vérifiez la compatibilité avec la version de l'API Freebox.
 - **Mot de passe OTA** : `ota_manager.cpp` ne fixe un mot de passe OTA que si `OTA_PASSWORD` est défini dans `config.h`. Sur un réseau non maîtrisé, définissez-le, et reportez la même valeur dans `esp32/ota.local.ini` (gitignoré) pour le téléversement OTA, afin d'éviter qu'un tiers ne flashe l'ESP32 via WiFi.
+- **⚠️ Ce montage suppose un réseau local de confiance** : le broker MQTT accepte les connexions anonymes (`allow_anonymous true`), et ni la page web de l'ESP32 ni les deux pages de configuration du NAS (ports 8090 et 8091) ne demandent d'authentification. Sur un réseau partagé (colocation, réseau invité), n'importe qui peut lire les métriques ou publier sur `esp32/cmd`. Prévoyez au minimum un mot de passe Mosquitto et un reverse proxy devant les pages de config.
+- **Captures vocales** : chaque enregistrement envoyé au bridge par `saverec` ou le test loopback est archivé en WAV horodaté dans `synology/scripts/captures/` (hors dépôt) et **n'est jamais purgé automatiquement**. Pensez à faire le ménage.
 - **Secrets** : `config.h` (`WIFI_SSID`, `WIFI_PASSWORD`, `OTA_PASSWORD`) et `synology/monitor.env` (mots de passe NAS, clé Groq, token Freebox) contiennent des secrets en clair. Ces deux fichiers sont **exclus du dépôt** par le `.gitignore` racine (avec `scripts/bridge_settings.json` et `scripts/captures/`) ; seuls les modèles `config.h.example` et `monitor.env.example` sont versionnés. Ne jamais forcer l'ajout des vrais fichiers (`git add -f`).
 - **Audio** : le rendu (tons, fanfare, lecture) et l'enregistrement micro tournent sur une tâche FreeRTOS dédiée au cœur 1, afin de ne jamais bloquer `loop()` (LVGL, touch, OTA). La réception MQTT tourne elle aussi sur sa propre tâche (esp-mqtt), `loop()` ne fait qu'appliquer les valeurs déjà parsées.
 - **`esp32/status`** : publié en `"online"` sur `MQTT_EVENT_CONNECTED`, et un **Last Will Testament** est configuré (`cfg.session.last_will` dans `mqtt_manager.cpp`), donc le broker publie automatiquement `"offline"` en cas de déconnexion brutale de l'ESP32.
@@ -369,6 +391,5 @@ Ce projet est distribué sous licence **GNU General Public License v3.0** — vo
 
 - Intégration Home Assistant
 - Capteurs ESP32 supplémentaires
-- Mot de passe OTA par défaut
 - Support multi-broker MQTT (ou plusieurs Dashboard)
-- Navigation LGVL par la voix
+- mettre en place une mémoire persistante pour la LLLM (type SQL), sous la forme d'un memory_manager.py

@@ -7,5 +7,6 @@ RUN pip install --no-cache-dir \
     openai==2.44.0 \
     edge-tts==7.2.8 \
     pydub==0.25.1 \
-    static-ffmpeg==2.13
+    static-ffmpeg==2.13 \
+    ddgs==9.14.4
 CMD ["python3", "-u", "monitor.py"]

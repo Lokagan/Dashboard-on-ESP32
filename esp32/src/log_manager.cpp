@@ -1,13 +1,12 @@
 // ============================================================
 // LOG_MANAGER.CPP — journal circulaire en mémoire RTC "no-init".
 //
-// Le buffer survit à un reset logiciel, un crash watchdog ou un
-// ESP.restart() — seule une coupure d'alimentation le remet à zéro.
-// log_init() ne le vide donc que sur un démarrage à froid : après un
-// plantage, les dernières lignes d'avant le reset restent lisibles.
+// Le buffer survit à un reset logiciel, un crash watchdog ou un ESP.restart() —
+// seule une coupure d'alimentation le remet à zéro, donc log_init() ne le vide
+// que sur un démarrage à froid.
 //
-// Appelé depuis plusieurs tâches (loop, audio, IA, HTTP, OTA) : accès
-// protégé par un spinlock portMUX (section critique légère).
+// Appelé depuis plusieurs tâches (loop, audio, IA, HTTP, OTA) : accès protégé
+// par un spinlock portMUX.
 // ============================================================
 
 // ---- BIBLIOTHÈQUES ----
@@ -51,8 +50,7 @@ void log_init() {
         _log_head  = 0;
         _log_count = 0;
     }
-    // Bornage défensif : à la toute première mise sous tension, la RTC contient
-    // n'importe quoi.
+    // À la toute première mise sous tension, la RTC contient n'importe quoi.
     if (_log_head < 0 || _log_head >= LOG_MAX_LINES)  _log_head  = 0;
     if (_log_count < 0 || _log_count > LOG_MAX_LINES) _log_count = 0;
 
@@ -62,17 +60,25 @@ void log_init() {
 void log_line(const char* fmt, ...) {
     char line[LOG_LINE_LEN];
 
-    // Horodatage mm:ss.mmm en préfixe de CHAQUE ligne. Sans lui, une suite de
-    // lignes identiques ne permet pas de distinguer un phénomène continu d'une
-    // rafale périodique — ça a mené deux fois à des conclusions fausses.
+    // Horodatage mm:ss.mmm en préfixe de CHAQUE ligne : sans lui, une suite de
+    // lignes identiques ne distingue pas un phénomène continu d'une rafale.
     unsigned long ms = millis();
     int n = snprintf(line, sizeof(line), "%02lu:%02lu.%03lu ",
                      (ms / 60000UL) % 100, (ms / 1000UL) % 60, ms % 1000UL);
 
     va_list args;
     va_start(args, fmt);
-    vsnprintf(line + n, sizeof(line) - n, fmt, args);
+    int m = vsnprintf(line + n, sizeof(line) - n, fmt, args);
     va_end(args);
+
+    // ⚠️ vsnprintf coupe à l'OCTET : sur un caractère UTF-8 multi-octets la
+    // coupe tombe au milieu et /serial affiche du mojibake. On recule donc
+    // jusqu'à une frontière — les octets de continuation valent 10xxxxxx.
+    if (m > 0 && (size_t)m >= sizeof(line) - n) {
+        int cut = LOG_LINE_LEN - 4;   // place pour "..." + '\0'
+        while (cut > n && ((unsigned char)line[cut] & 0xC0) == 0x80) cut--;
+        strcpy(line + cut, "...");
+    }
 
     Serial.println(line);
 
@@ -91,13 +97,9 @@ void log_clear() {
     portEXIT_CRITICAL(&_log_mux);
 }
 
-// JSON construit à la main plutôt qu'avec ArduinoJson : la version précédente
-// copiait le journal entier sur la PILE (40 × 100 = 4 Ko) avant de le passer à
-// un JsonDocument, qui le recopiait encore, puis à un String — trois copies en
-// vol sur http_task. Ici on ne recopie qu'une ligne à la fois.
-//
-// Contrepartie : une ligne peut être réécrite pendant qu'on parcourt le
-// tampon. Sans importance pour un journal de diagnostic.
+// JSON construit à la main, ligne par ligne : ArduinoJson demanderait le
+// journal entier sur la pile de http_task. Contrepartie : une ligne peut être
+// réécrite pendant le parcours, sans importance pour du diagnostic.
 String log_get_json(int max_lines) {
     portENTER_CRITICAL(&_log_mux);
     int n     = (max_lines < _log_count) ? max_lines : _log_count;
@@ -119,8 +121,7 @@ String log_get_json(int max_lines) {
 
         if (i) out += ',';
         out += '"';
-        // Échappement JSON minimal : les logs contiennent des guillemets
-        // (« "Jarvis" détecté ») et des chemins.
+        // Échappement JSON minimal : les logs contiennent des guillemets.
         for (const char* p = line; *p; p++) {
             if      (*p == '"')  out += "\\\"";
             else if (*p == '\\') out += "\\\\";
@@ -136,8 +137,8 @@ String log_get_json(int max_lines) {
 void log_set_loop_measure(bool on) {
     if (_loop_measure == on) return;
     _loop_measure = on;
-    log_line("[LOOP] Mesure %s", on ? "activee" : "coupee");
-    // Légende une fois à l'activation : la synthèse 10 s serait illisible sinon.
+    log_line("[LOOP] Mesure %s", on ? "activée" : "coupée");
+    // Légende une fois à l'activation.
     if (on) log_line("[LOOP] X%%=travail/10s  Nt=tours de loop()  nom:ms=cumul par manager");
 }
 

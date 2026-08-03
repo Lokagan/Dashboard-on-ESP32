@@ -34,12 +34,14 @@ Le firmware ESP32 (ai_manager.cpp) publie déjà lui-même "listening",
 # ----------------------------------------------------------------
 import os
 import io
+import re
 import json
 import time
 import wave
 import asyncio
 from collections import deque
 from datetime import datetime
+import zoneinfo
 from xml.etree import ElementTree
 import requests
 import paho.mqtt.client as mqtt
@@ -51,6 +53,10 @@ from pydub import AudioSegment
 import static_ffmpeg
 static_ffmpeg.add_paths()   # télécharge ffmpeg+ffprobe (une fois) et les ajoute au PATH
 from urllib.parse import quote
+try:
+    from ddgs import DDGS       # recherche web (outil web_search)
+except ImportError:             # image pas reconstruite : l'outil se dira
+    DDGS = None                 # indisponible, le reste du bridge tourne
 
 # ----------------------------------------------------------------
 # OBJETS GLOBAUX
@@ -64,8 +70,7 @@ HTTP_PORT = int(os.getenv("AI_BRIDGE_PORT", "8090"))
 SAMPLE_RATE = int(os.getenv("AUDIO_SAMPLE_RATE", "16000"))  # doit matcher AUDIO_SAMPLE_RATE (config.h)
 
 # Marge sous la saturation après normalisation de l'audio envoyé au STT, en dB.
-# Compense la distance variable au micro — l'ESP32 capture désormais en linéaire
-# (ALC matérielle désactivée, cf. normalize_pcm). Mettre à 0 (ou vide) désactive.
+# Compense la distance variable au micro. 0 (ou vide) désactive.
 _hr = os.getenv("STT_NORMALIZE_HEADROOM", "3")
 STT_NORMALIZE_HEADROOM = float(_hr) if _hr.strip() not in ("", "0") else None
 
@@ -82,11 +87,10 @@ STT_URL      = "https://api.groq.com/openai/v1/audio/transcriptions"
 #     déplacé dans bridge_defaults.json, cf. plus bas) ---
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.groq.com/openai/v1")
 
-# reasoning_effort / reasoning_format sont des extensions Groq, à passer par
-# extra_body et NON en kwargs : absents de la signature de create(), le SDK
-# lèverait un TypeError avant même d'émettre la requête.
-# ⚠️ Et seuls les modèles À RAISONNEMENT les acceptent — un llama/kimi répond
-# 400. Le refus est donc mémorisé par modèle (cf. le retry de llm_answer).
+# ⚠️ reasoning_effort / reasoning_format passent par extra_body et NON en
+# kwargs : absents de la signature de create(), le SDK lèverait un TypeError.
+# ⚠️ Seuls les modèles À RAISONNEMENT les acceptent — un llama/kimi répond 400,
+# d'où le refus mémorisé par modèle (cf. le retry de llm_answer).
 LLM_IS_GROQ = "groq.com" in LLM_BASE_URL
 _no_reasoning_models: set[str] = set()
 
@@ -96,26 +100,21 @@ def _llm_extra_body() -> dict:
     return {"reasoning_effort": "none", "reasoning_format": "hidden"}
 
 # --- Paramètres IA modifiables À CHAUD (page http://<NAS>:8090/) ---
-# DEUX fichiers, DEUX rôles, plus AUCUN doublon avec monitor.env :
-#   bridge_defaults.json (repo, versionné) -> valeurs par DÉFAUT, éditées à froid
+#   bridge_defaults.json (repo, versionné) -> valeurs par DÉFAUT
 #   bridge_settings.json (NAS, hors repo)  -> overrides SAUVÉS par l'interface web
-# monitor.env ne garde QUE le structurel (broker/hôtes/ports/secrets/cadence) ;
-# voix, modèle, prompt, météo et actus n'y sont plus. Le défaut est sans secret,
-# donc versionnable. Gotchas des mots-clés (le JSON ne porte pas de commentaire) :
-#   météo : fragments COURTS ("quel temps fait-il" ratait "quel temps il fait") ;
-#           "pleuv" et non "pleu" (qui prendrait "pleurer") ; weather_city n'est
-#           qu'un libellé, ce sont lat/lon qui font la requête.
-#   actus : "que se passe" attrape "que se passe-t-il" ; "actu" couvre
-#           actualité/actualités ; seuls les <title> RSS 2.0 sont lus (pas Atom).
-#   prompt : pas de date/heure ici (jamais passé à .format()) — ajoutée dans
+# monitor.env ne garde QUE le structurel (broker/hôtes/ports/secrets/cadence).
+# Gotchas des mots-clés, le JSON ne portant pas de commentaire :
+#   météo : fragments COURTS ; "pleuv" et non "pleu" (qui prendrait "pleurer") ;
+#           weather_city n'est qu'un libellé, lat/lon font la requête.
+#   actus : seuls les <title> RSS 2.0 sont lus (pas Atom).
+#   prompt : ⚠️ pas de date/heure ici (jamais passé à .format()) — ajoutée dans
 #            llm_answer() via _current_datetime_fr().
 DEFAULTS_FILE          = os.getenv("BRIDGE_DEFAULTS_FILE", "/app/scripts/bridge_defaults.json")
 SETTINGS_FILE          = os.getenv("BRIDGE_SETTINGS_FILE", "/app/scripts/bridge_settings.json")
 TTS_VOICE_FILE_LEGACY  = "/app/scripts/tts_voice.json"   # ancien fichier voix seule, migré puis ignoré
 
-# Peuplés au démarrage (main) depuis DEFAULTS_FILE, PAS à l'import : une erreur de
-# fichier ne doit tuer que le thread bridge, jamais nas/freebox_monitor —
-# monitor.py importe les trois dans le même process.
+# ⚠️ Peuplés au démarrage (main), PAS à l'import : monitor.py importe les trois
+# scripts dans le même process, une erreur de fichier ne doit tuer que le bridge.
 DEFAULT_SETTINGS: dict = {}
 _settings: dict = {}
 
@@ -124,13 +123,15 @@ _settings: dict = {}
 _JOURS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
 _MOIS  = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet",
           "août", "septembre", "octobre", "novembre", "décembre"]
+# --- Timezone
+_TZ = os.getenv("TIMEZONE","Europe/Paris")
 
 # --- Historique conversationnel ---
-# Le prompt système demande explicitement de garder le contexte, il faut donc
-# le purger : sans TTL, une question posée le lendemain arriverait avec dix
-# échanges périmés que le modèle prendrait pour la suite de la conversation.
-CONVERSATION_TTL_S = int(os.getenv("AI_CONVERSATION_TTL_S", "600"))  # 10 min d'inactivité
-conversation = deque(maxlen=20)   # 10 derniers échanges (Q+R = 2 entrées)
+# Deux réglages pilotables par env (monitor.env). ⚠️ La PROFONDEUR se paie à
+# CHAQUE requête (tout le fil renvoyé au LLM) ; le TTL, lui, est gratuit.
+CONVERSATION_TTL_S         = int(os.getenv("AI_CONVERSATION_TTL_S", "600"))          # inactivité, en s
+CONVERSATION_MAX_EXCHANGES = int(os.getenv("AI_CONVERSATION_MAX_EXCHANGES", "10"))   # nb d'échanges gardés
+conversation = deque(maxlen=CONVERSATION_MAX_EXCHANGES * 2)   # ×2 : 1 échange = user + assistant
 _last_exchange_ts = 0.0
 
 llm_client = OpenAI(base_url=LLM_BASE_URL, api_key=GROQ_API_KEY)
@@ -248,7 +249,7 @@ def mqtt_pub(topic: str, payload: str):
         print(f"[Bridge] Erreur publication MQTT {topic} : {e}")
 
 def _current_datetime_fr() -> str:
-    now = datetime.now()
+    now = datetime.now(zoneinfo.ZoneInfo(_TZ))
     return (f"{_JOURS[now.weekday()]} {now.day} {_MOIS[now.month - 1]} {now.year}, "
             f"il est {now:%H:%M}")
 
@@ -267,9 +268,8 @@ def _conversation_history() -> list:
         _conversation_clear()
 
     hist = list(conversation)
-    # maxlen coupe par le début : on peut se retrouver à commencer par un
-    # message "assistant" orphelin (sans le "user" correspondant). Groq
-    # l'accepte, d'autres backends non.
+    # maxlen coupe par le début : le fil peut commencer par un "assistant"
+    # orphelin, que certains backends refusent.
     if hist and hist[0]["role"] == "assistant":
         hist.pop(0)
     return hist
@@ -300,8 +300,7 @@ def stt_transcribe(pcm_bytes: bytes) -> str | None:
         return None
 
 # Codes météo WMO (Open-Meteo) -> libellé court FR. Table partielle ; un code
-# absent retombe sur "" (pas de condition mentionnée). Sert au présent ET aux
-# prévisions — jusqu'ici weather_code était récupéré puis ignoré.
+# absent retombe sur "" (pas de condition mentionnée).
 _WMO = {0: "ciel dégagé", 1: "peu nuageux", 2: "partiellement nuageux", 3: "couvert",
         45: "brouillard", 48: "brouillard givrant",
         51: "bruine légère", 53: "bruine", 55: "bruine dense",
@@ -316,23 +315,9 @@ def _wmo_label(code) -> str:
     except (TypeError, ValueError):
         return ""
 
-# --- 2. Météo — Open-Meteo (contexte injecté dans le prompt si pertinent) ---
-def maybe_fetch_weather(text: str) -> str | None:
-    low = text.lower()
-    if not any(k in low for k in _settings["weather_keywords"]):
-        return None
-    # Horizon détecté par mots-clés, défaut = météo actuelle. "après-demain"
-    # contient "demain", donc testé d'abord. Ces mots sont intrinsèques (comme
-    # "pleuv"), non configurables via la page.
-    if any(k in low for k in ("semaine", "prochains jours", "jours à venir", "jours qui viennent")):
-        horizon = "week"
-    elif "après-demain" in low or "apres-demain" in low:
-        horizon = 2
-    elif "demain" in low:
-        horizon = 1
-    else:
-        horizon = "now"
-
+# --- 2. Météo — Open-Meteo (outil get_weather) ---
+# horizon : "now" | 1 (demain) | 2 (après-demain) | "week".
+def fetch_weather(horizon="now") -> str | None:
     params = {"latitude": _settings["weather_lat"], "longitude": _settings["weather_lon"],
               "timezone": "auto"}
     if horizon == "now":
@@ -378,22 +363,19 @@ def maybe_fetch_weather(text: str) -> str | None:
         return f"Prévisions météo à {city} pour les prochains jours : {lignes}."
     return f"Prévisions météo à {city} — {_ligne(horizon)}."
 
-# --- 2b. Actualités — flux RSS (contexte injecté dans le prompt si pertinent) ---
-def maybe_fetch_news(text: str) -> str | None:
-    if not any(k in text.lower() for k in _settings["news_keywords"]):
-        return None
-    # Titres collectés PAR flux, puis ENTRELACÉS (round-robin) : sans ça, un flux
-    # volumineux en tête (franceinfo, 35 titres) remplit à lui seul news_count et
-    # un flux local ajouté après (Charente Libre) n'apparaît JAMAIS. L'entrelacement
-    # garantit que chaque flux contribue.
+# --- 2b. Actualités — flux RSS (outil get_news) ---
+def fetch_news(count: int | None = None) -> str | None:
+    count = count or _settings["news_count"]
+    # Titres collectés PAR flux puis ENTRELACÉS : sans ça, un flux volumineux
+    # remplit à lui seul news_count et un flux local n'apparaît JAMAIS.
     per_feed: list[tuple[str, list[str]]] = []          # (source, titres)
     for url in _settings["news_feeds"]:
         try:
             r = requests.get(url, timeout=10, headers={"User-Agent": "dashboard-bridge"})
             r.raise_for_status()
             root = ElementTree.fromstring(r.content)
-            # Le <title> du <channel> nomme la source (« Charente Libre… ») : sans
-            # lui, un titre local n'est PAS rattachable à sa région par le LLM.
+            # Le <title> du <channel> nomme la source : sans lui,
+            #  un titre local n'est PAS rattachable à sa région par le LLM.
             src = (root.findtext("channel/title") or url).strip()
             per_feed.append((src, [t for it in root.iter("item")     # RSS 2.0
                                    if (t := (it.findtext("title") or "").strip())]))
@@ -407,9 +389,9 @@ def maybe_fetch_news(text: str) -> str | None:
             if rank < len(feed) and feed[rank] not in seen:
                 seen.add(feed[rank])
                 picked.append((src, feed[rank]))
-        if len(picked) >= _settings["news_count"]:
+        if len(picked) >= count:
             break
-    picked = picked[:_settings["news_count"]]
+    picked = picked[:count]
     if not picked:
         return None
     # Regroupé par source : le LLM répond « en Charente » via la section dédiée.
@@ -422,34 +404,112 @@ def maybe_fetch_news(text: str) -> str | None:
             "principaux, sans tous les énumérer ; si la question cible un lieu ou "
             "une région, privilégie la source correspondante) :\n" + blocs)
 
-# --- 3. LLM — endpoint compatible OpenAI (modulable via LLM_BASE_URL/MODEL) ---
-def llm_answer(question: str, context: str | None, max_tokens: int | None = None) -> str | None:
-    # Contexte, modèle, température et longueur viennent de _settings :
-    # modifiables à chaud depuis la page http://<NAS>:8090/. max_tokens peut
-    # être forcé par l'appelant (réponse actu plus longue), sinon défaut settings.
-    system = f"{_settings['system_prompt']}\n\nNous sommes le {_current_datetime_fr()}."
-    if context:
-        system += f"\n\n{context}"
-    messages = [{"role": "system", "content": system}]
-    messages.extend(_conversation_history())
-    messages.append({"role": "user", "content": question})
+# --- 2c. Registre d'outils — schémas function-calling exposés au LLM ---
+# Un outil = un schéma OpenAI littéral + le callable qui l'exécute. Tous en
+# LECTURE SEULE : le pilotage MQTT a son propre chemin (maybe_handle_command).
 
-    # 2 tentatives : si le modèle refuse les paramètres reasoning (400 sur les
-    # modèles non-raisonnement de Groq), on mémorise le refus et on rejoue
-    # immédiatement sans — l'aller-retour d'erreur n'est payé qu'une fois par
-    # modèle, les requêtes suivantes partent directement sans extra_body.
+# Horizons nommés : un enum se raisonne mieux qu'un entier de jours.
+_HORIZONS = {"now": "now", "tomorrow": 1, "day_after": 2, "week": "week"}
+
+def _tool_get_weather(horizon: str = "now") -> str:
+    return fetch_weather(_HORIZONS.get(horizon, "now")) or "Météo indisponible."
+
+def _tool_get_news(count=None) -> str:
+    n = _clamp_int(count, 1, 15) if count is not None else None
+    return fetch_news(n) or "Aucune actualité disponible."
+
+# 5 × 300 caractères ≈ 400 tokens : au-delà, les snippets noient la question.
+WEB_SEARCH_RESULTS  = 5
+WEB_SEARCH_SNIPPET  = 300
+
+def _tool_web_search(query: str) -> str:
+    if DDGS is None:
+        print("[Bridge] web_search : ddgs absent de l'image")
+        return "Échec de la recherche. Réessaie ou réponds sans."
+    q = str(query).strip()
+    if not q:
+        return "Requête vide : rappelle l'outil avec des mots-clés."
+    res = DDGS().text(q, region="fr-fr", max_results=WEB_SEARCH_RESULTS)
+    if not res:
+        # Formulé pour que le modèle ne conclue pas à une infirmation.
+        return (f"Aucun résultat exploitable pour « {q} ». L'absence de résultat ne prouve "
+                f"RIEN : réessaie avec d'autres mots-clés, sinon dis que tu n'as pas pu vérifier.")
+    # URL jetées : illisibles en TTS.
+    lignes = []
+    for r in res:
+        titre = (r.get("title") or "").strip()
+        corps = " ".join((r.get("body") or "").split())[:WEB_SEARCH_SNIPPET]
+        if titre and corps:
+            lignes.append(f"- {titre} : {corps}")
+        elif titre or corps:
+            lignes.append(f"- {titre or corps}")
+    return (f"Résultats de recherche web pour « {q} » "
+            f"(extraits bruts, à recouper avant d'affirmer) :\n" + "\n".join(lignes))
+
+_TOOLS = {
+    "get_weather": ({"type": "function", "function": {
+        "name": "get_weather",
+        "description": "Météo actuelle ou prévisions, pour la ville configurée.",
+        "parameters": {"type": "object", "properties": {
+            "horizon": {"type": "string",
+                        "enum": ["now", "tomorrow", "day_after", "week"],
+                        "description": "now = maintenant, week = 7 jours"}},
+            "required": []}}}, _tool_get_weather),
+
+    "get_news": ({"type": "function", "function": {
+        "name": "get_news",
+        "description": "Titres d'actualité du jour, depuis les flux RSS configurés.",
+        "parameters": {"type": "object", "properties": {
+            "count": {"type": "integer", "minimum": 1, "maximum": 15,
+                      "description": "Nombre de titres ; défaut = réglage de la page"}},
+            "required": []}}}, _tool_get_news),
+
+    "web_search": ({"type": "function", "function": {
+        "name": "web_search",
+        "description": (
+            "Recherche sur le web. À utiliser quand la question porte sur un événement "
+            "récent, une actualité, un prix, un résultat sportif, une personne peu connue, "
+            "l'actualité ou le statut d'une personnalité (dont un décès), "
+            "ou toute information postérieure à ton entraînement — et quand l'utilisateur "
+            "affirme un fait que tu ignores. NE PAS utiliser pour des connaissances "
+            "générales stables (histoire, science, définitions, calcul)."),
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Requête, en mots-clés"}},
+            "required": ["query"]}}}, _tool_web_search),
+}
+
+def _tool_schemas() -> list:
+    # web_search est débrayable à chaud (page config) : ses snippets peuvent
+    # noyer une question à laquelle le modèle répond bien seul.
+    off = () if _settings.get("web_search_enabled", True) else ("web_search",)
+    return [s for n, (s, _) in _TOOLS.items() if n not in off]
+
+def _tool_run(name: str, args: dict) -> str:
+    """Tout échec ressort en CHAÎNE, jamais en exception. Les messages évitent
+    « indisponible » : le modèle en déduirait qu'il n'a aucun outil et le dirait."""
+    entry = _TOOLS.get(name)
+    if not entry:
+        return f"Outil inconnu : {name}. Utilise un des outils proposés."
+    try:
+        return entry[1](**args)
+    except Exception as e:
+        print(f"[Bridge] Outil {name} en échec : {e}")
+        return f"Échec de {name} pour cet appel. Réessaie ou réponds sans."
+
+# --- 3. LLM — endpoint compatible OpenAI (modulable via LLM_BASE_URL/MODEL) ---
+# Un appel au modèle, avec le retry "reasoning" (2 tentatives max). Renvoie le
+# MESSAGE brut — qui peut porter des tool_calls au lieu d'un contenu —, ou None.
+def _llm_create(messages: list, max_tokens: int, tools: list | None = None):
+    # 2 tentatives : un refus des paramètres reasoning (400) est mémorisé par
+    # modèle et la requête rejouée sans extra_body.
     for attempt in (1, 2):
         try:
-            resp = llm_client.chat.completions.create(
-                model=_settings["llm_model"],
-                messages=messages,
-                temperature=_settings["temperature"],
-                max_tokens=max_tokens or _settings["max_tokens"],
-                extra_body=_llm_extra_body()
-            )
-            answer = resp.choices[0].message.content.strip()
-            _conversation_remember(question, answer)
-            return answer
+            kwargs = dict(model=_settings["llm_model"], messages=messages,
+                          temperature=_settings["temperature"],
+                          max_tokens=max_tokens, extra_body=_llm_extra_body())
+            if tools:
+                kwargs["tools"], kwargs["tool_choice"] = tools, "auto"
+            return llm_client.chat.completions.create(**kwargs).choices[0].message
         except Exception as e:
             if attempt == 1 and "reasoning" in str(e).lower():
                 _no_reasoning_models.add(_settings["llm_model"])
@@ -459,6 +519,77 @@ def llm_answer(question: str, context: str | None, max_tokens: int | None = None
             # NB : un 429 (quota Groq atteint) n'est pas distingué du reste — le
             # firmware ne reçoit qu'un 500 générique et affiche "erreur".
             return None
+
+# Consigne outils, ajoutée au prompt système de la page config.
+_TOOLS_SYSTEM = ("Tu disposes d'outils pour obtenir des informations que tu ne connais pas. "
+                 "Appelle-les quand la réponse dépend de données récentes ou locales ; "
+                 "sinon réponds directement, sans outil. Si l'utilisateur affirme un fait "
+                 "récent que tu ignores, ne le contredis pas : vérifie avant de répondre. "
+                 "N'affirme JAMAIS qu'un événement récent n'a pas eu lieu sans avoir vérifié.")
+
+# Garde-fou : un modèle qui rappelle indéfiniment ses outils bloquerait la requête.
+TOOL_ROUNDS_MAX = 3
+
+def llm_answer(question: str, context: str | None, max_tokens: int | None = None) -> str | None:
+    # Contexte, modèle, température et longueur viennent de _settings :
+    # modifiables à chaud depuis la page http://<NAS>:8090/.
+    system = f"{_settings['system_prompt']}\n\nNous sommes le {_current_datetime_fr()}."
+    if context:
+        system += f"\n\n{context}"
+    tools = _tool_schemas()
+    if tools:
+        system += f"\n\n{_TOOLS_SYSTEM}"
+
+    messages = [{"role": "system", "content": system}]
+    messages.extend(_conversation_history())
+    messages.append({"role": "user", "content": question})
+
+    # Budget serré tant qu'aucun outil n'a répondu : un appel d'outil y tient.
+    budget = max_tokens or _settings["max_tokens"]
+    vus: set = set()
+    for tour in range(TOOL_ROUNDS_MAX):
+        # Dernier tour SANS outils : le modèle doit rédiger avec ce qu'il a.
+        dernier = tour == TOOL_ROUNDS_MAX - 1
+        msg = _llm_create(messages, budget, None if dernier else tools)
+        if msg is None:
+            return None
+        calls = getattr(msg, "tool_calls", None)
+        if not calls:
+            break
+        # Le message porteur des tool_calls revient dans le fil, sinon le modèle
+        # ne rattache pas les résultats à ses appels. Reconstruit à la main : les
+        # champs propres au fournisseur ne repartent pas.
+        messages.append({"role": "assistant", "content": msg.content or "",
+                         "tool_calls": [{"id": c.id, "type": "function",
+                                         "function": {"name": c.function.name,
+                                                      "arguments": c.function.arguments}}
+                                        for c in calls]})
+        for c in calls:
+            try:
+                args = json.loads(c.function.arguments or "{}")
+            except Exception:
+                args = {}
+            # Appel déjà joué à l'identique : le rejouer donnerait le même résultat.
+            cle = (c.function.name, c.function.arguments)
+            if cle in vus:
+                out = ("Tu as déjà appelé cet outil avec ces arguments, le résultat est "
+                       "identique. Réponds avec ce que tu as, ou dis ce qui manque.")
+            else:
+                vus.add(cle)
+                out = _tool_run(c.function.name, args)
+            print(f"[Bridge] Outil {c.function.name}({args}) → {out[:80]}")
+            messages.append({"role": "tool", "tool_call_id": c.id, "content": out})
+        # La rédaction qui suit peut avoir à résumer plusieurs titres.
+        budget = max(budget, _settings.get("tools_max_tokens", 200))
+    else:
+        print(f"[Bridge] {TOOL_ROUNDS_MAX} tours d'outils sans réponse — abandon")
+        return None
+
+    answer = (msg.content or "").strip()
+    if not answer:
+        return None
+    _conversation_remember(question, answer)
+    return answer
 
 # --- 4. TTS — edge-tts (voix française, gratuit) ---
 async def _edge_tts_generate(text: str, voice: str) -> bytes:
@@ -565,9 +696,8 @@ def record():
 
 
 # --- Page de paramétrage IA — servie sur le port du bridge ---
-# Tout est same-origin (page, listes, aperçu, validation) : aucun souci de CORS,
-# aucune modification du firmware ESP32, aucun redémarrage du conteneur. Le
-# bouton « Config NAS » du panneau web de l'ESP32 pointe ici (AI_BRIDGE_UI_URL).
+# Tout est same-origin (page, listes, aperçu, validation). Le bouton
+# « Config NAS » du panneau web de l'ESP32 pointe ici (AI_BRIDGE_UI_URL).
 
 CONFIG_PAGE = """<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -608,10 +738,75 @@ button{flex:1;padding:11px;border:none;border-radius:6px;font-size:14px;cursor:p
 .histbox .empty{color:#888;font-style:italic}
 /* ---- PANNEAU VOIX ---- */
 audio{width:100%;margin-top:12px}
+/* ---- PANNEAU COMMANDES ---- */
+.tool{background:#232323;border:1px solid #333;border-radius:10px;margin-top:12px}
+.tool.op{border-color:#03dac6}
+.tool .hd{display:flex;align-items:center;gap:8px;padding:12px 14px;cursor:pointer}
+.tool .hd .tw{color:#e0e0e0;font-size:14px;font-weight:500}
+.tool .hd .st{margin-left:auto;color:#666;font-size:12px}
+.tool .bd{padding:0 14px 14px}
+.trow{display:grid;grid-template-columns:1.1fr .9fr 1.5fr auto;gap:6px;align-items:center;margin-top:6px}
+.chip{cursor:pointer;background:#0c3a35;color:#03dac6;border:1px solid #03dac6;border-radius:12px;padding:2px 9px;font-size:12px;display:inline-block;margin:3px 3px 0 0}
+.mini{flex:none;background:transparent;border:1px dashed #555;color:#aaa;border-radius:6px;padding:6px 10px;font-size:12px;cursor:pointer;margin-top:8px}
+.xbtn{flex:none;background:#2a2a2a;border:1px solid #444;color:#ff6e6e;border-radius:6px;padding:8px 11px;cursor:pointer}
+.tdel{flex:none;background:transparent;border:none;color:#ff6e6e;cursor:pointer;font-size:13px;padding:0;margin-left:auto}
+/* ---- EN-TÊTE + ONGLETS ---- */
+.header{width:100%;max-width:1240px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;border-bottom:1px solid #333;padding-bottom:14px}
+.tabs{display:flex;gap:6px;flex-wrap:wrap}
+.tab{background:transparent;border:1px solid #444;color:#adbac7;border-radius:7px;padding:7px 18px;font-size:14px;cursor:pointer;white-space:nowrap}
+.tab.active{background:#03dac6;border-color:#03dac6;color:#121212;font-weight:600}
+.view{width:100%;display:flex;flex-direction:column;align-items:center}
+.hidden{display:none}
 </style></head><body>
 
+<div class="header">
 <h1>Paramètres de Jarvis</h1>
+<nav class="tabs">
+  <button class="tab active" data-view="conv">Conversations</button>
+  <button class="tab" data-view="llm">Paramètres LLM</button>
+  <button class="tab" data-view="tools">Outils</button>
+</nav>
+</div>
 
+<div id="v-conv" class="view">
+<div class="layout">
+<div class="col">
+
+<div class="box">
+<h2>Conversation</h2>
+<p class="sub">L'historique donné au LLM comme contexte (purge auto après inactivité).</p>
+<div class="cur" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:13px">
+  <span><b id="histN">…</b> échange(s) en mémoire<span id="resetIn" style="color:#888"></span></span>
+  <span style="margin-left:auto;display:flex;align-items:center;gap:8px;color:#aaa">
+    Réglages : Profondeur
+    <input id="limEx" type="number" min="1" max="100" style="width:58px"
+           title="Nombre d'échanges question-réponse gardés dans le contexte du LLM.">
+    échanges · purge après
+    <input id="limTtl" type="number" min="30" max="86400" style="width:78px"
+           title="Durée d'inactivité (en secondes) avant vidage automatique de l'historique.">
+    s
+    <button class="sec" onclick="applyLimits()" style="flex:none;padding:6px 12px">Appliquer</button>
+  </span>
+</div>
+<p class="hint">Réglage à chaud, <b>non sauvegardé</b> : au redémarrage du bridge, retour aux défauts de <code>monitor.env</code>. Plus la profondeur est grande, plus de contexte est renvoyé au LLM à chaque requête (tokens, latence).</p>
+<div class="row">
+  <button class="warn" onclick="clearConv()">Nouvelle conversation</button>
+</div>
+<label for="chatInput">Requête directe au LLM (hors dashboard — s'ajoute à l'historique)</label>
+<div class="row">
+  <input id="chatInput" placeholder="Pose ta question…" style="flex:1"
+         onkeydown="if(event.key==='Enter')sendChat()">
+  <button class="pri" onclick="sendChat()" style="flex:none">Envoyer</button>
+</div>
+<div id="histBox" class="histbox"></div>
+<div class="msg" id="msgC"></div>
+</div>
+
+</div>
+</div>
+</div>
+
+<div id="v-llm" class="view hidden">
 <div class="layout">
 <div class="col">
 
@@ -635,16 +830,22 @@ audio{width:100%;margin-top:12px}
 <div class="msg" id="msgL"></div>
 </div>
 
+</div>
+<div class="col">
+
 <div class="box">
 <h2>Personnalité</h2>
 <p class="sub">Le contexte système envoyé au LLM. La date et l'heure y sont ajoutées automatiquement — inutile de les mentionner.</p>
-<textarea id="sp" maxlength="4000"></textarea>
+<textarea id="sp" maxlength="4000" oninput="autoGrow(this)"></textarea>
 <div class="row">
   <button class="warn" onclick="resetPrompt()">Rétablir le défaut</button>
   <button class="pri" onclick="savePrompt()">Enregistrer</button>
 </div>
 <div class="msg" id="msgP"></div>
 </div>
+
+</div>
+<div class="col">
 
 <div class="box">
 <h2>Voix</h2>
@@ -663,25 +864,26 @@ audio{width:100%;margin-top:12px}
 </div>
 
 </div>
+</div>
+</div>
+
+<div id="v-tools" class="view hidden">
+<div class="layout">
 <div class="col">
 
 <div class="box">
-<h2>Conversation</h2>
-<p class="sub">L'historique donné au LLM comme contexte (purge auto après inactivité).</p>
-<div class="cur"><b id="histN">…</b> échange(s) en mémoire</div>
-<div class="row">
-  <button class="warn" onclick="clearConv()">Nouvelle conversation</button>
+<h2>Outils</h2>
+<p class="sub">Le LLM décide lui-même d'appeler météo, actualités ou recherche web. Le pilotage MQTT n'est pas concerné, il garde son mot-clé déclencheur.</p>
+<label for="tmt">Longueur MAX après appel d'outil (tokens)</label>
+<input id="tmt" type="number" min="20" max="1000" step="10">
+<div style="display:flex;align-items:center;gap:8px;margin-top:8px"><input type="checkbox" id="ws" style="width:auto"><span style="font-size:13px">Recherche web (DuckDuckGo) disponible</span></div>
+<div class="row"><button class="pri" onclick="saveToolsMode()">Enregistrer</button></div>
+<div class="msg" id="msgTM"></div>
 </div>
-<div id="histBox" class="histbox"></div>
-<div class="msg" id="msgC"></div>
-</div>
-
-</div>
-<div class="col">
 
 <div class="box">
 <h2>Météo</h2>
-<p class="sub">Open-Meteo est interrogé quand la question contient un mot-clé ; la ville n'est qu'un libellé, la requête utilise lat/lon.</p>
+<p class="sub">Open-Meteo, appelé par l'outil get_weather ; la ville n'est qu'un libellé, la requête utilise lat/lon.</p>
 <label for="wc">Ville</label>
 <input id="wc" maxlength="60">
 <div class="grid">
@@ -690,29 +892,42 @@ audio{width:100%;margin-top:12px}
   <div><label for="wlo">Longitude</label>
        <input id="wlo" type="number" min="-180" max="180" step="0.01"></div>
 </div>
-<label for="wk">Mots-clés déclencheurs (séparés par des virgules)</label>
-<textarea id="wk" style="min-height:70px" maxlength="800"></textarea>
 <div class="row"><button class="pri" onclick="saveWeather()">Enregistrer</button></div>
 <div class="msg" id="msgW"></div>
 </div>
 
+</div>
+<div class="col">
+
 <div class="box">
 <h2>Actualités</h2>
-<p class="sub">Flux RSS interrogés quand la question contient un mot-clé ; les titres sont fusionnés, dédoublonnés puis résumés à l'oral par le LLM.</p>
+<p class="sub">Flux RSS appelés par l'outil get_news ; les titres sont fusionnés, dédoublonnés puis résumés à l'oral par le LLM.</p>
 <label for="nf">Flux RSS (une URL par ligne)</label>
 <textarea id="nf" style="min-height:60px" maxlength="1200"></textarea>
-<div class="grid">
-  <div><label for="nc">Titres max</label>
-       <input id="nc" type="number" min="1" max="15" step="1"></div>
-  <div><label for="nmt">Longueur MAX (tokens)</label>
-       <input id="nmt" type="number" min="20" max="1000" step="10"></div>
-</div>
-<label for="nk">Mots-clés déclencheurs (séparés par des virgules)</label>
-<textarea id="nk" style="min-height:70px" maxlength="800"></textarea>
+<label for="nc">Titres max</label>
+<input id="nc" type="number" min="1" max="15" step="1">
 <div class="row"><button class="pri" onclick="saveNews()">Enregistrer</button></div>
 <div class="msg" id="msgN"></div>
 </div>
 
+</div>
+<div class="col">
+
+<div class="box">
+<h2>Commandes vocales</h2>
+<p class="sub">Jarvis pilote le dashboard quand la phrase contient un mot-clé déclencheur. Chaque outil traduit une demande en action MQTT (construite à la volée, éditable ici).</p>
+<label for="ck">Mot(s)-clé déclencheur(s) (séparés par des virgules)</label>
+<input id="ck" maxlength="200">
+<p class="hint">Sans ce mot, la phrase repart en question normale — aucune action.</p>
+<div id="toolBox"></div>
+<div class="row">
+  <button class="sec" onclick="addTool()">+ Nouvel outil</button>
+  <button class="pri" onclick="saveCmds()">Enregistrer</button>
+</div>
+<div class="msg" id="msgK"></div>
+</div>
+
+</div>
 </div>
 </div>
 
@@ -721,6 +936,9 @@ audio{width:100%;margin-top:12px}
 let DEFAULTS = {};
 function say(id,m,ok){const e=document.getElementById(id);e.textContent=m;e.className='msg '+(ok?'ok':'ko');
   if(ok&&m)setTimeout(()=>{e.textContent='';},4000);}
+// Ajuste la hauteur d'un textarea à son contenu (scrollHeight nul si masqué :
+// à rappeler quand l'onglet devient visible).
+function autoGrow(el){ if(!el) return; el.style.height='auto'; el.style.height=(el.scrollHeight+4)+'px'; }
 
 async function postConfig(body, msgId, okText){
   try{
@@ -763,11 +981,47 @@ async function clearConv(){
     say('msgC',`Historique vidé (${d.cleared} échange(s)).`,true);
   }catch(e){ say('msgC','Échec : '+e.message,false); }
 }
+async function sendChat(){
+  const inp=document.getElementById('chatInput');
+  const text=inp.value.trim();
+  if(!text) return;
+  inp.value='';
+  say('msgC','Envoi au LLM…',true);
+  try{
+    const r=await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});
+    const d=await r.json();
+    if(!r.ok) throw new Error(d.error||('HTTP '+r.status));
+    say('msgC','',true);
+    loadConv();   // l'échange vient d'entrer dans l'historique
+  }catch(e){ say('msgC','Échec : '+e.message,false); inp.value=text; }
+}
+// À chaud, NON sauvé : au redémarrage du bridge on repart des défauts ENV.
+async function applyLimits(){
+  const ex=parseInt(document.getElementById('limEx').value,10);
+  const ttl=parseInt(document.getElementById('limTtl').value,10);
+  try{
+    const r=await fetch('/conversation/limits',{method:'POST',headers:{'Content-Type':'application/json'},
+                                                body:JSON.stringify({max_exchanges:ex,ttl_s:ttl})});
+    const d=await r.json();
+    if(!r.ok) throw new Error((d.errors||['HTTP '+r.status]).join(' ; '));
+    say('msgC','Appliqué à chaud (non sauvé — défaut ENV au redémarrage).',true);
+  }catch(e){ say('msgC','Échec : '+e.message,false); }
+}
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+// Compte à rebours avant purge : la valeur serveur est resynchronisée à chaque
+// loadConv (4 s), le ticker 1 s ne fait que l'égrener entre deux.
+let _resetIn=null;
+function renderReset(){
+  const el=document.getElementById('resetIn');
+  if(el) el.textContent=(_resetIn!=null && _resetIn>=0) ? ' — Reset dans '+_resetIn+' s' : '';
+}
+setInterval(()=>{ if(_resetIn!=null && _resetIn>0){ _resetIn--; renderReset(); } },1000);
+
 async function loadConv(){
   try{
     const d=await (await fetch('/conversation')).json();
-    document.getElementById('histN').textContent=Math.floor(d.history.length/2);
+    document.getElementById('histN').textContent=Math.floor(d.history.length/2)+'/'+d.max_exchanges;
+    _resetIn=d.reset_in_s; renderReset();
     const box=document.getElementById('histBox');
     const html = d.history.length
       ? d.history.map(m=>`<div class="${m.role==='user'?'u':'a'}">${esc(m.content)}</div>`).join('')
@@ -798,20 +1052,88 @@ async function adopt(){
   }catch(e){ say('msgV','Échec : '+e.message,false); }
 }
 
+// ---- PANNEAU OUTILS ----
+function saveToolsMode(){
+  postConfig({tools_max_tokens:document.getElementById('tmt').value,
+              web_search_enabled:document.getElementById('ws').checked},'msgTM','Outils enregistrés.');
+}
+
 // ---- PANNEAU MÉTÉO ----
 function saveWeather(){
   postConfig({weather_city:document.getElementById('wc').value,
               weather_lat:document.getElementById('wla').value,
-              weather_lon:document.getElementById('wlo').value,
-              weather_keywords:document.getElementById('wk').value},'msgW','Météo enregistrée.');
+              weather_lon:document.getElementById('wlo').value},'msgW','Météo enregistrée.');
 }
 
 // ---- PANNEAU ACTUALITÉS ----
 function saveNews(){
   postConfig({news_feeds:document.getElementById('nf').value,
-              news_count:document.getElementById('nc').value,
-              news_max_tokens:document.getElementById('nmt').value,
-              news_keywords:document.getElementById('nk').value},'msgN','Actualités enregistrées.');
+              news_count:document.getElementById('nc').value},'msgN','Actualités enregistrées.');
+}
+
+// ---- PANNEAU COMMANDES VOCALES ----
+let CTOOLS=[];
+let lastTmpl=null;
+function ecs(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function renderTools(){
+  const box=document.getElementById('toolBox');
+  box.innerHTML=CTOOLS.map((t,ti)=>{
+    if(!t._open){
+      return `<div class="tool"><div class="hd" data-t="${ti}"><span>▸</span><span class="tw">${ecs(t.name||'sans nom')}</span><span class="st">${t.confirm?'confirmation':'immédiat'}</span></div></div>`;
+    }
+    const chips=(t.params||[]).filter(p=>p.name).map(p=>`<span class="chip" data-t="${ti}" data-p="${ecs(p.name)}">{${ecs(p.name)}}</span>`).join('');
+    const prows=(t.params||[]).map((p,pi)=>`<div class="trow">
+        <input class="f" data-t="${ti}" data-p="${pi}" data-k="name" value="${ecs(p.name||'')}" placeholder="nom">
+        <select class="f" data-t="${ti}" data-p="${pi}" data-k="type"><option${p.type!=='choix'?' selected':''}>nombre</option><option${p.type==='choix'?' selected':''}>choix</option></select>
+        <input class="f" data-t="${ti}" data-p="${pi}" data-k="spec" value="${ecs(p.spec||'')}" placeholder="${p.type==='choix'?'valeurs, séparées par des virgules':'min - max'}">
+        <button class="xbtn delP" data-t="${ti}" data-p="${pi}" title="retirer">✕</button>
+        <input class="f" data-t="${ti}" data-p="${pi}" data-k="desc" value="${ecs(p.desc||'')}" placeholder="aide pour le LLM (optionnel)" style="grid-column:1 / 4">
+      </div>`).join('');
+    return `<div class="tool op"><div class="hd" data-t="${ti}"><span>▾</span><span class="tw">${ecs(t.name||'sans nom')}</span><button class="tdel" data-t="${ti}">supprimer</button></div>
+      <div class="bd">
+      <label>Nom (identifiant)</label><input class="f" data-t="${ti}" data-k="name" value="${ecs(t.name||'')}">
+      <label>Quand l'utiliser — décrit au LLM</label><input class="f" data-t="${ti}" data-k="description" value="${ecs(t.description||'')}">
+      <label>Paramètres</label>${prows}
+      <button class="mini addP" data-t="${ti}">+ paramètre</button>
+      <label>Action — topic MQTT + charge utile</label>
+      <div style="display:grid;grid-template-columns:150px 1fr;gap:6px">
+        <input class="f" data-t="${ti}" data-k="topic" value="${ecs(t.topic||'esp32/cmd')}">
+        <input class="f tmpl" data-t="${ti}" data-k="action" value="${ecs(t.action||'')}" placeholder="ex: volume:{percent}">
+      </div>
+      <p class="hint">Insérer un paramètre : ${chips||'(ajoute un paramètre)'}</p>
+      <div style="display:flex;align-items:center;gap:8px;margin-top:8px"><input type="checkbox" class="cfx" data-t="${ti}" ${t.confirm?'checked':''} style="width:auto"><span style="font-size:13px">Demander confirmation avant d'exécuter</span></div>
+      ${t.confirm?`<label>Question de confirmation</label><input class="f tmpl" data-t="${ti}" data-k="prompt" value="${ecs(t.prompt||'')}">`:''}
+      <label>Phrase parlée</label><input class="f tmpl" data-t="${ti}" data-k="speak" value="${ecs(t.speak||'')}">
+      </div></div>`;
+  }).join('');
+  bindTools();
+}
+function syncT(){
+  document.querySelectorAll('#toolBox .f').forEach(el=>{
+    const ti=+el.dataset.t,k=el.dataset.k;
+    if(el.dataset.p!==undefined){CTOOLS[ti].params[+el.dataset.p][k]=el.value;}
+    else{CTOOLS[ti][k]=el.value;}
+  });
+  document.querySelectorAll('#toolBox .cfx').forEach(el=>{CTOOLS[+el.dataset.t].confirm=el.checked;});
+}
+function bindTools(){
+  const B=document.getElementById('toolBox');
+  B.querySelectorAll('.hd').forEach(el=>el.onclick=e=>{if(e.target.closest('.tdel'))return;syncT();const t=CTOOLS[+el.dataset.t];t._open=!t._open;renderTools();});
+  B.querySelectorAll('.tdel').forEach(el=>el.onclick=e=>{e.stopPropagation();syncT();CTOOLS.splice(+el.dataset.t,1);renderTools();});
+  B.querySelectorAll('.cfx').forEach(el=>el.onchange=()=>{syncT();renderTools();});
+  B.querySelectorAll('select.f').forEach(el=>el.onchange=()=>{syncT();renderTools();});
+  B.querySelectorAll('.tmpl').forEach(el=>el.onfocus=()=>{lastTmpl=el;});
+  B.querySelectorAll('.chip').forEach(el=>el.onclick=()=>{const f=(lastTmpl&&lastTmpl.dataset.t===el.dataset.t)?lastTmpl:B.querySelector('.tmpl[data-t="'+el.dataset.t+'"]');if(f){f.value+='{'+el.dataset.p+'}';f.focus();syncT();}});
+  B.querySelectorAll('.addP').forEach(el=>el.onclick=()=>{syncT();CTOOLS[+el.dataset.t].params.push({name:'',type:'nombre',spec:'0 - 100',desc:''});renderTools();});
+  B.querySelectorAll('.delP').forEach(el=>el.onclick=()=>{syncT();CTOOLS[+el.dataset.t].params.splice(+el.dataset.p,1);renderTools();});
+}
+function addTool(){syncT();CTOOLS.forEach(t=>t._open=false);CTOOLS.push({name:'nouvel_outil',description:'',confirm:true,topic:'esp32/cmd',action:'',speak:'',prompt:'',params:[],_open:true});renderTools();}
+function saveCmds(){
+  syncT();
+  postConfig({command_keywords:document.getElementById('ck').value,
+              command_tools:CTOOLS.map(t=>({name:t.name,description:t.description,confirm:!!t.confirm,
+                topic:t.topic,action:t.action,speak:t.speak,prompt:t.prompt,params:t.params}))},
+             'msgK','Commandes enregistrées.');
 }
 
 // ---- INITIALISATION ----
@@ -823,15 +1145,19 @@ async function loadAll(){
   document.getElementById('mt').value = cfg.settings.max_tokens;
   document.getElementById('curV').textContent = cfg.settings.voice;
   document.getElementById('baseUrl').textContent = cfg.info.llm_base_url;
-  document.getElementById('histN').textContent = cfg.info.history_len;
+  document.getElementById('histN').textContent = cfg.info.history_len + '/' + cfg.info.conversation_max_exchanges;
+  document.getElementById('limEx').value  = cfg.info.conversation_max_exchanges;
+  document.getElementById('limTtl').value = cfg.info.conversation_ttl_s;
+  document.getElementById('tmt').value = cfg.settings.tools_max_tokens || 200;
+  document.getElementById('ws').checked = cfg.settings.web_search_enabled !== false;
   document.getElementById('wc').value  = cfg.settings.weather_city;
   document.getElementById('wla').value = cfg.settings.weather_lat;
   document.getElementById('wlo').value = cfg.settings.weather_lon;
-  document.getElementById('wk').value  = cfg.settings.weather_keywords.join(', ');
   document.getElementById('nf').value  = cfg.settings.news_feeds.join('\\n');
   document.getElementById('nc').value  = cfg.settings.news_count;
-  document.getElementById('nmt').value = cfg.settings.news_max_tokens;
-  document.getElementById('nk').value  = cfg.settings.news_keywords.join(', ');
+  document.getElementById('ck').value  = (cfg.settings.command_keywords||[]).join(', ');
+  CTOOLS = JSON.parse(JSON.stringify(cfg.settings.command_tools||[]));
+  renderTools();   // tous repliés par défaut
 
   const vs = await (await fetch('/voices')).json();
   const sel = document.getElementById('v');
@@ -856,6 +1182,15 @@ async function loadAll(){
   oc.value='__custom__'; oc.textContent='Autre modèle (saisie libre)…';
   ms.appendChild(oc);
 }
+// ---- ONGLETS (calqué sur activity_monitor) ----
+const _views = {conv:document.getElementById('v-conv'), llm:document.getElementById('v-llm'), tools:document.getElementById('v-tools')};
+document.querySelectorAll('.tab').forEach(t=>t.addEventListener('click',()=>{
+  document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  t.classList.add('active');
+  for(const k in _views) _views[k].classList.toggle('hidden', k!==t.dataset.view);
+  if(t.dataset.view==='llm') autoGrow(document.getElementById('sp'));   // scrollHeight fiable une fois visible
+}));
+
 loadAll();
 loadConv();
 setInterval(loadConv, 4000);
@@ -906,6 +1241,7 @@ def get_config():
     return {"settings": _settings, "defaults": DEFAULT_SETTINGS,
             "info": {"llm_base_url": LLM_BASE_URL,
                      "conversation_ttl_s": CONVERSATION_TTL_S,
+                     "conversation_max_exchanges": CONVERSATION_MAX_EXCHANGES,
                      "history_len": len(conversation) // 2}}
 
 
@@ -948,6 +1284,18 @@ def set_config():
         except (TypeError, ValueError):
             errors.append("max_tokens : 20 à 1000")
 
+    if "tools_max_tokens" in data:
+        try:
+            n = int(data["tools_max_tokens"])
+            if not (20 <= n <= 1000):
+                raise ValueError
+            _settings["tools_max_tokens"] = n
+        except (TypeError, ValueError):
+            errors.append("tools_max_tokens : 20 à 1000")
+
+    if "web_search_enabled" in data:
+        _settings["web_search_enabled"] = bool(data["web_search_enabled"])
+
     if "weather_city" in data:
         c = str(data["weather_city"]).strip()
         if 1 <= len(c) <= 60:
@@ -972,22 +1320,6 @@ def set_config():
             _settings["weather_lon"] = lon
         except (TypeError, ValueError):
             errors.append("longitude : -180 à 180")
-
-    if "weather_keywords" in data:
-        raw = data["weather_keywords"]
-        # La page envoie une chaîne "a, b, c" ; une liste JSON est acceptée aussi.
-        # Normalisés en minuscules : la détection compare à la question en .lower().
-        if isinstance(raw, str):
-            kws = [k.strip().lower() for k in raw.split(",")]
-        elif isinstance(raw, list):
-            kws = [str(k).strip().lower() for k in raw]
-        else:
-            kws = []
-        kws = [k for k in kws if k]
-        if 1 <= len(kws) <= 30 and all(len(k) <= 40 for k in kws):
-            _settings["weather_keywords"] = kws
-        else:
-            errors.append("mots-clés météo : 1 à 30 entrées de 40 caractères max")
 
     if "news_feeds" in data:
         raw = data["news_feeds"]
@@ -1014,17 +1346,8 @@ def set_config():
         except (TypeError, ValueError):
             errors.append("titres max : 1 à 15")
 
-    if "news_max_tokens" in data:
-        try:
-            n = int(data["news_max_tokens"])
-            if not (20 <= n <= 1000):
-                raise ValueError
-            _settings["news_max_tokens"] = n
-        except (TypeError, ValueError):
-            errors.append("longueur réponse actu : 20 à 1000")
-
-    if "news_keywords" in data:
-        raw = data["news_keywords"]
+    if "command_keywords" in data:
+        raw = data["command_keywords"]
         if isinstance(raw, str):
             kws = [k.strip().lower() for k in raw.split(",")]
         elif isinstance(raw, list):
@@ -1032,16 +1355,60 @@ def set_config():
         else:
             kws = []
         kws = [k for k in kws if k]
-        if 1 <= len(kws) <= 30 and all(len(k) <= 40 for k in kws):
-            _settings["news_keywords"] = kws
+        if 1 <= len(kws) <= 10 and all(len(k) <= 40 for k in kws):
+            _settings["command_keywords"] = kws
         else:
-            errors.append("mots-clés actu : 1 à 30 entrées de 40 caractères max")
+            errors.append("mots-clés déclencheurs : 1 à 10 entrées de 40 caractères max")
 
+    if "command_tools" in data:
+        # Outils construits côté page : on borne tout (nom = identifiant sûr pour le
+        # function-calling, longueurs, 20 outils / 6 params max) avant de garder.
+        raw = data["command_tools"]
+        if not isinstance(raw, list) or len(raw) > 20:
+            errors.append("outils : liste de 20 maximum")
+        else:
+            def _ident(s):
+                return "".join(c for c in str(s).strip() if c.isalnum() or c in "_-")[:40]
+            def _clip(s, n):
+                return str(s).strip()[:n]
+            tools = []
+            for t in raw:
+                if not isinstance(t, dict):
+                    continue
+                name = _ident(t.get("name", ""))
+                if not name:
+                    continue
+                params = []
+                for p in (t.get("params") or [])[:6]:
+                    if not isinstance(p, dict):
+                        continue
+                    pn = _ident(p.get("name", ""))
+                    if not pn:
+                        continue
+                    params.append({"name": pn,
+                                   "type": "choix" if p.get("type") == "choix" else "nombre",
+                                   "spec": _clip(p.get("spec", ""), 200),
+                                   "desc": _clip(p.get("desc", ""), 200)})
+                tools.append({"name": name,
+                              "description": _clip(t.get("description", ""), 200),
+                              "confirm": bool(t.get("confirm")),
+                              "topic": _clip(t.get("topic", "") or "esp32/cmd", 100) or "esp32/cmd",
+                              "action": _clip(t.get("action", ""), 200),
+                              "speak": _clip(t.get("speak", ""), 200),
+                              "prompt": _clip(t.get("prompt", ""), 200),
+                              "params": params})
+            _settings["command_tools"] = tools
+
+    # Sauvegarde AVANT le compte-rendu d'erreurs : les champs valides sont déjà
+    # appliqués en mémoire, ils doivent l'être sur disque aussi.
+    _settings_save()
     if errors:
         return {"errors": errors}, 400
 
-    _settings_save()
-    print(f"[Bridge] Paramètres mis à jour : {', '.join(sorted(data.keys()))}")
+    # Valeurs affichées, tronquées : « clé mise à jour » ne dit pas si la valeur
+    # reçue est celle qu'on croit.
+    print("[Bridge] Paramètres appliqués : "
+          + ", ".join(f"{k}={repr(_settings[k])[:40]}" for k in sorted(data) if k in _settings))
     return {"settings": _settings}
 
 
@@ -1070,19 +1437,269 @@ def conversation_clear():
 
 @app.route("/conversation", methods=["GET"])
 def conversation_get():
-    """Historique conversationnel courant — pour le bouton « Afficher » de la page
-    config. Même vue que celle donnée au LLM (purge TTL appliquée au passage)."""
-    return {"history": _conversation_history()}
+    """Historique conversationnel courant (purge TTL appliquée au passage) + de
+    quoi alimenter le compteur : profondeur max et compte à rebours avant purge."""
+    hist = _conversation_history()
+    reset_in = None
+    if hist and _last_exchange_ts:
+        reset_in = max(0, int(CONVERSATION_TTL_S - (time.monotonic() - _last_exchange_ts)))
+    return {"history": hist, "max_exchanges": CONVERSATION_MAX_EXCHANGES, "reset_in_s": reset_in}
 
+@app.route("/conversation/limits", methods=["POST"])
+def conversation_limits():
+    """Ajuste À CHAUD la profondeur (nb d'échanges) et le TTL de l'historique.
+    NON persisté : au redémarrage on repart des valeurs d'env (défauts). Bornes
+    pour éviter d'envoyer un contexte délirant au LLM à chaque requête."""
+    global conversation, CONVERSATION_TTL_S, CONVERSATION_MAX_EXCHANGES
+    data = request.get_json(silent=True) or {}
+    errors = []
+    try:
+        ex = int(data["max_exchanges"])
+        if not (1 <= ex <= 100):
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        errors.append("échanges : entier 1 à 100")
+    try:
+        ttl = int(data["ttl_s"])
+        if not (30 <= ttl <= 86400):
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        errors.append("durée : entier 30 à 86400 s")
+    if errors:
+        return {"errors": errors}, 400
+
+    CONVERSATION_MAX_EXCHANGES = ex
+    CONVERSATION_TTL_S = ttl
+    conversation = deque(conversation, maxlen=ex * 2)   # préserve le fil, tronque le plus vieux
+    print(f"[Bridge] Limites conversation (à chaud) : {ex} échanges, TTL {ttl}s")
+    return {"max_exchanges": ex, "ttl_s": ttl, "history_len": len(conversation) // 2}
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    """Requête LLM DIRECTE depuis la page config : ni STT, ni TTS, ni MQTT, ni
+    détection de commande — juste le LLM. L'échange entre dans l'historique
+    PARTAGÉ (llm_answer appelle _conversation_remember), la page le rafraîchit
+    ensuite via /conversation."""
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return "", 400
+    print(f"[Bridge] Chat direct : {text}")
+    answer = llm_answer(text, None)
+    if answer is None:
+        return {"error": "LLM indisponible"}, 500
+    return {"answer": answer}
+
+
+# ----------------------------------------------------------------
+# COMMANDES VOCALES — pilotage du dashboard (esp32/cmd)
+# ----------------------------------------------------------------
+# Portillon "pilote" (command_keywords) : une phrase n'est routée vers le
+# classificateur QUE si elle contient un mot-clé de pilotage — sinon le flux Q-R
+# reste intact, sans appel LLM supplémentaire.
+# Le classificateur traduit la phrase en action via le TOOL-CALLING du LLM. Les
+# réglages (volume/luminosité) passent par une confirmation vocale, la
+# navigation s'exécute direct.
+_CMD_YES = ("oui", "ouais", "ouaip", "vas-y", "vas y", "confirme", "c'est bon",
+            "ok", "d'accord", "yes", "carrément")
+_CMD_NO  = ("non", "annule", "laisse tomber", "laisse", "stop", "négatif")
+
+def _said(low: str, words) -> bool:
+    """Mot-clé cherché comme MOT ENTIER, jamais en sous-chaîne : « non » est
+    contenu dans « annonce », « ok » dans « stock », « laisse » dans « délaisse ».
+    Une confirmation en attente était donc annulée par une phrase anodine.
+    (?<!\\w)/(?!\\w) plutôt que \\b : les entrées commencent/finissent parfois
+    par autre chose qu'un caractère de mot."""
+    return any(re.search(r"(?<!\w)" + re.escape(w) + r"(?!\w)", low) for w in words)
+
+# Outils = DONNÉES (éditables via la page config). Le schéma function-calling et
+# l'action MQTT sont construits À LA VOLÉE : ajouter un outil = une entrée dans
+# command_tools, zéro code. Un param est de type "nombre" (spec "min - max") ou
+# "choix" (spec "a, b, c"). Les {param} du gabarit/phrases sont substitués.
+def _parse_range(spec):
+    """(min, max) extrait d'un « 0 - 100 » (les 2 premiers nombres trouvés)."""
+    tok, nums = "", []
+    for ch in str(spec) + " ":
+        if ch.isdigit():
+            tok += ch
+        elif tok:
+            nums.append(int(tok)); tok = ""
+    if len(nums) >= 2:
+        return min(nums[0], nums[1]), max(nums[0], nums[1])
+    return 0, 100
+
+def _choices(spec):
+    return [c.strip() for c in str(spec).split(",") if c.strip()]
+
+def _tool_schema(t: dict):
+    """Un outil (données) -> schéma function-calling OpenAI/Groq (None si sans nom)."""
+    name = (t.get("name") or "").strip()
+    if not name:
+        return None
+    props, required = {}, []
+    for p in t.get("params", []):
+        pn = (p.get("name") or "").strip()
+        if not pn:
+            continue
+        if p.get("type") == "choix":
+            props[pn] = {"type": "string", "enum": _choices(p.get("spec"))}
+        else:
+            lo, hi = _parse_range(p.get("spec"))
+            props[pn] = {"type": "integer", "minimum": lo, "maximum": hi}
+        if p.get("desc"):
+            props[pn]["description"] = p["desc"]
+        required.append(pn)
+    return {"type": "function", "function": {
+        "name": name, "description": t.get("description", ""),
+        "parameters": {"type": "object", "properties": props, "required": required}}}
+
+# Une seule action en attente de confirmation (un seul ESP32), avec TTL : un
+# "oui" tardif ne doit pas déclencher une commande oubliée.
+_pending_command: dict | None = None
+_pending_ts: float = 0.0
+COMMAND_PENDING_TTL_S = 30
+
+def _clamp_int(v, lo, hi):
+    try:
+        return max(lo, min(hi, int(v)))
+    except (TypeError, ValueError):
+        return None
+
+def _execute_command(action: dict):
+    mqtt_pub(action["topic"], action["payload"])   # one-shot, non retained
+    print(f"[Bridge] Commande vocale exécutée : {action['topic']} = {action['payload']}")
+
+def _classify_command(text: str) -> dict | None:
+    """Phrase pilotée -> action structurée, via le tool-calling sur les outils
+    définis dans les settings. Renvoie None si aucun outil ne correspond (la
+    phrase repart en flux normal) ou en cas d'échec du modèle."""
+    tools = _settings.get("command_tools", [])
+    schemas = [s for s in (_tool_schema(t) for t in tools) if s]
+    if not schemas:
+        return None
+    try:
+        resp = llm_client.chat.completions.create(
+            model=_settings["llm_model"],
+            messages=[
+                {"role": "system", "content":
+                    "Tu pilotes un dashboard domestique. Traduis la demande en appel "
+                    "d'outil si elle correspond à une action disponible ; sinon "
+                    "n'appelle aucun outil."},
+                {"role": "user", "content": text},
+            ],
+            # ⚠️ Raisonnement COUPÉ (extra_body) : sinon un modèle à raisonnement
+            # brûle le budget de tokens à « réfléchir » et l'appel d'outil sort
+            # tronqué (400 tool_use_failed).
+            tools=schemas, tool_choice="auto",
+            temperature=0, max_tokens=512, extra_body=_llm_extra_body(),
+        )
+    except Exception as e:
+        print(f"[Bridge] Classification commande impossible : {e}")
+        return None
+
+    calls = resp.choices[0].message.tool_calls
+    if not calls:
+        return None
+    fn = calls[0].function
+    try:
+        args = json.loads(fn.arguments or "{}")
+    except Exception:
+        return None
+
+    tdef = next((t for t in tools if (t.get("name") or "").strip() == fn.name), None)
+    if not tdef:
+        return None
+
+    # Validation (bornes/choix) puis substitution des {param} dans les gabarits.
+    values = {}
+    for p in tdef.get("params", []):
+        pn = (p.get("name") or "").strip()
+        if not pn:
+            continue
+        raw = args.get(pn)
+        if p.get("type") == "choix":
+            allowed = _choices(p.get("spec"))
+            sv = str(raw).strip() if raw is not None else ""
+            if allowed and sv not in allowed:
+                return None
+            values[pn] = sv
+        else:
+            lo, hi = _parse_range(p.get("spec"))
+            iv = _clamp_int(raw, lo, hi)
+            if iv is None:
+                return None
+            values[pn] = iv
+
+    def _fill(s: str) -> str:
+        for k, v in values.items():
+            s = s.replace("{" + k + "}", str(v))
+        return s
+
+    return {"topic":   (tdef.get("topic") or "esp32/cmd").strip() or "esp32/cmd",
+            "payload":  _fill(tdef.get("action", "")),
+            "confirm":  bool(tdef.get("confirm")),
+            "prompt":   _fill(tdef.get("prompt", "")) or "Tu veux confirmer ?",
+            "speak":    _fill(tdef.get("speak", "")) or "C'est fait."}
+
+def _speak_response(text: str, transcript: str, listen_after: bool = False):
+    """Synthétise `text`, publie ai/answer et renvoie la réponse HTTP (même
+    forme que _answer_and_speak). listen_after -> en-tête X-Listen-After : le
+    firmware ré-arme l'écoute à la fin de la lecture (cf. ai_manager)."""
+    pcm_out = tts_speak(text)
+    if not pcm_out:
+        mqtt_pub("ai/status", "error")
+        return "", 500
+    mqtt_pub("ai/answer", text)
+    resp = Response(pcm_out, mimetype="application/octet-stream")
+    resp.headers["X-Transcript"] = quote(transcript)
+    resp.headers["X-Answer"] = quote(text)
+    if listen_after:
+        resp.headers["X-Listen-After"] = "1"
+    return resp
+
+def maybe_handle_command(text: str):
+    """Court-circuit du flux Q-R si `text` est une commande ou une réponse à une
+    confirmation en attente. Renvoie une Response, ou None pour laisser passer."""
+    global _pending_command, _pending_ts
+    # Apostrophe typographique normalisée : Whisper rend « c'est bon » avec U+2019.
+    low = text.lower().replace("’", "'")
+
+    # 1) Réponse à une confirmation en attente (non périmée) ?
+    if _pending_command and (time.monotonic() - _pending_ts) <= COMMAND_PENDING_TTL_S:
+        if _said(low, _CMD_YES):
+            action, _pending_command = _pending_command, None
+            _execute_command(action)
+            return _speak_response(action["speak"], text)
+        if _said(low, _CMD_NO):
+            _pending_command = None
+            return _speak_response("D'accord, j'annule.", text)
+        # Ni oui ni non : on oublie l'attente et on traite la phrase normalement.
+        _pending_command = None
+    else:
+        _pending_command = None   # périmée
+
+    # 2) Portillon : sans mot-clé de pilotage, ce n'est pas une commande.
+    if not any(k in low for k in _settings.get("command_keywords", [])):
+        return None
+
+    action = _classify_command(text)
+    if not action:
+        return _speak_response("Je n'ai pas compris la commande.", text)
+
+    if action["confirm"]:
+        _pending_command, _pending_ts = action, time.monotonic()
+        return _speak_response(action["prompt"], text, listen_after=True)
+
+    _execute_command(action)          # navigation : immédiat, sans confirmation
+    return _speak_response(action["speak"], text)
 
 def _answer_and_speak(text: str):
     """Partie commune à /ask et /ask_text, une fois le texte de la
-    question connu : météo/actu -> LLM -> TTS -> réponse HTTP + MQTT."""
-    news_context = maybe_fetch_news(text)
-    contexts = [c for c in (maybe_fetch_weather(text), news_context) if c]
-    # Réponse actu plus longue (5-6 titres) ; sinon budget court habituel.
-    max_tokens = _settings["news_max_tokens"] if news_context else _settings["max_tokens"]
-    answer = llm_answer(text, "\n\n".join(contexts) or None, max_tokens)
+    question connu : commande -> sinon LLM (+ outils) -> TTS -> réponse."""
+    cmd_resp = maybe_handle_command(text)
+    if cmd_resp is not None:
+        return cmd_resp
+    answer = llm_answer(text, None)          # le modèle décide seul de ses outils
     if not answer:
         mqtt_pub("ai/status", "error")
         return "", 500

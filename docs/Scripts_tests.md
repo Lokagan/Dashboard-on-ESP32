@@ -35,6 +35,15 @@ mosquitto_pub -h 192.168.1.1 -t ai/transcript -m "Quelle heure est-il ?"
 mosquitto_pub -h 192.168.1.1 -t ai/answer -m "Il est 14h32, il fait beau dehors."
 
 
+# --- Commandes vocales (pilotage du dashboard) ---
+# Portillon "pilote" (command_keywords, bridge_defaults.json) : sans lui, la
+# phrase repart en Q-R normal. Navigation = immédiat ; réglages = confirmation
+# ("Tu veux… ?" -> "oui", ré-écoute auto via l'en-tête X-Listen-After).
+mosquitto_pub -h 192.168.1.1 -t ai/ask -m "pilote, affiche le NAS"
+mosquitto_pub -h 192.168.1.1 -t ai/ask -m "pilote, mets le volume à 40"
+mosquitto_pub -h 192.168.1.1 -t ai/ask -m "oui"
+
+
 # --- Commandes ESP32 (esp32/cmd) ---
 mosquitto_pub -h 192.168.1.1 -t esp32/cmd -m "page:nas"
 mosquitto_pub -h 192.168.1.1 -t esp32/cmd -m "page:sysinfo1"

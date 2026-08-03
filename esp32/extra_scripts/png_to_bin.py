@@ -33,11 +33,11 @@ PRÉREQUIS
   silencieusement (une mauvaise surprise moins visible qu'une erreur
   claire à la conversion)
 
-    pip install pillow --break-system-packages
+    pip3 install pillow --break-system-packages
 """
 
 # ----------------------------------------------------------------
-# RESSOURCES BIBLIOTHÈQUES
+#  BIBLIOTHÈQUES
 # ----------------------------------------------------------------
 import argparse
 import struct
@@ -47,7 +47,7 @@ from pathlib import Path
 try:
     from PIL import Image
 except ImportError:
-    sys.exit("Pillow manquant — installe avec : pip install pillow --break-system-packages")
+    sys.exit("Pillow manquant — installe avec : pip3 install pillow --break-system-packages")
 
 # ----------------------------------------------------------------
 # HELPERS
@@ -117,9 +117,9 @@ def main():
 
     print(f"\n{len(pngs) - errors}/{len(pngs)} fichier(s) converti(s), "
           f"{total} octets ({total / 1024:.1f} Ko) au total dans {out_dir}")
+    
     if errors:
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()

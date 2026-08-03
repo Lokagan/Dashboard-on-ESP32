@@ -69,10 +69,8 @@ void led_loop() {
     FastLED.show();
 }
 
-// À appeler juste avant une opération sensible au cache flash désactivé
-// (OTA notamment) : bloque tout appel à FastLED.show() donc toute
-// activité RMT tant que la pause est active. Ne touche pas à l'état
-// actuel de la LED (elle reste figée sur sa dernière valeur affichée).
+// À appeler avant une opération sensible au cache flash désactivé (OTA) :
+// bloque tout FastLED.show(), donc toute activité RMT. La LED reste figée.
 void led_pause() {
     _paused = true;
 }

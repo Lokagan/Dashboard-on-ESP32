@@ -1,17 +1,13 @@
 // ============================================================
 // AI_COMPANION.CPP — avatar 120x120 sur ui_ImageCompanion (ui_ScreenAI)
 //
-// Frames chargées depuis LittleFS (/companion/*.bin) en PSRAM au
-// démarrage, plutôt que compilées en flash (const) — libère ~886 Ko
-// de la partition app0/app1 (3,125 Mo chacune), déplacés vers littlefs.
-// Allocation PSRAM au boot, réutilisée pour toute la durée de vie.
+// Frames chargées depuis LittleFS (/companion/*.bin) en PSRAM au démarrage,
+// allocation unique réutilisée pour toute la durée de vie.
 //
-// Format des .bin : PAS de header — juste les octets bruts RGB565A8 
-// (plan couleur 120*120*2 octets, puis plan alpha 120*120*1 octet).
-// Le lv_image_dsc_t est reconstruit ici à la main.
+// Format des .bin : PAS de header — les octets bruts RGB565A8 (plan couleur
+// 120*120*2, puis plan alpha 120*120*1). Le lv_image_dsc_t est reconstruit ici.
 //
-// idle    : 4 frames — respiration douce, tourne en continu (y
-//           compris à l'état IDLE, contrairement à avant)
+// idle    : 4 frames — respiration douce, tourne en continu
 // listen  : 6 frames — pulse d'anneau
 // think   : 6 frames — rotation des 3 points
 // speak   : 4 frames — bouche fermée -> mi -> ouverte -> mi
@@ -65,8 +61,7 @@ static const lv_image_dsc_t* _frames_listen[6];
 static const lv_image_dsc_t* _frames_think[6];
 static const lv_image_dsc_t* _frames_speak[4];
 
-// Animation — timer + lv_image_set_src (objet Image standard
-// SquareLine, pas de widget Animated Image requis)
+// Animation — timer + lv_image_set_src (objet Image standard SquareLine)
 static lv_timer_t*             _anim_timer     = nullptr;
 static const lv_image_dsc_t**  _current_frames = nullptr;
 static uint8_t                 _current_count  = 0;
@@ -75,16 +70,13 @@ static uint8_t                 _current_idx    = 0;
 // Dernier état demandé, pour reprendre exactement là où on était
 static AiState _last_state = AI_IDLE;
 
-// Avant-déclaration — définie en API LOCALES, référencée plus haut
-// dans le fichier par _start_anim() (HELPERS)
+// Avant-déclaration — définie en API LOCALES, appelée depuis _start_anim()
 static void _anim_timer_cb(lv_timer_t* t);
 
 // ---- HELPERS ----
 
-// Chargement d'une frame — échec silencieux + log si un fichier manque
-// (évite un crash dur si l'upload LittleFS a été oublié ou partiel) :
-// l'avatar reste alors invisible/figé plutôt que de planter tout
-// l'écran Companion.
+// Échec silencieux + log si un fichier manque : l'avatar reste figé plutôt
+// que de planter l'écran Companion.
 static bool _load_frame(uint8_t idx) {
     char path[48];
     snprintf(path, sizeof(path), "/companion/%s.bin", _frame_names[idx]);
@@ -95,7 +87,7 @@ static bool _load_frame(uint8_t idx) {
         return false;
     }
     if (f.size() != FRAME_TOTAL_SZ) {
-        log_line("[Companion] Taille inattendue pour %s : %u (attendu %u)",
+        log_line("[Companion] Taille inattendue pour %s : %u (attendue %u)",
                  path, (unsigned)f.size(), (unsigned)FRAME_TOTAL_SZ);
         f.close();
         return false;

@@ -14,9 +14,13 @@
 #include <WebServer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <esp_heap_caps.h>
 
 // ---- RESSOURCES LOCALES ----
 #include "http_manager.h"
+#include "display_manager.h"   // display_show_ai_auto (écoute déclenchée depuis le web)
+#include "display_driver.h"    // panel_capture_* (GET /screen.bmp)
+#include "audio_manager.h"     // audio_wakeword_ack
 #include "config.h"
 
 // ---- OBJETS GLOBAUX ----
@@ -27,10 +31,10 @@ static volatile bool _cmd_pending = false;
 static char          _pending_cmd[32] = "";
 static volatile bool _ai_ask_pending = false;
 static char          _pending_ai_question[200] = "";
+static volatile bool _ai_listen_pending = false;   // bouton « Demander » vide → écoute
 
 // --- INTERFACE HTML/JS ---
-// Les valeurs initiales des sliders sont INJECTÉES depuis config.h : codées en
-// dur, elles avaient fini par diverger de la réalité du firmware.
+// Valeurs initiales des sliders INJECTÉES depuis config.h.
 const char HTML_CONTENT[] PROGMEM = R"=====(
 <!DOCTYPE html>
 <html lang="fr">
@@ -109,7 +113,7 @@ const char HTML_CONTENT[] PROGMEM = R"=====(
                              white-space: nowrap; }
         .cmd-btn.btn-on { background: #00c853; color: #121212; }
         .cmd-btn.btn-on:hover { background: #00e676; color: #121212; }
-        .cmd-btn.btn-reboot { background: #cf6679; color: #121212; }
+        .cmd-btn.btn-reboot { background: #cf6679; color: #121212; text-align: center; }
         .cmd-btn.btn-reboot:hover { background: #ff4081; color: white; }
     </style>
 </head>
@@ -120,9 +124,9 @@ const char HTML_CONTENT[] PROGMEM = R"=====(
             <h2>Assistant IA</h2>
             <div class="ai-row">
                 <div id="aiLight" class="ai-light idle"></div>
-                <input id="aiQuestion" class="ai-input" type="text" placeholder="Pose ta question..."
-                       onkeydown="if (event.key === 'Enter') postText('/ai_ask', 'aiQuestion')">
-                <button class="ai-ask-btn" onclick="postText('/ai_ask', 'aiQuestion')">Demander</button>
+                <input id="aiQuestion" class="ai-input" type="text" placeholder="Pose ta question... (vide = 🎤 parler)"
+                       onkeydown="if (event.key === 'Enter') askOrListen()">
+                <button class="ai-ask-btn" onclick="askOrListen()">Demander</button>
             </div>
         </div>
 
@@ -186,22 +190,22 @@ const char HTML_CONTENT[] PROGMEM = R"=====(
                        onchange="sendCmd('volume:' + this.value)">
             </div>
             <a class="cmd-btn" target="_blank" rel="noopener"
-               href=")=====" AI_BRIDGE_UI_URL R"=====(">⚙ Config IA côté NAS (voix, contexte, LLM)</a>
+               href=")=====" AI_BRIDGE_UI_URL R"=====(">⚙ Config IA (-> NAS)</a>
             <a class="cmd-btn" target="_blank" rel="noopener"
-               href=")=====" ACTIVITY_UI_URL R"=====(">⚙ Config Services côté NAS</a>
+               href=")=====" ACTIVITY_UI_URL R"=====(">⚙ Config ACTIVITÉS (-> NAS)</a>
             <a class="cmd-btn" target="_blank" rel="noopener"
-               href=")=====" ACTIVITY_ADGUARD_URL R"=====(">⚙ Config ADGUARD côté NAS</a>
+               href=")=====" ACTIVITY_ADGUARD_URL R"=====(">⚙ Config ADGUARD (-> NAS)</a>
         </div>
 
         <div class="cmd-section">
             <h3>Diagnostic</h3>
             <div class="cmd-grid6">
-                <button class="cmd-btn" onclick="sendCmd('page:sysinfo1')" title="SysInfo — Identité : modèle, silicium, CPU, charge par cœur, flash, température, dernier reset">ID</button>
+                <button class="cmd-btn" onclick="sendCmd('page:sysinfo1')" title="SysInfo — Identité : puce, charge par cœur, température, uptime, flash, écran, firmware, dernier reset">ID</button>
                 <button class="cmd-btn" onclick="sendCmd('page:sysinfo2')" title="SysInfo — Mémoire : heap interne/DMA/PSRAM, firmware, postes d'allocation connus">MEM</button>
-                <button class="cmd-btn" onclick="sendCmd('page:sysinfo3')" title="SysInfo — Réseau : WiFi, IP, MQTT">NET</button>
-                <button class="cmd-btn" onclick="sendCmd('page:sysinfo4')" title="SysInfo — Tâches : état, priorité, %CPU et pile de chaque tâche FreeRTOS">TSK</button>
-                <button class="cmd-btn" onclick="sendCmd('page:sysinfo5')" title="SysInfo — Partitions : table de partitionnement de la flash">PRT</button>
-                <button class="cmd-btn" onclick="sendCmd('page:sysinfo6')" title="SysInfo — Fichiers : occupation LittleFS">FS</button>
+                <button class="cmd-btn" onclick="sendCmd('page:sysinfo3')" title="SysInfo — Tâches : état, priorité, %CPU et pile de chaque tâche FreeRTOS">TSK</button>
+                <button class="cmd-btn" onclick="sendCmd('page:sysinfo4')" title="SysInfo — Partitions : table de partitionnement de la flash">PRT</button>
+                <button class="cmd-btn" onclick="sendCmd('page:sysinfo5')" title="SysInfo — Fichiers : occupation LittleFS">FS</button>
+                <button class="cmd-btn" onclick="sendCmd('page:sysinfo6')" title="SysInfo — Réseau : WiFi, IP, MQTT">NET</button>
             </div>
             <div class="cmd-pair">
                 <button class="cmd-btn" onclick="sendMem()">État mémoire</button>
@@ -214,8 +218,10 @@ const char HTML_CONTENT[] PROGMEM = R"=====(
             </div>
             <div class="cmd-pair">
                 <button class="cmd-btn" onclick="sendCmd('saverec')" title="Envoie la dernière capture IA au NAS (WAV horodaté dans scripts/captures/)">Capture IA → NAS</button>
-                <button class="cmd-btn btn-reboot" onclick="sendReboot()">Redémarrer</button>
+                <a class="cmd-btn" href="/screen.bmp" target="_blank" rel="noopener"
+                   title="Image de ce qu'affiche la dalle, en BMP">Capture d'écran</a>
             </div>
+            <button class="cmd-btn btn-reboot" onclick="sendReboot()">Redémarrer</button>
         </div>
     </div>
     </div>
@@ -234,6 +240,18 @@ const char HTML_CONTENT[] PROGMEM = R"=====(
             } catch (error) {
                 alert('Erreur : ' + error.message);
             }
+        }
+
+        // Bouton « Demander » : champ vide -> écoute vocale (comme le wake word),
+        // sinon question texte classique.
+        async function askOrListen() {
+            const text = document.getElementById('aiQuestion').value.trim();
+            if (!text) {
+                try { await fetch('/ai_listen', { method: 'POST' }); }
+                catch (error) { alert('Erreur : ' + error.message); }
+                return;
+            }
+            postText('/ai_ask', 'aiQuestion');
         }
 
         async function refreshAiStatus() {
@@ -494,9 +512,8 @@ static void _handle_list_files() {
 
     File file = root.openNextFile();
     while (file) {
-        // Selon la version du core, file.name() renvoie un nom relatif OU un
-        // chemin complet : on ne garde que le dernier segment et on reconstruit
-        // le chemin nous-mêmes, fiable en sous-dossier.
+        // ⚠️ Selon la version du core, file.name() renvoie un nom relatif OU un
+        // chemin complet : on reconstruit le chemin depuis le dernier segment.
         String basename = _basename(String(file.name()));
 
         JsonObject o = arr.add<JsonObject>();
@@ -585,6 +602,73 @@ static void _handle_cmd_request() {
     server.send(200, "text/plain", "OK");
 }
 
+static void _le32(uint8_t* p, uint32_t v) {
+    p[0] = (uint8_t)v;         p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+
+// Capture d'écran en BMP 24 bits. L'armement passe par le drapeau de /cmd :
+// display_capture_screen() touche LVGL, interdit depuis http_task.
+// ⚠️ L'attente porte sur le NUMÉRO de capture, PAS sur panel_capture_ready() :
+// celui-ci est resté vrai depuis la fois d'avant, on servirait donc l'image
+// précédente pendant que loopTask écrit la nouvelle dans le même buffer.
+static void _handle_screen_request() {
+    uint32_t seq0 = panel_capture_seq();
+    strcpy(_pending_cmd, "shot");
+    _cmd_pending = true;
+
+    uint32_t t0 = millis();
+    while (panel_capture_seq() == seq0 && millis() - t0 < SCREEN_CAPTURE_TIMEOUT_MS)
+        vTaskDelay(pdMS_TO_TICKS(20));
+
+    const uint16_t* px = (panel_capture_seq() != seq0) ? panel_capture_buffer() : nullptr;
+    if (!px) { server.send(504, "text/plain", "Capture indisponible"); return; }
+
+    const uint32_t rowBytes = (uint32_t)SCREEN_WIDTH * 3;   // 960, déjà multiple de 4
+    const uint32_t dataSize = rowBytes * SCREEN_HEIGHT;
+
+    uint8_t hdr[54] = { 0 };
+    hdr[0] = 'B'; hdr[1] = 'M';
+    _le32(hdr + 2,  54 + dataSize);
+    _le32(hdr + 10, 54);
+    _le32(hdr + 14, 40);                                    // BITMAPINFOHEADER
+    _le32(hdr + 18, SCREEN_WIDTH);
+    _le32(hdr + 22, (uint32_t)(-SCREEN_HEIGHT));            // négatif = top-down
+    hdr[26] = 1;
+    hdr[28] = 24;
+    _le32(hdr + 34, dataSize);
+
+    server.sendHeader("Content-Disposition", "inline; filename=\"screen.bmp\"");
+    server.setContentLength(sizeof(hdr) + dataSize);
+    server.send(200, "image/bmp", "");
+
+    // auto& : le type rendu par client() a changé de nom avec le core 3.x.
+    auto& client = server.client();
+    client.write(hdr, sizeof(hdr));
+
+    // Conversion par blocs en PSRAM : la pile de http_task ne porte rien.
+    uint8_t* out = (uint8_t*)heap_caps_malloc(rowBytes * SCREEN_CAPTURE_ROWS,
+                                              MALLOC_CAP_SPIRAM);
+    if (!out) return;                                       // en-têtes partis, on coupe
+
+    for (int y = 0; y < SCREEN_HEIGHT; y += SCREEN_CAPTURE_ROWS) {
+        int n = SCREEN_HEIGHT - y;
+        if (n > SCREEN_CAPTURE_ROWS) n = SCREEN_CAPTURE_ROWS;
+
+        uint8_t* d = out;
+        for (int i = 0; i < n * SCREEN_WIDTH; i++) {
+            uint16_t v = px[(size_t)y * SCREEN_WIDTH + i];
+            v = (uint16_t)((v >> 8) | (v << 8));            // ordre dalle -> RGB565 natif
+            uint8_t r = (v >> 11) & 0x1F, g = (v >> 5) & 0x3F, b = v & 0x1F;
+            *d++ = (uint8_t)(b << 3 | b >> 2);              // BMP = BGR
+            *d++ = (uint8_t)(g << 2 | g >> 4);
+            *d++ = (uint8_t)(r << 3 | r >> 2);
+        }
+        client.write(out, (size_t)n * rowBytes);
+    }
+    heap_caps_free(out);
+}
+
 // Idem : ai_on_ask_request() touche LVGL.
 static void _handle_ai_ask_request() {
     if (!server.hasArg("text")) {
@@ -597,16 +681,22 @@ static void _handle_ai_ask_request() {
     server.send(200, "text/plain", "OK");
 }
 
-// Appel direct : log_clear() est protégé par la même section critique que
-// log_line() et ne touche pas LVGL.
-static void _handle_serial_clear_request() {
-    log_clear();
-    log_line("[LOG] Journal efface");   // repère : tout ce qui suit est postérieur
+// Champ texte vide côté web → écoute vocale, comme le wake word. La séquence
+// touche LVGL : on ne pose qu'un drapeau, exécuté dans http_loop().
+static void _handle_ai_listen_request() {
+    _ai_listen_pending = true;
     server.send(200, "text/plain", "OK");
 }
 
-// PAS de drapeau différé, contrairement à /ai_ask : ai_say() ne fait que
-// recopier le texte dans la file de la tâche IA, sans toucher LVGL.
+// Appel direct : log_clear() ne touche pas LVGL et gère son propre verrou.
+static void _handle_serial_clear_request() {
+    log_clear();
+    log_line("[LOG] Journal effacé !");   // repère : tout ce qui suit est postérieur
+    server.send(200, "text/plain", "OK");
+}
+
+// PAS de drapeau différé, contrairement à /ai_ask : ai_say() ne fait
+// qu'empiler dans la file de la tâche IA, sans toucher LVGL.
 static void _handle_say_request() {
     if (!server.hasArg("text")) {
         server.send(400, "text/plain", "Parametre 'text' manquant");
@@ -625,9 +715,8 @@ static void _handle_ai_status_request() {
         case AI_SPEAKING:  state_str = "speaking";  break;
         case AI_ERROR:     state_str = "error";     break;
     }
-    // "loop" voyage avec l'état IA plutôt que sur sa propre route : le sondage
-    // à 1,5 s existe déjà, et il resynchronise le bouton après un rechargement
-    // de page ou un redémarrage de l'ESP32.
+    // "loop" voyage avec l'état IA : le sondage à 1,5 s existe déjà et
+    // resynchronise le bouton après un rechargement de page.
     char json[64];
     snprintf(json, sizeof(json), "{\"state\":\"%s\",\"loop\":%s}",
              state_str, log_loop_measure() ? "true" : "false");
@@ -645,8 +734,8 @@ static void _http_task(void* pvParameters) {
 // ---- API PUBLIQUES ----
 
 void http_init() {
-    // send_P streame depuis la flash ; server.send() aurait construit un String
-    // de ~9 Ko en heap à chaque chargement de la page.
+    // send_P streame depuis la flash ; server.send() construirait un String
+    // de ~9 Ko en heap à chaque chargement.
     server.on("/", []() { server.send_P(200, "text/html", HTML_CONTENT); });
 
     server.on("/list",         _handle_list_files);
@@ -656,16 +745,17 @@ void http_init() {
     server.on("/serial",       HTTP_GET,  _handle_serial_request);
     server.on("/serial/clear", HTTP_POST, _handle_serial_clear_request);
     server.on("/ai_ask",       HTTP_POST, _handle_ai_ask_request);
+    server.on("/ai_listen",    HTTP_POST, _handle_ai_listen_request);
     server.on("/say",          HTTP_POST, _handle_say_request);
     server.on("/ai_status",    HTTP_GET,  _handle_ai_status_request);
+    server.on("/screen.bmp",   HTTP_GET,  _handle_screen_request);
     server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
 
     server.begin();
     log_line("[HTTP] Serveur démarré sur le port %d", HTTP_SERVER_PORT);
 
-    // Pile : STACK_BYTES_HTTP_TASK. Les 6144 initiaux débordaient via
-    // log_get_json() (~5880 o) ; sérialisé ligne par ligne désormais → pic 3080 o
-    // (relevé APRÈS un téléchargement, le chemin le plus gourmand) → ~3 Ko marge.
+    // ⚠️ La plus tendue des quatre piles : ne pas descendre plus bas. Relever
+    // APRÈS un téléchargement de fichier, son chemin le plus gourmand.
     xTaskCreatePinnedToCore(_http_task, "http_task", STACK_BYTES_HTTP_TASK, nullptr, 1, nullptr, 0);
 }
 
@@ -678,5 +768,11 @@ void http_loop() {
     if (_ai_ask_pending) {
         _ai_ask_pending = false;
         ai_on_ask_request(_pending_ai_question);
+    }
+    if (_ai_listen_pending) {
+        _ai_listen_pending = false;
+        display_show_ai_auto();   // même séquence que le wake word (wakeword_loop)
+        audio_wakeword_ack();
+        ai_start_listening();
     }
 }

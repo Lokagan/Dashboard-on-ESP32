@@ -161,6 +161,9 @@ Format `cmd` ou `cmd:arg`, traité par `mqtt_handle_esp_cmd()` (`mqtt_manager.cp
 |                      | qui l'archive en WAV horodaté dans `scripts/captures/` sur le NAS
 |                      | — bouton « Capture IA → NAS » du panneau web.
 |                      | Y compris les captures écartées pour absence de parole.      |
+| `shot`               | Capture l'écran de la dalle dans un buffer PSRAM, récupérable
+|                      | en BMP par `GET /screen.bmp` — bouton « Capture d'écran » du
+|                      | panneau web, qui arme et récupère d'un seul clic.            |
 | `reboot`             | Redémarre l'ESP32 (`ESP.restart()`)                          |
 |----------------------|--------------------------------------------------------------|
 Chaque commande reçue est journalisée dans le buffer circulaire de `log_manager.cpp` (visible via `GET /serial` sur l'interface web).
@@ -168,6 +171,8 @@ Chaque commande reçue est journalisée dans le buffer circulaire de `log_manage
 > ⚠️ Une valeur `page:X` inconnue ou `brightness`/`volume` hors plage est journalisée sans effet — aucun crash, la commande est simplement ignorée.
 
 > Ces mêmes commandes sont aussi déclenchables via `POST /cmd` sur l'interface web embarquée de l'ESP32 (panneau "Commandes ESP32", `http_manager.cpp`) — même fonction `mqtt_handle_esp_cmd()` sous-jacente.
+
+> Elles peuvent aussi être émises par **le bridge** (`bridge_monitor.py`) suite à une **commande vocale** (« pilote, affiche le NAS ») : le LLM traduit la phrase en action via tool-calling. Voir `CLAUDE.md` (section « Commandes vocales »).
 
 ## QoS et messages retenus
 
@@ -207,6 +212,9 @@ Consommés/publiés par : `esp32/src/ai_manager.cpp` (écran Companion) et `syno
 | ai/ask         | string | "Quelle heure est-il ?" | → ESP32                  | Déclenche une question en texte (sans passer par le micro). Anti-doublon :
 |                |        |                         |                          | ignoré si un `ai/ask` arrive moins de 2s après le précédent,
 |                |        |                         |                          | ou si l'IA est déjà en cours d'utilisation (`listening`/`thinking`/`speaking`).
+|                |        |                         |                          | Si la phrase contient un **mot-clé de pilotage** (`command_keywords`, défaut « pilote »),
+|                |        |                         |                          | elle est traitée comme une **commande vocale** (cf. bridge) au lieu d'une question —
+|                |        |                         |                          | action émise sur `esp32/cmd`.
 |----------------|--------|-------------------------|--------------------------|-------------------------------------------------------------------------------------------------------|
 | ai/transcript  | string | "Quelle heure est-il ?" | → ESP32                  | Texte de la question (résultat STT), affiché en sous-titre sur l'écran Companion.
 |----------------|--------|-------------------------|--------------------------|-------------------------------------------------------------------------------------------------------|
@@ -218,7 +226,7 @@ En complément de MQTT, l'ESP32 appelle directement en HTTP `bridge_monitor.py` 
 
 - **`AI_BRIDGE_URL`** (`POST`, `Content-Type: application/octet-stream`) : upload direct du buffer audio PCM16 mono 16 kHz capturé en PSRAM (pas de fichier, pas d'écriture flash). En-têtes `X-Sample-Rate` et `X-Samples` envoyés avec la requête.
 - **`AI_BRIDGE_TEXT_URL`** (`POST`, JSON `{"text": "..."}`) : utilisé pour les questions envoyées via `ai/ask`.
-- **Réponse du bridge** : en-têtes `X-Transcript` et `X-Answer` (texte URL-encodé, car les en-têtes HTTP ne supportent que l'ISO-8859-1), suivis du flux audio TTS en **PCM brut** (int16 mono 16 kHz, pas de header WAV) en corps de réponse. Le firmware lit ce flux directement en PSRAM et le joue immédiatement — **rien n'est écrit sur la flash**. L'écriture d'un `/tts.wav` après lecture a été retirée : elle suspendait le cache d'instructions et gelait LVGL ~2,9 s après chaque réponse. Le rejeu (`ai_replay_answer()`) redemande la synthèse au bridge via `POST /say`.
+- **Réponse du bridge** : en-têtes `X-Transcript` et `X-Answer` (texte URL-encodé, car les en-têtes HTTP ne supportent que l'ISO-8859-1), suivis du flux audio TTS en **PCM brut** (int16 mono 16 kHz, pas de header WAV) en corps de réponse. Le firmware lit ce flux directement en PSRAM et le joue immédiatement — **rien n'est écrit sur la flash**. L'écriture d'un `/tts.wav` après lecture a été retirée : elle suspendait le cache d'instructions et gelait LVGL ~2,9 s après chaque réponse. Le rejeu (`ai_replay_answer()`) redemande la synthèse au bridge via `POST /say`. En-tête optionnel **`X-Listen-After: 1`** sur les réponses de confirmation d'une commande vocale : le firmware ré-arme l'écoute à la fin de la lecture, sans nouveau « Jarvis ».
 
 ---
 

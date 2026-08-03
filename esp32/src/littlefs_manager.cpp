@@ -1,9 +1,8 @@
 // ============================================================
 // LITTLEFS_MANAGER.CPP — Montage LittleFS + accès fichiers
 //
-// Point de montage unique. Le reste du firmware passe
-// par les wrappers ci-dessous plutôt que d'inclure <LittleFS.h> et
-// d'appeler l'objet global directement.
+// Point de montage unique : le reste du firmware passe par les wrappers
+// ci-dessous plutôt que par <LittleFS.h> et l'objet global.
 // ============================================================
 
 // ---- BIBLIOTHÈQUES ----
@@ -19,9 +18,8 @@ static bool _mounted = false;
 // ---- API PUBLIQUES ----
 
 void littlefs_init() {
-    // Le nom de partition par défaut de LittleFS.begin() est "spiffs"
-    // (historique) — notre partitions.csv nomme la partition "littlefs",
-    // donc il faut le préciser explicitement (sinon : partition introuvable).
+    // ⚠️ LittleFS.begin() cherche une partition "spiffs" par défaut, la nôtre
+    // s'appelle "littlefs" : sans ce nom explicite, partition introuvable.
     _mounted = LittleFS.begin(true, "/littlefs", 10, "littlefs");
     if (!_mounted) {
         log_line("[FS] Montage LittleFS échoué");

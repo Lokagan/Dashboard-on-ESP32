@@ -32,9 +32,30 @@
     {
       "name": "À trier",
       "icon": "📁"
+    },
+    {
+      "name": "Education",
+      "icon": "📰"
     }
   ],
   "services": [
+    {
+      "name": "Duolingo",
+      "icon": "📰",
+      "category": "Education",
+      "match": [
+        "duolingo"
+      ]
+    },
+    {
+      "name": "SmartLife",
+      "icon": "🏠",
+      "category": "Domotique",
+      "match": [
+        "lifeaiot",
+        "smart321"
+      ]
+    },
     {
       "name": "YouTube",
       "icon": "📺",
@@ -106,46 +127,6 @@
       "category": "Vidéo / TV",
       "match": [
         "molotov"
-      ]
-    },
-    {
-      "name": "Canal+",
-      "icon": "🎬",
-      "category": "Vidéo / TV",
-      "match": [
-        "canalplus",
-        "canal-plus",
-        "mycanal"
-      ]
-    },
-    {
-      "name": "France TV",
-      "icon": "📺",
-      "category": "Vidéo / TV",
-      "match": [
-        "francetv",
-        "france.tv",
-        "ftvcdn"
-      ]
-    },
-    {
-      "name": "TF1",
-      "icon": "📺",
-      "category": "Vidéo / TV",
-      "match": [
-        "tf1",
-        "mytf1",
-        "wat.tv"
-      ]
-    },
-    {
-      "name": "M6 / 6play",
-      "icon": "📺",
-      "category": "Vidéo / TV",
-      "match": [
-        "6play",
-        "m6web",
-        "m6.fr"
       ]
     },
     {
@@ -242,9 +223,7 @@
       "category": "Social / Messagerie",
       "match": [
         "twitter",
-        "twimg",
-        "t.co",
-        "x.com"
+        "twimg"
       ]
     },
     {
@@ -308,24 +287,6 @@
       ]
     },
     {
-      "name": "Riot / LoL",
-      "icon": "🎮",
-      "category": "Jeux",
-      "match": [
-        "riotgames",
-        "leagueoflegends"
-      ]
-    },
-    {
-      "name": "Minecraft",
-      "icon": "🎮",
-      "category": "Jeux",
-      "match": [
-        "minecraft",
-        "mojang"
-      ]
-    },
-    {
       "name": "ChatGPT",
       "icon": "🤖",
       "category": "IA",
@@ -361,9 +322,7 @@
       "match": [
         "apple.com",
         "icloud",
-        "mzstatic",
         "appleid",
-        "cdn-apple",
         "aaplimg"
       ]
     },
@@ -415,7 +374,8 @@
       "icon": "🌐",
       "category": "Web / Système",
       "match": [
-        "proxad"
+        "proxad",
+        "free"
       ]
     },
     {
@@ -429,7 +389,7 @@
     },
     {
       "name": "Genshin Impact",
-      "icon": "🌐",
+      "icon": "🎮",
       "category": "Jeux",
       "match": [
         "hoyoverse",
@@ -441,7 +401,8 @@
       "icon": "🎬",
       "category": "Vidéo / TV",
       "match": [
-        "capcutapi"
+        "capcutapi",
+        "capcut"
       ]
     },
     {
@@ -462,55 +423,36 @@
     }
   ],
   "noise": [
-    "1e100.net",
-    "_dns.resolver.arpa",
-    "adjust.com",
     "akadns",
     "akamai",
-    "akamaized",
-    "amazonaws.com",
-    "amplitude",
+    "alibabadns",
+    "alicdn",
+    "aliexpress",
+    "amazonaws",
+    "app-analytics-services",
     "app-measurement",
-    "appsflyer",
-    "azureedge",
-    "bblmw.com",
-    "branch.io",
-    "bugsnag",
-    "cloudflare.com",
-    "cloudfront.net",
-    "connectivitycheck",
-    "cookielaw",
-    "crashlytics",
-    "criteo",
+    "apple-cloudkit",
+    "apple-dns",
+    "appsflyersdk",
+    "azure",
+    "cdn-apple",
+    "cloudflare",
+    "cloudfront",
+    "dbankcloud",
     "doubleclick",
-    "edgekey",
-    "edgesuite",
-    "fastly.net",
-    "fbcdn.net",
-    "firebase",
-    "firebaseinstallations",
-    "firebaseremoteconfig",
-    "ggpht.com",
+    "fastly",
     "google-analytics",
     "googleadservices",
-    "googleapis.com",
+    "googleapis",
     "googlesyndication",
-    "googletagmanager",
-    "gstatic.com",
-    "gvt1.com",
-    "gvt2.com",
-    "in-addr.arpa",
-    "ip6.arpa",
-    "mixpanel",
-    "msftconnecttest",
-    "ntp.org",
-    "onetrust",
-    "pool.ntp",
-    "scorecardresearch",
-    "segment.com",
-    "segment.io",
-    "sentry",
-    "sharethis",
-    "time.apple"
+    "googleusercontent",
+    "gstatic",
+    "in-addr",
+    "local",
+    "logitech",
+    "mzstatic",
+    "ntp",
+    "safebrowsing",
+    "this-url-does-not-exist"
   ]
 }

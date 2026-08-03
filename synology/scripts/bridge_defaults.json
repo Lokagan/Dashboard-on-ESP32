@@ -1,15 +1,53 @@
 {
   "voice": "fr-FR-DeniseNeural",
-  "system_prompt": "Réponds toujours en français, en une ou deux phrases courtes et naturelles à l'oral, sans liste ni markdown. Réponds uniquement à ce qui est demandé, sans ajouter d'informations non sollicitées (météo, actualités, etc.), sauf si la question porte explicitement dessus. N'invente jamais de lieu, de donnée ou de date que tu ne connais pas ; si tu ne sais pas, dis-le simplement plutôt que de deviner. Les requêtes peuvent être des questions ou des demandes/commandes ; traite-les de la même façon, sans exiger qu'elles se terminent par un point d'interrogation. Réponds toujours par une phrase complète, naturelle et polie, jamais par un mot isolé ou une liste. C'est une conversation : chaque requête fait suite à l'échange précédent, garde le contexte en mémoire.",
-  "llm_model": "qwen/qwen3.6-27b",
+  "system_prompt": "Réponds toujours en français, de manière naturelle, concise et adaptée à l’oral, généralement en une ou deux phrases courtes. Réponds directement à la demande, sans informations supplémentaires non sollicitées.\nTraite de la même façon les questions, les demandes et les commandes, même lorsqu’elles ne se terminent pas par un point d’interrogation.\nN’invente jamais une information inconnue. Si une donnée, une date ou un lieu te manque, utilises tes outils pour vérifier.\nLa conversation est continue : utilise le contexte des échanges précédents lorsque cela est pertinent pour comprendre la demande actuelle.",
+  "llm_model": "llama-3.3-70b-versatile",
   "temperature": 0.6,
   "max_tokens": 100,
+  "tools_max_tokens": 200,
+  "web_search_enabled": true,
   "weather_city": "Paris",
   "weather_lat": 48.856614,
   "weather_lon": 2.3522219,
-  "weather_keywords": ["météo", "meteo", "quel temps", "pluie", "pleut", "pleuv", "température", "temperature", "il fait chaud", "il fait froid"],
   "news_feeds": ["https://www.francetvinfo.fr/titres.rss", "https://www.lemonde.fr/rss/une.xml"],
   "news_count": 6,
-  "news_max_tokens": 200,
-  "news_keywords": ["actu", "les infos", "les nouvelles", "nouvelles du jour", "quoi de neuf", "que se passe", "informations", "l'actualité"]
+  "command_keywords": ["pilote"],
+  "command_tools": [
+    {
+      "name": "dashboard_navigate",
+      "description": "Afficher un écran, une page du dashboard.",
+      "confirm": false,
+      "topic": "esp32/cmd",
+      "action": "page:{screen}",
+      "speak": "J'affiche {screen}.",
+      "prompt": "",
+      "params": [
+        {"name": "screen", "type": "choix", "spec": "home, nas, freebox, ai, sysinfo1, sysinfo2, sysinfo3, sysinfo4, sysinfo5, sysinfo6, disks, downloads, connections, devices, activity", "desc": "home=accueil, nas=NAS, freebox=box Freebox, ai=assistant, sysinfo1=diagnostic identité, sysinfo2=diagnostic mémoire, sysinfo3=diagnostic taches, sysinfo4=diagnostic partitions, sysinfo5=diagnostic littleFS, sysinfo6=diagnostic wifi, disks=disques, downloads=téléchargements, connections=connexions, devices=appareils, activity=activité réseau"}
+      ]
+    },
+    {
+      "name": "dashboard_set_volume",
+      "description": "Régler le volume du haut-parleur, en pourcentage (0 = muet).",
+      "confirm": true,
+      "topic": "esp32/cmd",
+      "action": "volume:{percent}",
+      "speak": "Volume réglé à {percent}.",
+      "prompt": "Tu veux mettre le volume à {percent} ?",
+      "params": [
+        {"name": "percent", "type": "nombre", "spec": "0 - 100", "desc": ""}
+      ]
+    },
+    {
+      "name": "dashboard_set_brightness",
+      "description": "Régler la luminosité de l'écran, en pourcentage.",
+      "confirm": true,
+      "topic": "esp32/cmd",
+      "action": "brightness:{percent}",
+      "speak": "Luminosité réglée à {percent}.",
+      "prompt": "Tu veux mettre la luminosité à {percent} ?",
+      "params": [
+        {"name": "percent", "type": "nombre", "spec": "1 - 100", "desc": ""}
+      ]
+    }
+  ]
 }

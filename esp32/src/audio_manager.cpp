@@ -43,8 +43,8 @@ bool audio_is_playing   = false;
 static I2SClass _i2s;
 static uint8_t  _volume = 215;   // registre 0x32 : 0,5 dB/pas, 215 ≈ -17 dB
 
-// Tampons de travail en RAM INTERNE (.bss) — déclarés ici et non en `static`
-// dans les fonctions, pour rester visibles quand on inventorie l'interne.
+// Tampons de travail en RAM INTERNE (.bss) — hors des fonctions, pour rester
+// visibles à l'inventaire de l'interne.
 static int16_t _audio_buf[1024 * 2];   // conversion mono -> stéréo avant write (4 Ko)
 static int16_t _stereo_buf[256 * 2];   // trame brute lue depuis l'ADC (1 Ko)
 
@@ -63,9 +63,8 @@ enum AudioCmd {
     AUDIO_CMD_WAKEWORD_ACK,
 };
 
-// Chaque message porte SON payload. Avant : file d'enum + statics partagés, donc
-// deux STREAM empilés relisaient le MÊME buffer (le dernier écrit) -> rejeu d'un
-// buffer déjà libéré -> double-free -> panic ("Faire parler Jarvis" répété).
+// ⚠️ Chaque message porte SON payload : avec des statics partagés, deux STREAM
+// empilés reliraient le MÊME buffer -> double-free -> panic.
 struct AudioMsg {
     AudioCmd             cmd;
     const int16_t*       buf;         // PLAY_PSRAM_STREAM
@@ -171,11 +170,9 @@ static void _es8311_init() {
     _es_write(0x13, 0x10);  // ampli casque OFF (on utilise OUTP/OUTN + FM8002E)
     _es_write(0x1C, 0x6A);  // passe-haut ADC (supprime l'offset DC)
     _es_write(0x14, 0x1A);  // Mic1P–Mic1N, PGA analogique +30 dB (max matériel)
-    // ⚠️ Micro volontairement LINÉAIRE — NE PAS RÉACTIVER L'ALC :
-    // elle s'effondrait à zéro 160 ms après une phrase forte.
+    // ⚠️ Micro volontairement LINÉAIRE — NE PAS RÉACTIVER L'ALC ni l'automute.
     // ALC coupée, 0x17 n'est plus un plafond mais le gain numérique FIXE :
     // 0xFF (+32 dB) obligatoire, à 0 dB la parole tombe à -52 dBFS.
-    // L'automute (0x18 bit6) coupait le micro entre deux phrases.
     _es_write(0x17, 0xFF);
     _es_write(0x18, 0x00);  // ALC_EN=0, ADC_AUTOMUTE_EN=0
     _es_write(0x19, 0xF0);  // cibles ALC — sans effet
@@ -196,8 +193,7 @@ static void _i2s_init() {
 // ---- API LOCALES ----
 
 // Capture vers la PSRAM. silence_cutoff : coupe après ~800 ms sous le seuil,
-// mais SEULEMENT après SPEECH_MIN_MS de vraie parole (sinon le résidu du jingle
-// suffisait à couper avant que l'utilisateur ne parle).
+// mais SEULEMENT après SPEECH_MIN_MS de vraie parole.
 // *out_cancelled distingue l'annulation (on jette) de l'arrêt manuel (on garde).
 static bool _audio_capture_to_psram(int max_ms, bool silence_cutoff, size_t* out_samples,
                                      bool* out_cancelled, uint16_t* out_speech_ms = nullptr) {
@@ -254,7 +250,7 @@ static bool _audio_capture_to_psram(int max_ms, bool silence_cutoff, size_t* out
                 silence_frames += frames_read;
                 if (speech_frames >= speech_min && silence_frames > silence_limit) break;
                 if (speech_frames < speech_min && (int)recorded > no_speech_limit) {
-                    log_line("[Audio] Aucune parole detectee en %d ms — abandon", NO_SPEECH_TIMEOUT_MS);
+                    log_line("[Audio] Aucune parole détectée en %d ms — abandon", NO_SPEECH_TIMEOUT_MS);
                     break;
                 }
             } else {
@@ -272,11 +268,9 @@ static bool _audio_capture_to_psram(int max_ms, bool silence_cutoff, size_t* out
              (unsigned long)((uint64_t)speech_frames * 1000 / SAMPLE_RATE));
 
     // La capture est TEMPS RÉEL : temps écoulé >> durée audio = tampon DMA
-    // débordé, échantillons perdus, parole hachée chez Whisper. Rien d'autre
-    // ne le signale, l'amplitude reste normale. (Libellé sans accents :
-    // LOG_LINE_LEN vaut 100 OCTETS.)
+    // débordé. Rien d'autre ne le signale, l'amplitude reste normale.
     if (audio_ms > 0 && wall_ms > audio_ms + audio_ms / 4) {
-        log_line("[Audio] ALERTE : %lu ms reel / %lu ms audio (x%lu.%02lu) — echantillons PERDUS",
+        log_line("[Audio] ALERTE : %lu ms réel / %lu ms audio (x%lu.%02lu) — échantillons PERDUS",
                  (unsigned long)wall_ms, (unsigned long)audio_ms,
                  (unsigned long)(wall_ms / audio_ms),
                  (unsigned long)((wall_ms * 100 / audio_ms) % 100));
@@ -319,8 +313,8 @@ static void _sound_click() {
     _play_tone(1200.0f, 30, 0.5f);
 }
 
-// Accusé de réception avant l'écoute. Le drain est indispensable :
-// l'enregistrement est empilé juste derrière dans la file.
+// Accusé de réception avant l'écoute. Drain indispensable : l'enregistrement
+// est empilé juste derrière dans la file.
 static void _sound_wakeword_ack() {
     _play_tone(660.0f, 90, 0.45f);
     _play_silence(20);
@@ -349,7 +343,7 @@ static void _sound_ff6() {
 }
 
 // Test hardware micro + HP : enregistre, rejoue, archive sur le NAS.
-// L'envoi est asynchrone (file de _ai_task), il ne retarde pas le bus I2S.
+// Envoi asynchrone (file de _ai_task), il ne retarde pas le bus I2S.
 static void _sound_test_loopback() {
     log_line("[Audio] Test loopback — enregistrement %d ms...", LOOPBACK_RECORD_MS);
 
@@ -361,17 +355,17 @@ static void _sound_test_loopback() {
     audio_is_recording = false;
 
     if (samples == 0) {
-        log_line("[Audio] Test loopback : aucune donnee capturee");
+        log_line("[Audio] Test loopback : aucune donnée capturée");
         return;
     }
 
     uint32_t t_play = millis();
     _audio_play_psram_stream(_record_psram_buf, samples, false);   // false : buffer singleton
-    log_line("[Audio] Lecture : %lu ms (%u echantillons)",
+    log_line("[Audio] Lecture : %lu ms (%u échantillons)",
              (unsigned long)(millis() - t_play), (unsigned)samples);
 
     ai_upload_pcm(_record_psram_buf, samples);
-    log_line("[Audio] Test loopback termine — capture envoyee au NAS");
+    log_line("[Audio] Test loopback terminé — capture envoyée au NAS");
 }
 
 // Enregistrement IA — le buffer PSRAM part directement chez ai_manager.
@@ -396,8 +390,8 @@ static void _audio_record(int max_ms, audio_record_done_cb done_cb) {
     }
 }
 
-// Au repos, ESP_SR écoute le micro : on le met en pause le temps d'exécuter la
-// commande, pour garantir un seul lecteur I2S à la fois.
+// ESP_SR écoute le micro au repos : pause le temps de la commande, pour
+// garantir un seul lecteur I2S à la fois.
 static void _audio_task(void* pvParameters) {
     AudioMsg msg;
     for (;;) {
@@ -434,11 +428,7 @@ void audio_init() {
     _ensure_record_buffer();   // évite un malloc PSRAM au premier enregistrement
 
     _audio_queue = xQueueCreate(4, sizeof(AudioMsg));
-    // Pile : STACK_BYTES_AUDIO_TASK. Pic mesuré 2064 o (enreg. long) ; à 3072 il
-    // ne restait que 1008 o (MARGE FAIBLE) — ne pas redescendre. High-water
-    // trompeur, relever APRÈS un échange vocal complet. Priorité 3 et non 1 :
-    // capture I2S temps réel, à égalité avec loopTask elle se faisait affamer
-    // par LVGL (×3,26 mesuré, échantillons perdus). CLAUDE.md.
+    // Pile : STACK_BYTES_AUDIO_TASK.
     xTaskCreatePinnedToCore(_audio_task, "audio_task", STACK_BYTES_AUDIO_TASK, nullptr, 3, nullptr, 1);
 
     log_line("[Audio] Init OK");

@@ -3,20 +3,36 @@
 # Calculée à la main pour 16MB (board_build.flash_size = 16MB) :
 #   nvs      :  20 KB  @ 0x009000
 #   otadata  :   8 KB  @ 0x00E000
-#   app0     : 3.125MB @ 0x010000  (slot OTA A)
-#   app1     : 3.125MB @ 0x330000  (slot OTA B — offset auto, contigu)
-#   model    :    4MB  @ 0x650000  (réservée pour jarvis/ESP-SR)
-#   littlefs : 5.625MB @ 0xA50000  (0x5A0000 — l'avatar Companion en occupe
-#                                  ~907 Ko, soit 16 % : large marge)
-#   -> total : 0xFF0000 (~15.94MB), marge de 64KB en fin de flash 
+#   app0     :    4MB  @ 0x010000  (slot OTA A)
+#   app1     :    4MB  @ 0x410000  (slot OTA B)
+#   model    : 768 KB  @ 0x810000  (jarvis/ESP-SR — srmodels_jarvis.bin)
+#   littlefs : 7.125MB @ 0x8D0000  (l'avatar Companion en occupe ~932 Ko)
+#   -> total : 0xFF0000 (~15.94MB), marge de 64KB en fin de flash
 #
-# app0/app1 à 3.125MB chacun laisse une marge large par rapport au
-# sketch actuel (à vérifier avec `pio run -t size`, mais largement
-# suffisant pour LVGL+TFT_eSPI+FastLED+HTTP+MQTT+audio).
+# Rééquilibrage 2026-08-02, sur occupation MESURÉE :
+#   app0/app1 3.125MB pour un firmware.bin de 2.2MB  -> ~70 %, le seul point tendu
+#   model       4MB   pour srmodels_jarvis.bin 566KB -> 14 %, 3.45MB dormants
+#   littlefs  5.625MB pour data/ 932KB               -> 16 %
+# Les 3.25MB rendus par `model` vont donc surtout aux slots applicatifs
+# (-> 55 % d'occupation), le reste à littlefs. 768KB laisse 26 % de marge au
+# modèle : de quoi encaisser un blob un peu plus gros sans repartitionner.
+#
+# ⚠️ OFFSETS EXPLICITES, ne pas repasser en auto (colonne vide) :
+# extra_scripts/flash_assets.py lit ICI les offsets de `model` et `littlefs`
+# pour y flasher srmodels_jarvis.bin et l'image du système de fichiers. C'est la
+# source de vérité unique des deux — une colonne vide obligerait le script à
+# recalculer l'alignement lui-même, donc à diverger un jour.
+#
+# ⚠️ Alignement : partitions `app` sur 64KB (0x10000), partitions `data` sur
+# 4KB (0x1000). app0 @0x010000 et app1 @0x410000 sont bien multiples de 64KB.
+#
+# ⚠️ Toute modification de cette table impose un FLASH USB COMPLET
+# (upload_protocol = esptool) : l'OTA ne repartitionne pas. Procédure complète
+# dans CLAUDE.md, section « Partitions flash et modèle ESP-SR ».
 # ------------------------------------------------------------
 nvs,       data, nvs,      0x9000,   0x5000,
 otadata,   data, ota,      0xE000,   0x2000,
-app0,      app,  ota_0,    0x10000,  0x320000,
-app1,      app,  ota_1,           ,  0x320000,
-model,     data, spiffs,          ,  0x400000,
-littlefs,  data, spiffs,          ,  0x5A0000,
+app0,      app,  ota_0,    0x10000,  0x400000,
+app1,      app,  ota_1,    0x410000, 0x400000,
+model,     data, spiffs,   0x810000, 0xC0000,
+littlefs,  data, spiffs,   0x8D0000, 0x720000,

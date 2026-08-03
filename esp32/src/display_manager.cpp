@@ -1,21 +1,23 @@
 // ============================================================
-// DISPLAY_MANAGER.CPP — LVGL 9.x + TFT_eSPI (ILI9341)
-// TFT_eSPI initialise l'écran, LVGL lui est relié par _lv_flush_cb.
+// DISPLAY_MANAGER.CPP — LVGL 9.x + esp_lcd (ILI9341)
+// display_driver.h possède le bus SPI, LVGL lui est relié par _lv_flush_cb.
+// Le transfert est ASYNCHRONE : le rendu de la bande suivante recouvre
+// l'émission de la précédente, d'où le double buffer (LV_BUF_N).
 //
-// SquareLine est la source de vérité de l'UI : on ne touche ici qu'aux
-// VALEURS (textes, séries, plages), jamais à la structure ni à la
-// géométrie des objets générés. Les corrections de mise en page se font
-// dans SquareLine Studio.
+// SquareLine est la source de vérité de l'UI : on ne touche ici qu'aux VALEURS
+// des objets générés, jamais à leur structure ni à leur géométrie. EXCEPTION :
+// charts et tables sont code-owned (cf. _chart_build, _table_setup_structure).
 // ============================================================
 
 // ---- BIBLIOTHÈQUES ----
+#include <Arduino.h>
 #include <lvgl.h>
-#include <TFT_eSPI.h>
 #include <ArduinoJson.h>
 #include <string.h>
 
 // ---- RESSOURCES LOCALES ----
 #include "config.h"
+#include "display_driver.h"
 #include "../squareline/ui/ui.h"
 #include "display_manager.h"
 #include "sysinfo_manager.h"
@@ -31,16 +33,12 @@
 #define FLOAT_DEC(v)  ((int)(((v) - (int)(v)) * 10 + 0.5f) % 10)
 
 // LV_BUF_LINES/LV_BUF_BYTES et les JSON_*_SIZE vivent dans display_manager.h :
-// la page MEMOIRE de SysInfo les lit aussi (_si_alloc), et la ligne LVGL de sa
-// table avait déjà divergé de 3 840 o.
+// la page MEMOIRE de SysInfo les lit aussi (_si_alloc)
 
-// Cadence max de mise à jour des charts. Les données arrivent par rafales
-// toutes les ~5 s : traitées une par frame, elles provoquaient 6 à 8 repeints
-// au lieu d'un, chacun sur ~75 % de l'écran (ext_draw_size des scales).
+// Cadence max de mise à jour des charts (données en rafale toutes les ~5 s)
 #define CHART_REFRESH_MIN_INTERVAL_MS 1000
 
 // Instance partagée (extern depuis sysinfo_manager.cpp)
-TFT_eSPI _tft;
 
 static lv_display_t* _disp = nullptr;
 static lv_color_t*   _buf1 = nullptr;
@@ -56,9 +54,8 @@ static lv_chart_series_t* _chart_nas_net_out = nullptr;   // (débit MB/s, avec 
 static lv_chart_series_t* _chart_fb_down   = nullptr;
 static lv_chart_series_t* _chart_fb_up     = nullptr;
 
-// Les charts sont créés en CODE (plus dans SquareLine — cf. _chart_build), comme
-// les tables. Objets + labels d'échelle min/mid/max faits main, l'échelle
-// SquareLine étant partie avec le widget.
+// Charts créés en CODE (cf. _chart_build), comme les tables. Labels d'échelle
+// min/mid/max faits main, l'échelle SquareLine étant partie avec le widget.
 static lv_obj_t* _chart_nas = nullptr;
 static lv_obj_t* _chart_fb  = nullptr;
 
@@ -68,8 +65,8 @@ static lv_obj_t* _nas_lblR[3] = {nullptr, nullptr, nullptr};   // droite : R/W (
 static lv_obj_t* _fb_lblL[3]  = {nullptr, nullptr, nullptr};   // gauche : RX (×10 -> /10)
 static lv_obj_t* _fb_lblR[3]  = {nullptr, nullptr, nullptr};   // droite : TX (×10 -> /10)
 
-// Dernière plage appliquée par axe : les labels ne sont réécrits qu'au changement
-// (lv_label_set_text invalide même à texte identique — règle du projet).
+// Dernière plage par axe : les labels ne sont réécrits qu'au changement
+// (lv_label_set_text invalide même à texte identique).
 static int32_t _nas_rangeL = -1, _nas_rangeR = -1;
 static int32_t _fb_rangeL  = -1, _fb_rangeR  = -1;
 
@@ -78,8 +75,7 @@ static bool _fb_chart_dirty  = false;
 static unsigned long _last_chart_refresh = 0;
 
 // Cache des dernières valeurs reçues, tenu à jour quel que soit l'écran actif :
-// garde les charts continus et permet de rattraper l'affichage à l'entrée sur
-// l'écran, sans attendre le prochain message MQTT.
+// garde les charts continus et rattrape l'affichage à l'entrée sur l'écran.
 static struct {
     int   cpu = 0;
     int   ram = 0;
@@ -104,8 +100,7 @@ static struct {
 } _fb_state;
 
 // Points de chart EN ATTENTE — déposés par les display_update_*, dépilés tous
-// dans UNE frame par display_loop (cf. CHART_REFRESH_MIN_INTERVAL_MS). Aucun
-// point perdu : le dépilage tourne bien plus vite que la publication (~5 s).
+// dans UNE frame par display_loop (cf. CHART_REFRESH_MIN_INTERVAL_MS).
 static struct {
     bool  has_cpu = false, has_ram = false, has_read = false, has_write = false;
     bool  has_net_in = false, has_net_out = false;
@@ -151,25 +146,40 @@ static bool          _ai_return_armed     = false;    // armé à l'entrée voca
 static bool _display_paused  = false;
 static volatile bool _force_redraw = false;
 static bool _ai_was_speaking = false;
-static bool _ota_screen_init = false;   // cf. display_show_ota_progress
 
-// Vrai pendant lv_timer_handler(), donc pendant les écritures SPI de
-// _lv_flush_cb. Lu depuis ota_task : volatile obligatoire (l'autre cœur ne
-// verrait sinon jamais le changement, le compilateur gardant la valeur en
-// registre). Un octet écrit/lu par un seul écrivain — pas besoin de mutex.
+// Vrai pendant lv_timer_handler(), donc pendant les écritures SPI. Lu depuis
+// ota_task, d'où le volatile. Un seul écrivain : pas besoin de mutex.
 static volatile bool _in_lvgl = false;
 #define DISPLAY_PAUSE_TIMEOUT_MS 1000
 
 // Instrumentation du rendu, relevée avec les "slow frame" : distingue un
-// redessin plein écran (chercher QUI invalide) d'un petit nombre de pixels
-// coûteux (le temps est dans le rendu, pas dans le SPI).
+// redessin plein écran d'un petit nombre de pixels coûteux.
 static uint16_t _flush_count = 0;
 static uint32_t _flush_px    = 0;
 static int16_t  _flush_x1 = 0, _flush_y1 = 0, _flush_x2 = 0, _flush_y2 = 0;
 
-// Espion d'invalidation, armé par display_spy_invalidations() (cmd "spy").
-// Les "slow frame" ne donnent que l'UNION des zones ; LV_EVENT_INVALIDATE_AREA
-// donne chaque rectangle AVANT fusion, donc le widget responsable.
+// Attente du BUS, µs cumulés sur la frame : mise en file du transfert ET
+// attente entre bandes. Sépare le coût de TRANSFERT de celui de RENDU.
+static uint32_t _flush_us = 0;
+
+#define LVGL_SLOW_FRAME_MS 100
+
+// ⚠️ Les buffers LVGL doivent être en RAM INTERNE : la PSRAM n'est pas
+// DMA-capable et le repli silencieux rendrait un écran noir.
+static bool _buf_psram = false;
+
+// Écran LVGL, mémorisé pour signaler la fin de transfert depuis l'ISR.
+static lv_display_t* _disp_for_isr = nullptr;
+
+// Fin de transfert, appelée depuis l'ISR SPI. lv_display_flush_ready() est la
+// SEULE fonction LVGL autorisée ici — tout autre appel serait un bug de
+// thread-safety. Pas d'IRAM_ATTR : l'ISR d'esp_lcd n'est pas en IRAM non plus.
+static void _on_flush_done(void) {
+    if (_disp_for_isr) lv_display_flush_ready(_disp_for_isr);
+}
+
+// Espion d'invalidation, armé par display_spy_invalidations() (cmd "spy") :
+// chaque rectangle AVANT fusion, donc le widget responsable.
 static volatile uint8_t _spy_remaining = 0;
 
 // ---- HELPERS ----
@@ -182,10 +192,9 @@ static volatile uint8_t _spy_remaining = 0;
 #define CHART_H       95
 #define CHART_POINTS  30
 
-// Palette métier — chaque métrique une couleur, portée par son readout ET sa
-// courbe ET son label d'échelle. ⚠️ DOIT rester alignée sur les couleurs des
-// readouts dans SquareLine (ui_ScreenNAS/Freebox.c) : si l'une change là-bas,
-// la mettre à jour ici (paire SquareLine/code, comme ailleurs dans le projet).
+// Palette métier — une couleur par métrique, portée par son readout, sa courbe
+// et son label d'échelle. ⚠️ PAIRE SquareLine/code : à resynchroniser si une
+// couleur de readout change dans ui_ScreenNAS/Freebox.c.
 #define COL_CPU    lv_color_hex(0xFFFF00)
 #define COL_RAM    lv_color_hex(0x0088FF)
 #define COL_READ   lv_color_hex(0x00FF00)
@@ -194,9 +203,8 @@ static volatile uint8_t _spy_remaining = 0;
 #define COL_TX     lv_color_hex(0xFF8800)
 
 // Moteur générique : crée un chart (géométrie + style + 6 labels d'échelle) sur
-// `screen`, remplit lblL/lblR ([0]=max, [1]=mid, [2]="0" figé), colore les labels
-// par côté. Les SÉRIES sont ajoutées par l'appelant (noms référencés ailleurs).
-// Factorise ce qui était dupliqué NAS/Freebox — esprit du moteur de tables.
+// `screen`, remplit lblL/lblR ([0]=max, [1]=mid, [2]="0" figé), colore les
+// labels par côté. Les SÉRIES sont ajoutées par l'appelant.
 static lv_obj_t* _chart_build(lv_obj_t* screen, lv_color_t colL, lv_color_t colR,
                               lv_obj_t* lblL[3], lv_obj_t* lblR[3]) {
     lv_obj_t* ch = lv_chart_create(screen);
@@ -286,9 +294,8 @@ static void _refresh_chart_fb() {
     lv_chart_refresh(_chart_fb);
 }
 
-// Dépile un point en attente vers sa série. Le dépilage est inconditionnel
-// (sur écran inactif LVGL bloque l'invalidation, c'est gratuit et l'historique
-// reste continu) ; seul le marquage "dirty" dépend de l'écran affiché.
+// Dépile un point en attente vers sa série. Inconditionnel — seul le marquage
+// "dirty" dépend de l'écran affiché.
 static void _chart_push_pending(bool& pending, lv_obj_t* chart, lv_chart_series_t* ser,
                                 int value, lv_obj_t* screen, bool& dirty) {
     if (!pending) return;
@@ -317,11 +324,10 @@ static void _json_buf_set(char* dst, size_t size, const char* json) {
 
 // ---- API LOCALES ----
 
-// --- LVGL / TFT_eSPI ---
+// --- LVGL / dalle ---
 
 static void _invalidate_spy_cb(lv_event_t* e) {
-    // Lecture/écriture explicites : `_spy_remaining--` sur un volatile est
-    // déprécié en C++20.
+    // `_spy_remaining--` sur un volatile est déprécié en C++20.
     uint8_t n = _spy_remaining;
     if (n == 0) return;
     _spy_remaining = n - 1;
@@ -331,8 +337,22 @@ static void _invalidate_spy_cb(lv_event_t* e) {
              (int)(a->x2 - a->x1 + 1), (int)(a->y2 - a->y1 + 1));
 }
 
-// TFT_eSPI attend du RGB565 big-endian ; LVGL 9 le produit déjà en
-// LV_COLOR_FORMAT_RGB565_SWAPPED, on le passe directement.
+// LVGL 9 produit du LV_COLOR_FORMAT_RGB565_SWAPPED, ce que la dalle attend sur
+// le fil : le buffer part au DMA sans conversion.
+//
+// ⚠️ lv_display_flush_ready() n'est PAS appelé ici mais depuis _on_flush_done(),
+// l'ISR de fin de transfert : c'est ce qui permet à LVGL de dessiner la bande
+// suivante dans l'AUTRE buffer pendant que celle-ci est émise. Rendre la main
+// tout de suite écraserait le buffer sous le transfert.
+// ⚠️ Le wait_cb n'est pas optionnel POUR MESURER : sans lui LVGL attend en
+// boucle vide (lv_refr.c : `while (disp->flushing);`) et ce temps — du bus
+// pur — se compte comme du RENDU.
+static void _lv_flush_wait_cb(lv_display_t* disp) {
+    uint32_t us0 = micros();
+    while (panel_busy()) { }
+    _flush_us += micros() - us0;
+}
+
 static void _lv_flush_cb(lv_display_t* disp, const lv_area_t* area, uint8_t* px_map) {
     uint32_t w = (area->x2 - area->x1 + 1);
     uint32_t h = (area->y2 - area->y1 + 1);
@@ -349,12 +369,10 @@ static void _lv_flush_cb(lv_display_t* disp, const lv_area_t* area, uint8_t* px_
     _flush_count++;
     _flush_px += w * h;
 
-    _tft.startWrite();
-    _tft.setAddrWindow(area->x1, area->y1, w, h);
-    _tft.pushPixels((uint16_t*)px_map, w * h);
-    _tft.endWrite();
-
-    lv_display_flush_ready(disp);
+    // Attente RÉSIDUELLE du bus : ce que le rendu n'a pas masqué.
+    uint32_t us0 = micros();
+    panel_flush(area->x1, area->y1, area->x2, area->y2, px_map);
+    _flush_us += micros() - us0;
 }
 
 // --- Companion IA (ui_ScreenAI) ---
@@ -405,8 +423,7 @@ static void _fb_apply_all() {
 
 // --- Table générique ---
 // Le lv_table est persistant : détruit/recréé uniquement au changement de
-// source (navigation), pas à chaque message MQTT — un simple rafraîchissement
-// ne fait que réécrire les valeurs des cellules.
+// source, pas à chaque message MQTT.
 
 static void _table_setup_structure(TableSource source, const char* title,
                                    const char* col_headers[], const uint16_t col_widths[],
@@ -434,14 +451,13 @@ static void _table_setup_structure(TableSource source, const char* title,
     lv_obj_set_y(_lv_table, 35);
     lv_obj_set_width(_lv_table, 320);
     lv_obj_set_height(_lv_table, 170);   // laisse place au bouton Next à y=205
-    // ui_font_Font10 (plage 0x20-0x17F) au lieu de montserrat_10 (ASCII seul) :
-    // les accents des noms/titres venant du NAS/Freebox s'affichent enfin.
+    // ⚠️ ui_font_Font10 est en plage 0x20-0x17F, montserrat_10 en ASCII seul :
+    // sans ça les accents des noms NAS/Freebox disparaissent.
     lv_obj_set_style_text_font(_lv_table, &ui_font_Font10, LV_PART_ITEMS);
     lv_obj_set_style_pad_top(_lv_table, 3, LV_PART_ITEMS);
     lv_obj_set_style_pad_bottom(_lv_table, 3, LV_PART_ITEMS);
 
-    // Fond transparent = couleur de l'écran. Le « card » gris du thème LVGL par
-    // défaut nuisait à la lisibilité. MAIN = le cadre, ITEMS = les cellules.
+    // Fond transparent = couleur de l'écran. MAIN = le cadre, ITEMS = les cellules.
     lv_obj_set_style_bg_opa(_lv_table, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_style_border_width(_lv_table, 0, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(_lv_table, LV_OPA_TRANSP, LV_PART_ITEMS);
@@ -564,54 +580,63 @@ static void _table_load(TableSource source) {
 void display_init() {
     log_line("[Display] Init start");
 
-    _tft.init();   // utilise le ILI9341_Init.h custom
-    _tft.setRotation(1);
-    _tft.fillScreen(TFT_BLACK);
-    // Après init() pour ne pas conflicter avec le LEDC de TFT_eSPI.
+    // LV_BUF_BYTES est le plus gros flush du firmware : les bandes de rebond de
+    // l'OTA (8 lignes) tiennent dedans.
+    if (!panel_init(_on_flush_done, LV_BUF_BYTES)) {
+        log_line("[Display] FATAL: dalle indisponible");
+        return;
+    }
     analogWrite(TFT_BL, map(DISPLAY_BRIGHTNESS_DEFAULT, 0, 100, 0, 255));
-
-    log_line("[Display] TFT_eSPI OK");
 
     lv_init();
 
-    // Buffer de dessin en RAM INTERNE. En PSRAM (2 × 40 lignes) le rendu était
-    // bien plus lent : 115 ms pour un plein écran dont ~31 ms seulement de SPI,
-    // le reste passé à écrire puis relire la PSRAM.
-    _buf1 = (lv_color_t*)heap_caps_malloc(LV_BUF_BYTES,
-                                          MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    // Buffer UNIQUE volontairement : le flush est synchrone (pushPixels, copie CPU
-    // sans DMA), un second ne recouvrirait rien.
-    // ⚠️ Double buffer 2×12 + flush DMA (pushPixelsDMA) TENTÉ le 2026-07-28 : ÉCHEC
-    // sur ce S3+HSPI. Écran NOIR (endWrite() termine la transaction avant la fin
-    // du DMA → pixels jamais sortis) ; et même en version DMA bloquante la frame
-    // plein écran est PLUS lente (156 ms vs 124, 20 flush vs 14 : l'overhead DMA
-    // par bande dépasse le SPI recouvrable, ~13 ms sur 124). Ne pas rouvrir.
-    _buf2 = nullptr;
-
+    // Buffer de dessin (RAM INTERNE, et en PSRAM si débordement)
+    _buf1 = (lv_color_t*)heap_caps_malloc(LV_BUF_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!_buf1) {
-        // Repli PSRAM plutôt qu'un écran mort : lent, mais fonctionnel.
-        log_line("[Display] Buffer interne KO (%u o) → repli PSRAM, rendu lent",
-                 (unsigned)LV_BUF_BYTES);
-        _buf1 = (lv_color_t*)heap_caps_malloc(LV_BUF_BYTES, MALLOC_CAP_SPIRAM);
+        log_line("[Display] Buffer1: RAM interne indisponible → fallback PSRAM");
+        _buf1 = (lv_color_t*)heap_caps_malloc(LV_BUF_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        _buf_psram = true;
     }
-    if (!_buf1) {
-        log_line("[Display] FATAL: Buffer1 FAIL");
+
+    if (LV_BUF_N == 2) {
+        _buf2 = (lv_color_t*)heap_caps_malloc(LV_BUF_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (!_buf2) {
+            log_line("[Display] Buffer2: RAM interne indisponible → fallback PSRAM");
+            _buf2 = (lv_color_t*)heap_caps_malloc(LV_BUF_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            _buf_psram = true;
+        }
+    } else {
+        _buf2 = nullptr;
+    }
+
+    if (!_buf1 || (LV_BUF_N == 2 && !_buf2)) {
+        log_line("[Display] FATAL: impossible d'allouer les buffers LVGL");
         return;
     }
-    log_line("[Display] Buffer LVGL : %u o (%d lignes de %d px)",
-             (unsigned)LV_BUF_BYTES, LV_BUF_LINES, SCREEN_WIDTH);
 
-    // En PSRAM : simples zones de données relues à l'ouverture de l'écran Table,
-    // jamais dans une boucle de rendu.
+    log_line("[Display] %u buffer(s) LVGL : %u o (%d lignes de %d px)",
+             (unsigned)LV_BUF_N, (unsigned)(LV_BUF_BYTES * LV_BUF_N), LV_BUF_LINES, SCREEN_WIDTH);
+
+    // Un seul buffer = LVGL attend chaque transfert : sûr, mais aucun
+    // recouvrement. À ne laisser que le temps d'un diagnostic.
+    if (LV_BUF_N != 2) log_line("[Display] ATTENTION: 1 seul buffer, aucun recouvrement");
+
+    // ⚠️ Un buffer en PSRAM casse le DMA : le log évite d'avoir à diagnostiquer
+    // un écran noir.
+    if (_buf_psram) log_line("[Display] ATTENTION: buffer LVGL en PSRAM, DMA impossible");
+
+    // En PSRAM : relues à l'ouverture de l'écran Table, jamais en boucle de rendu.
     _json_nas_disks       = _json_buf_alloc(JSON_NAS_DISKS_SIZE);
     _json_nas_downloads   = _json_buf_alloc(JSON_NAS_DOWNLOADS_SIZE);
     _json_nas_connections = _json_buf_alloc(JSON_NAS_CONNECTIONS_SIZE);
     _json_fbx_devices     = _json_buf_alloc(JSON_FBX_DEVICES_SIZE);
 
     _disp = lv_display_create(SCREEN_WIDTH, SCREEN_HEIGHT);
+    _disp_for_isr = _disp;   // cible de _on_flush_done, hors contexte LVGL
     lv_display_set_default(_disp);
     lv_display_set_color_format(_disp, LV_COLOR_FORMAT_RGB565_SWAPPED);
     lv_display_set_flush_cb(_disp, _lv_flush_cb);
+    lv_display_set_flush_wait_cb(_disp, _lv_flush_wait_cb);
     lv_display_add_event_cb(_disp, _invalidate_spy_cb, LV_EVENT_INVALIDATE_AREA, nullptr);
     lv_display_set_buffers(_disp, _buf1, _buf2, LV_BUF_BYTES, LV_DISPLAY_RENDER_MODE_PARTIAL);
 
@@ -635,11 +660,8 @@ void display_init() {
     log_line("[Display] UI OK");
 
     // --- Charts (créés ici, plus dans SquareLine) ---
-    // Courbes ET labels d'échelle prennent la couleur de charte de leur métrique.
-    // NAS gauche : CPU/RAM (%). Droite : 4 débits MB/s (R/W disque + réseau IN/OUT).
-    // Le label d'échelle prend la couleur de la série primaire de l'axe (gauche
-    // CPU, droite Read) ; les autres restent lisibles via leur readout coloré.
-    // COL_RX/COL_TX = couleurs génériques réception/émission (readouts Net In/Out).
+    // NAS gauche : CPU/RAM (%). Droite : 4 débits MB/s (R/W disque + réseau).
+    // Le label d'échelle prend la couleur de la série primaire de l'axe.
     _chart_nas = _chart_build(ui_ScreenNAS, COL_CPU, COL_READ, _nas_lblL, _nas_lblR);
     _chart_nas_cpu     = lv_chart_add_series(_chart_nas, COL_CPU,   LV_CHART_AXIS_PRIMARY_Y);
     _chart_nas_ram     = lv_chart_add_series(_chart_nas, COL_RAM,   LV_CHART_AXIS_PRIMARY_Y);
@@ -761,10 +783,9 @@ void display_loop() {
         _force_redraw = false;
         lv_obj_invalidate(lv_scr_act());
     }
-    // Retour auto à l'écran précédent après inactivité sur l'écran IA (entrée
-    // vocale/MQTT). Désarmé dès qu'on quitte l'IA autrement (bouton Back, nav).
-    // Jamais pendant une conversation : garde sur AI_IDLE. Inactivité = le plus
-    // récent d'un changement d'état IA ou d'un toucher écran.
+    // Retour auto à l'écran précédent après inactivité sur l'écran IA. Jamais
+    // pendant une conversation : garde sur AI_IDLE. Inactivité = le plus récent
+    // d'un changement d'état IA ou d'un toucher écran.
     if (_ai_return_armed) {
         if (lv_scr_act() != ui_ScreenAI) {
             _ai_return_armed = false;
@@ -807,19 +828,32 @@ void display_loop() {
 
     _flush_count = 0;
     _flush_px    = 0;
+    _flush_us    = 0;
 
     unsigned long t0 = millis();
     _in_lvgl = true;
     lv_timer_handler();
+
+    // ⚠️ Aucun transfert ne doit rester en vol quand loopTask rend la main :
+    // ota_task croirait le bus libre. Coût nul s'il n'y a rien à attendre.
+    {
+        uint32_t us_tail = micros();
+        panel_wait();
+        _flush_us += micros() - us_tail;
+    }
+
     _in_lvgl = false;
     unsigned long dt = millis() - t0;
 
-    // Format compact : LOG_LINE_LEN vaut 100 OCTETS, dont 10 d'horodatage.
-    if (dt > 100) {
-        uint32_t pct = (_flush_px * 100) / ((uint32_t)SCREEN_WIDTH * SCREEN_HEIGHT);
-        log_line("[LVGL] slow %lums — %u flush, %lu px (%lu%%), (%d,%d)-(%d,%d)",
-                 dt, (unsigned)_flush_count, (unsigned long)_flush_px, (unsigned long)pct,
-                 (int)_flush_x1, (int)_flush_y1, (int)_flush_x2, (int)_flush_y2);
+    // Détail du flush (pixels, zone, % de l'écran, part du bus).
+    if (dt > LVGL_SLOW_FRAME_MS) {
+        uint32_t pct    = (_flush_px * 100) / ((uint32_t)SCREEN_WIDTH * SCREEN_HEIGHT);
+        uint32_t spi_ms = _flush_us / 1000;
+        uint32_t spi_pc = dt ? (uint32_t)(_flush_us / 10 / dt) : 0;   // % de la frame
+        log_line("[LVGL] slow frame %lums - SPI %lums (%lu%%) | %u flush, %lu px (%d,%d)-(%d,%d) (%lu%%)",
+                 dt,(unsigned long)spi_ms, (unsigned long)spi_pc,
+                 (unsigned)_flush_count, (unsigned long)_flush_px,
+                 (int)_flush_x1, (int)_flush_y1, (int)_flush_x2, (int)_flush_y2, (unsigned long)pct);
     }
 
     bool speaking_now = audio_is_playing;
@@ -827,29 +861,27 @@ void display_loop() {
     _ai_was_speaking = speaking_now;
 }
 
-// LVGL et OTA partagent le même bus SPI sans mutex (SUPPORT_TRANSACTIONS
-// désactivé) : une écriture concurrente corrompt la liaison avec l'écran.
+// LVGL et les écrans OTA partagent le bus SPI de la dalle.
 //
-// ⚠️ Poser le drapeau NE SUFFIT PAS, et c'est ce qui faisait paniquer un OTA sur
-// trois : il n'empêche que la frame SUIVANTE. Au moment où ota_task (cœur 0)
-// appelle ceci, loopTask (cœur 1) peut être DANS lv_timer_handler(), donc dans
-// _lv_flush_cb entre startWrite() et endWrite(). L'appelant enchaînait alors
-// sur display_show_ota_progress() -> _tft.fillScreen(), ouvrant une seconde
-// transaction SPI sur le même _tft — abort du pilote, reset "panic".
-// On attend donc la sortie effective de LVGL avant de rendre la main.
+// ⚠️ Poser le drapeau NE SUFFIT PAS : il n'empêche que la frame SUIVANTE, alors
+// que loopTask peut être DANS lv_timer_handler() au moment de l'appel — deux
+// écrivains sur le même bus, abort du pilote, panic. On attend donc la sortie
+// effective de LVGL, PUIS la fin du transfert en vol.
 void display_pause() {
     _display_paused = true;
 
-    // Pas de deadlock : le seul appelant est ota_task (cœur 0, priorité 2),
-    // loopTask tourne sur l'autre cœur et progresse toujours. Le timeout ne
-    // couvre qu'une frame lente (270 ms mesurés au pire) avec large marge ;
-    // l'atteindre signalerait un blocage réel, d'où le log.
+    // Pas de deadlock : le seul appelant est ota_task, sur l'autre cœur.
+    // Atteindre le timeout signalerait un blocage réel, d'où le log.
     unsigned long t0 = millis();
     while (_in_lvgl && millis() - t0 < DISPLAY_PAUSE_TIMEOUT_MS) {
         vTaskDelay(pdMS_TO_TICKS(1));
     }
     if (_in_lvgl) log_line("[Display] pause : LVGL toujours actif apres %lu ms",
                            (unsigned long)DISPLAY_PAUSE_TIMEOUT_MS);
+
+    // Le transfert en cours doit être sorti avant que l'appelant (écrans OTA)
+    // ne prenne le bus à son tour.
+    panel_wait();
 }
 
 void display_resume() {
@@ -906,11 +938,10 @@ void display_show_TABLE_FBX_ACTIVITY(lv_event_t* e) {
 
 // --- NAS ---
 //
-// Pattern commun : le point de chart part dans _nas_chart_pending (jamais poussé
-// directement), et le label n'est réécrit QUE si la valeur change —
-// lv_label_set_text invalide même à texte identique, et sur un NAS au repos
-// cpu/ram/temp ne bougent pas d'une publication à l'autre. L'écran reste juste
-// à l'entrée grâce à _nas_apply_all() sur SCREEN_LOADED.
+// Pattern commun : le point de chart part dans _nas_chart_pending (jamais
+// poussé directement), et le label n'est réécrit QUE si la valeur change —
+// lv_label_set_text invalide même à texte identique. Rattrapage à l'entrée
+// sur l'écran par _nas_apply_all() sur SCREEN_LOADED.
 
 void display_update_nas_cpu(int percent) {
     bool changed = (percent != _nas_state.cpu);
@@ -1088,9 +1119,8 @@ void display_update_fb_devices(const char* json) {
 
 // --- Utils ---
 
-// Déclarée dans un en-tête PRIVÉ de LVGL (lv_obj_draw_private.h) que lvgl.h
-// n'inclut pas : on redéclare le prototype plutôt que de parier sur le chemin
-// d'inclusion retenu par PlatformIO. Sert au dump d'arbre uniquement.
+// Déclarée dans un en-tête PRIVÉ de LVGL que lvgl.h n'inclut pas : on redéclare
+// le prototype plutôt que de parier sur le chemin d'inclusion de PlatformIO.
 extern "C" int32_t lv_obj_get_ext_draw_size(const lv_obj_t* obj);
 
 static const char* _obj_class_name(lv_obj_t* o) {
@@ -1111,19 +1141,16 @@ static void _tree_rec(lv_obj_t* o, int depth) {
     lv_obj_get_coords(o, &a);
     char txt[20] = "";
     if (lv_obj_get_class(o) == &lv_label_class) {
-        // Troncature UTF-8-safe : ne JAMAIS couper au milieu d'une séquence
-        // multi-octets (sinon octet orphelin → � dans le log). Au plus ~12 octets,
-        // puis on recule tant que le point de coupe tombe sur un octet de
-        // continuation (10xxxxxx). Le `°C` du label Temp reste ainsi intact.
+        // ⚠️ Troncature UTF-8-safe : couper au milieu d'une séquence multi-octets
+        // donne un � dans le log. On recule sur les octets de continuation.
         const char* s = lv_label_get_text(o);
         size_t keep = 0;
         while (s[keep] && keep < 12) keep++;
         while (keep > 0 && ((unsigned char)s[keep] & 0xC0) == 0x80) keep--;
         snprintf(txt, sizeof(txt), " '%.*s'", (int)keep, s);
     }
-    // ext_draw_size : marge que LVGL ajoute AUTOUR de l'objet à l'invalidation,
-    // pour couvrir ce qui déborde. C'est elle qui transforme un chart de 280x95
-    // en repeint de 320x179.
+    // ext_draw_size : marge ajoutée par LVGL AUTOUR de l'objet à l'invalidation.
+    // C'est elle qui transforme un chart de 280x95 en repeint de 320x179.
     int32_t ext = lv_obj_get_ext_draw_size(o);
     log_line("[TREE]%*s%s%s (%d,%d)-(%d,%d) ext%d", depth * 2, "", _obj_class_name(o), txt,
              (int)a.x1, (int)a.y1, (int)a.x2, (int)a.y2, (int)ext);
@@ -1138,12 +1165,12 @@ void display_dump_tree() {
                      : scr == ui_ScreenAI      ? "AI"
                      : scr == ui_ScreenHome    ? "Home"
                      : scr == ui_ScreenTable   ? "Table" : "?";
-    log_line("[TREE] === ecran actif : %s (%u enfants) ===", name,
+    log_line("[TREE] === écran actif : %s (%u enfants) ===", name,
              (unsigned)lv_obj_get_child_count(scr));
     _tree_rec(scr, 0);
 
-    // Seuls objets hors écran actif que lv_obj_invalidate laisse atteindre le
-    // display : si un rectangle de l'espion ne correspond à rien, il vient d'ici.
+    // Seuls objets hors écran actif que lv_obj_invalidate laisse passer : un
+    // rectangle d'espion sans correspondance vient d'ici.
     if (lv_obj_get_child_count(lv_layer_top()) > 0) {
         log_line("[TREE] === layer_top ===");
         _tree_rec(lv_layer_top(), 0);
@@ -1156,76 +1183,25 @@ void display_dump_tree() {
 
 void display_spy_invalidations(uint8_t count) {
     _spy_remaining = count;
-    log_line("[LVGL] Espion arme — les %u prochaines invalidations seront tracees", (unsigned)count);
+    log_line("[LVGL] Espion armé — les %u prochaines invalidations seront tracées", (unsigned)count);
 }
 
-// Affichage en TFT_eSPI direct (hors LVGL) : reste visible même si LVGL est
-// bloqué pendant le transfert. Appelé depuis le callback OTA (tâche WiFi).
-void display_show_ota_progress(int percent) {
-    // ⚠️ Le décor ne se dessine qu'UNE fois, sur le seul _ota_screen_init.
-    // Le drapeau est remis à false aux deux sorties
-    // 100 % plus bas, et display_show_ota_error : un OTA suivant
-    // repart bien d'un écran propre sans cette condition.
-    if (!_ota_screen_init) {
-        _ota_screen_init = true;
-        _tft.fillScreen(TFT_BLACK);
-        _tft.setTextColor(TFT_CYAN, TFT_BLACK);
-        _tft.setTextSize(2);
-        const char* title = "MISE A JOUR OTA";
-        _tft.setCursor((SCREEN_WIDTH - strlen(title) * 12) / 2, 60);
-        _tft.print(title);
-        _tft.setTextSize(1);
-        _tft.setTextColor(TFT_WHITE, TFT_BLACK);
-        _tft.setCursor((SCREEN_WIDTH - 18 * 6) / 2, 90);
-        _tft.print("Ne pas eteindre !");
-        _tft.drawRect(20, 120, SCREEN_WIDTH - 40, 20, TFT_WHITE);
-    }
+// ⚠️ Repeint SYNCHRONE, et c'est tout l'intérêt : l'armement encadre exactement
+// lv_refr_now(), seule façon qu'aucune autre frame ne dépose de bandes dans le
+// buffer. Deux variantes asynchrones ont échoué là-dessus.
+// Prix : loopTask bloquée le temps d'un plein écran (~50 à 140 ms).
+bool display_capture_screen() {
+    if (!panel_capture_arm()) return false;
 
-    int barW = (int)((SCREEN_WIDTH - 42) * constrain(percent, 0, 100) / 100.0f);
-    _tft.fillRect(21, 121, barW, 18, TFT_GREEN);
+    lv_obj_invalidate(lv_scr_act());   // sans ça, seules les zones sales seraient repeintes
 
-    char buf[8];
-    snprintf(buf, sizeof(buf), " %3d%% ", percent);
-    _tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    _tft.setTextSize(2);
-    _tft.setCursor((SCREEN_WIDTH - 6 * 12) / 2, 150);
-    _tft.print(buf);
+    _in_lvgl = true;                   // même verrou que display_loop : ota_task doit nous voir
+    lv_refr_now(_disp);
+    panel_wait();                      // dernière bande sortie avant de rendre le bus
+    _in_lvgl = false;
 
-    if (percent >= 100) {
-        _ota_screen_init = false;
-        _tft.setTextColor(TFT_GREEN, TFT_BLACK);
-        _tft.setTextSize(1);
-        _tft.setCursor((SCREEN_WIDTH - 22 * 6) / 2, 180);
-        _tft.print("Redemarrage en cours...");
-    }
-}
-
-// Échec OTA, en TFT direct comme la barre de progression.
-void display_show_ota_error(const char* reason) {
-    _ota_screen_init = false;   // la prochaine progression repartira d'un écran propre
-
-    _tft.fillScreen(TFT_BLACK);
-    _tft.setTextColor(TFT_RED, TFT_BLACK);
-    _tft.setTextSize(2);
-    const char* title = "ECHEC OTA";
-    _tft.setCursor((SCREEN_WIDTH - strlen(title) * 12) / 2, 80);
-    _tft.print(title);
-
-    _tft.setTextSize(1);
-    _tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    _tft.setCursor((SCREEN_WIDTH - strlen(reason) * 6) / 2, 120);
-    _tft.print(reason);
-
-    _tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    const char* hint1 = "firmware precedent conserve";
-    _tft.setCursor((SCREEN_WIDTH - strlen(hint1) * 6) / 2, 145);
-    _tft.print(hint1);
-
-    _tft.setTextColor(TFT_WHITE, TFT_RED);
-    const char* hint2 = "FAITES UN NOUVEL ESSAI OU REDEMARREZ";
-    _tft.setCursor((SCREEN_WIDTH - strlen(hint2) * 6) / 2, 180);
-    _tft.print(hint2);
-
+    panel_capture_done();
+    return true;
 }
 
 void display_set_brightness(int percent) {
