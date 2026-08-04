@@ -80,14 +80,16 @@ pioarduino (`CONFIG_SR_WN_WN9_HIESP=y`, `CONFIG_SR_MN_EN_MULTINET7_QUANT=y`,
 
 ## Flasher le bin
 
-La partition `model` est à **`0x650000`** (calcul depuis `partitions.csv` : `app0` `0x10000`+`0x320000`
-→ `app1` → `0x650000`). Indépendant du firmware, par câble USB-C :
+La partition `model` est à **`0x810000`** — offset **explicite** dans `partitions.csv`, à relire là-bas
+plutôt qu'à recalculer. Indépendant du firmware, par câble USB-C :
 
 ```bash
-esptool.py --chip esp32s3 --port /dev/tty.usbmodemXXX --baud 921600 write_flash 0x650000 srmodels.bin
+esptool.py --chip esp32s3 --port /dev/tty.usbmodemXXX --baud 921600 write_flash 0x810000 srmodels.bin
 ```
 
-Un `pio run -t upload` ne touche **pas** cette partition.
+Un `pio run -t upload` par OTA ne touche **pas** cette partition ; par USB (`esptool`) si, via
+`extra_scripts/flash_assets.py`, qui lit l'offset dans `partitions.csv` et ajoute le modèle et l'image
+LittleFS aux images flashées.
 
 ---
 

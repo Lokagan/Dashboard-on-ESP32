@@ -70,7 +70,10 @@ ESP32-S3 (ES3C28P)
 - ✅ Interface web embarquée (port 80, `http_manager.cpp`) : gestionnaire de fichiers LittleFS (liste/téléchargement/suppression), visualiseur de logs circulaire (`GET /serial`), panneau de commandes ESP32
 - ✅ Assistant IA — outils appelés par le LLM lui-même (function calling) : **météo** (Open-Meteo ; prévisions demain / semaine, conditions décodées),
      **actualités** (flux RSS résumés à l'oral) et **recherche web** (DuckDuckGo) ;
-     page de config web à chaud (`http://<NAS>:8090/`) : voix, personnalité, modèle, météo, actualités, commandes vocales
+     page de config web à chaud (`http://<NAS>:8090/`) : voix, personnalité, modèle, mémoire, météo, actualités, commandes vocales
+- ✅ Mémoire persistante (`memory_manager.py`, SQLite + FTS5) — l'assistant retient d'une conversation à l'autre ce qui reste vrai
+     (prénoms, animaux, lieux, préférences) et se le voit réinjecté à chaque requête ; écriture automatique après chaque échange,
+     ou explicite (« retiens que… »), le tout consultable et corrigeable depuis la page de config
 - ✅ Détection par mot-clé (wake word) « Jarvis » via ESP_SR natif (`wakeword_manager.cpp`) — déclenche l'assistant IA sans appui bouton, en plus du bouton Rec et de MQTT
 - ✅ Écran « Activité réseau » — service en cours par appareil (YouTube, Steam…) déduit du journal DNS d'AdGuard Home (`activity_monitor.py`, port 8091)
 - ✅ Commandes `esp32/cmd` (navigation à distance, luminosité, volume, reboot, outils de diagnostic) pleinement exécutées via `mqtt_handle_esp_cmd()` — appelable depuis le topic MQTT `esp32/cmd` 
@@ -150,6 +153,8 @@ dashboard-projet/
     │   ├── bridge_monitor.py    # Assistant IA — bridge HTTP (STT/LLM/TTS + météo/actus)
     │   ├── bridge_defaults.json # Défauts des paramètres IA (versionné)
     │   ├── bridge_settings.json # Overrides sauvés par la page config (hors repo)
+    │   ├── memory_manager.py    # Mémoire persistante de l'assistant (SQLite + FTS5)
+    │   ├── memory.db            # Base des faits mémorisés (hors repo)
     │   ├── freebox_get_token.py # Générateur d'API_TOKEN Freebox
     │   ├── activity_monitor.py  # Activité réseau — lit le journal DNS AdGuard (port 8091)
     │   └── services.json        # Mapping domaine → service (éditable à chaud)
@@ -195,7 +200,7 @@ cp synology/monitor.env.example synology/monitor.env
 
 > Ne stockez jamais vos identifiants secrets publiquement.
 
-Les paramètres de l'assistant IA (voix, modèle, personnalité, météo, actualités, commandes vocales) ne sont **pas** dans `monitor.env` : leurs défauts vivent dans `synology/scripts/bridge_defaults.json` (versionné, sans secret) et se modifient à chaud depuis la page `http://<NAS>:8090/`. `bridge_settings.json` garde les réglages sauvés côté NAS (hors dépôt).
+Les paramètres de l'assistant IA (voix, modèle, personnalité, mémoire, météo, actualités, commandes vocales) ne sont **pas** dans `monitor.env` : leurs défauts vivent dans `synology/scripts/bridge_defaults.json` (versionné, sans secret) et se modifient à chaud depuis la page `http://<NAS>:8090/`. `bridge_settings.json` garde les réglages sauvés côté NAS (hors dépôt).
 
 L'écran **« Activité réseau »** (voir plus bas) s'appuie sur [AdGuard Home](https://adguard.com/adguard-home.html) installé sur le NAS comme résolveur DNS du réseau : renseignez `AGH_URL` / `AGH_USER` / `AGH_PASS` dans `monitor.env`. Le service `activity_monitor.py` interroge son journal DNS (page servie sur le port `8091`). Sans AdGuard, tout le reste fonctionne — seule la colonne « service » reste vide.
 
@@ -312,8 +317,23 @@ Accessible depuis le bouton dédié sur l'écran Home. Fonctionnement :
 - **Bouton Play** : rejoue la dernière réponse TTS reçue.
 - La question peut aussi être posée en texte via le topic MQTT `ai/ask` (bridge → ESP32 → `AI_BRIDGE_TEXT_URL`), avec un anti-doublon de 2s entre deux requêtes.
 - **Déclenchement mains-libres** : mot-clé « Jarvis » (ESP_SR natif, `wakeword_manager.cpp`), en plus du bouton Rec et de `ai/ask`.
-- **Outils** : le LLM décide seul d'appeler la **météo** (Open-Meteo ; actuel / demain / après-demain / semaine), les **actualités** (flux RSS) ou la **recherche web** (DuckDuckGo), le bridge exécute et lui renvoie le résultat pour qu'il rédige. Réglages à chaud sur `http://<NAS>:8090/` (voix, personnalité, modèle, outils, météo, actualités, commandes vocales). ⚠️ L'appel spontané d'outils dépend du **modèle** choisi, pas du prompt.
+- **Outils** : le LLM décide seul d'appeler la **météo** (Open-Meteo ; actuel / demain / après-demain / semaine), les **actualités** (flux RSS) ou la **recherche web** (DuckDuckGo), le bridge exécute et lui renvoie le résultat pour qu'il rédige. Réglages à chaud sur `http://<NAS>:8090/` (voix, personnalité, modèle, mémoire, outils, météo, actualités, commandes vocales). ⚠️ L'appel spontané d'outils dépend du **modèle** choisi, pas du prompt.
+- **Mémoire persistante** : l'assistant retient ce qui reste vrai d'une conversation à l'autre (cf. section dédiée ci-dessous).
 - États affichés : `idle`, `listening`, `thinking`, `speaking`, `error` — publiés sur `ai/status`.
+
+### Mémoire persistante de l'assistant
+
+L'historique conversationnel est court et purgé après quelques minutes d'inactivité. La mémoire, elle, garde **des faits durables** : prénoms, animaux, lieux, métier, préférences. `synology/scripts/memory_manager.py` les range dans une base SQLite (`memory.db`, hors dépôt) sous forme **une clé canonique → une valeur** — `animal.chat.nom → Mao` — de sorte qu'un fait corrigé écrase l'ancien au lieu de s'empiler à côté. Recherche plein texte par FTS5, sans aucune dépendance hors bibliothèque standard.
+
+**Lecture** — les faits sont **injectés dans le prompt système** à chaque requête : aucun appel LLM supplémentaire, aucune latence ajoutée. Un outil `search_memory` complète au-delà de ce qui est injecté. ⚠️ L'injection n'est pas un détail d'optimisation : reposer sur le seul outil rendrait la mémoire muette avec les modèles qui n'appellent pas leurs outils spontanément.
+
+**Écriture** — deux chemins :
+- **automatique** : après *chaque* échange, une passe d'analyse extrait ce qui mérite d'être retenu. Elle tourne dans un thread détaché lancé **après** l'envoi de la réponse, donc elle ne retarde jamais la parole. Coût : un appel LLM de plus par échange, débrayable depuis la page ;
+- **explicite** : « retiens que mon chat s'appelle Mao » — confirmation vocale immédiate. Un mot-clé déclencheur, réglable.
+
+⚠️ Aucun **oubli** automatique : seule une demande explicite efface un fait. Les transcriptions douteuses (Whisper produit parfois un générique de sous-titres sur du bruit) sont écartées avant la passe automatique — dans l'historique court ces parasites se purgent seuls, en mémoire ils seraient définitifs.
+
+L'onglet **Mémoire** de `http://<NAS>:8090/` liste les faits, permet d'en corriger la valeur, d'en oublier un, de tout effacer, et règle le nombre de faits injectés, le plafond total (éviction du moins récemment utilisé) et les mots-clés.
 
 ### Écran Activité réseau (AdGuard Home)
 
@@ -369,7 +389,7 @@ Pour plus de détails, voir `docs/mqtt_topics.md`.
 - **Mot de passe OTA** : `ota_manager.cpp` ne fixe un mot de passe OTA que si `OTA_PASSWORD` est défini dans `config.h`. Sur un réseau non maîtrisé, définissez-le, et reportez la même valeur dans `esp32/ota.local.ini` (gitignoré) pour le téléversement OTA, afin d'éviter qu'un tiers ne flashe l'ESP32 via WiFi.
 - **⚠️ Ce montage suppose un réseau local de confiance** : le broker MQTT accepte les connexions anonymes (`allow_anonymous true`), et ni la page web de l'ESP32 ni les deux pages de configuration du NAS (ports 8090 et 8091) ne demandent d'authentification. Sur un réseau partagé (colocation, réseau invité), n'importe qui peut lire les métriques ou publier sur `esp32/cmd`. Prévoyez au minimum un mot de passe Mosquitto et un reverse proxy devant les pages de config.
 - **Captures vocales** : chaque enregistrement envoyé au bridge par `saverec` ou le test loopback est archivé en WAV horodaté dans `synology/scripts/captures/` (hors dépôt) et **n'est jamais purgé automatiquement**. Pensez à faire le ménage.
-- **Secrets** : `config.h` (`WIFI_SSID`, `WIFI_PASSWORD`, `OTA_PASSWORD`) et `synology/monitor.env` (mots de passe NAS, clé Groq, token Freebox) contiennent des secrets en clair. Ces deux fichiers sont **exclus du dépôt** par le `.gitignore` racine (avec `scripts/bridge_settings.json` et `scripts/captures/`) ; seuls les modèles `config.h.example` et `monitor.env.example` sont versionnés. Ne jamais forcer l'ajout des vrais fichiers (`git add -f`).
+- **Secrets** : `config.h` (`WIFI_SSID`, `WIFI_PASSWORD`, `OTA_PASSWORD`) et `synology/monitor.env` (mots de passe NAS, clé Groq, token Freebox) contiennent des secrets en clair. Ces deux fichiers sont **exclus du dépôt** par le `.gitignore` racine (avec `scripts/bridge_settings.json`, `scripts/memory.db` et `scripts/captures/`) ; seuls les modèles `config.h.example` et `monitor.env.example` sont versionnés. Ne jamais forcer l'ajout des vrais fichiers (`git add -f`).
 - **Audio** : le rendu (tons, fanfare, lecture) et l'enregistrement micro tournent sur une tâche FreeRTOS dédiée au cœur 1, afin de ne jamais bloquer `loop()` (LVGL, touch, OTA). La réception MQTT tourne elle aussi sur sa propre tâche (esp-mqtt), `loop()` ne fait qu'appliquer les valeurs déjà parsées.
 - **`esp32/status`** : publié en `"online"` sur `MQTT_EVENT_CONNECTED`, et un **Last Will Testament** est configuré (`cfg.session.last_will` dans `mqtt_manager.cpp`), donc le broker publie automatiquement `"offline"` en cas de déconnexion brutale de l'ESP32.
 - **Bridge IA** : `AI_BRIDGE_URL` / `AI_BRIDGE_TEXT_URL` pointent vers `synology/scripts/bridge_monitor.py` (serveur Flask, port 8090), lancé dans le même container Docker que `nas_monitor.py`/`freebox_monitor.py` via `monitor.py`.
@@ -399,4 +419,3 @@ Ce projet est distribué sous licence **GNU General Public License v3.0** — vo
 - Intégration Home Assistant
 - Capteurs ESP32 supplémentaires
 - Support multi-broker MQTT (ou plusieurs Dashboard)
-- mettre en place une mémoire persistante pour la LLLM (type SQL), sous la forme d'un memory_manager.py
