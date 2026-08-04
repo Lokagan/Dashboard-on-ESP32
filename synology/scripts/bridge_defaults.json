@@ -11,6 +11,11 @@
   "weather_lon": 2.3522219,
   "news_feeds": ["https://www.francetvinfo.fr/titres.rss", "https://www.lemonde.fr/rss/une.xml"],
   "news_count": 6,
+  "memory_enabled": true,
+  "memory_auto": true,
+  "memory_max_facts": 200,
+  "memory_profile_limit": 40,
+  "memory_keywords": ["retiens", "rappelle toi", "souviens toi", "mémorise", "note que", "oublie"],
   "command_keywords": ["pilote"],
   "command_tools": [
     {

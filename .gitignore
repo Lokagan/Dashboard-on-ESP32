@@ -15,3 +15,4 @@ esp32/*.local.ini
 synology/monitor.env
 synology/scripts/bridge_settings.json
 synology/scripts/captures/
+synology/scripts/memory.db*

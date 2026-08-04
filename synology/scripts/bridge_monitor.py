@@ -23,6 +23,7 @@ Endpoints HTTP (pas des topics MQTT), voir les routes Flask ci-dessous :
   POST /ask_text  {"text"}  -> saute le STT, LLM + TTS
   POST /say       {"text"}  -> TTS seul : invite système prononcée telle quelle,
                               sans LLM et sans mémorisation dans l'historique
+  GET/POST/DELETE /memory   -> faits de la mémoire persistante (memory_manager)
 
 Le firmware ESP32 (ai_manager.cpp) publie déjà lui-même "listening",
 "thinking" et "speaking" — ce bridge ne publie que ce qu'il est seul
@@ -39,6 +40,9 @@ import json
 import time
 import wave
 import asyncio
+import threading
+import subprocess
+from contextlib import contextmanager
 from collections import deque
 from datetime import datetime
 import zoneinfo
@@ -59,6 +63,18 @@ except ImportError:             # image pas reconstruite : l'outil se dira
     DDGS = None                 # indisponible, le reste du bridge tourne
 
 # ----------------------------------------------------------------
+# RESSOURCES LOCALES
+# ----------------------------------------------------------------
+# Mémoire persistante (SQLite), ouverte dans main(). ⚠️ Import défensif : ce
+# module est importé par monitor.py, un fichier manquant tuerait AUSSI les
+# collecteurs nas/freebox.
+try:
+    import memory_manager as memory
+except Exception as _e:
+    print(f"[Bridge] memory_manager indisponible ({_e}) — mémoire désactivée")
+    memory = None
+
+# ----------------------------------------------------------------
 # OBJETS GLOBAUX
 # ----------------------------------------------------------------
 MQTT_BROKER = os.getenv("MQTT_BROKER", "192.168.1.1")
@@ -68,6 +84,10 @@ HTTP_HOST = os.getenv("AI_BRIDGE_HOST", "0.0.0.0")
 HTTP_PORT = int(os.getenv("AI_BRIDGE_PORT", "8090"))
 
 SAMPLE_RATE = int(os.getenv("AUDIO_SAMPLE_RATE", "16000"))  # doit matcher AUDIO_SAMPLE_RATE (config.h)
+
+# Grain du flux TTS : 0,25 s d'audio. Plus fin ne gagne rien (l'ESP32 pré-remplit
+# 1 s avant de jouer), plus gros retarde le premier son d'autant.
+TTS_STREAM_CHUNK = SAMPLE_RATE * 2 // 4
 
 # Marge sous la saturation après normalisation de l'audio envoyé au STT, en dB.
 # Compense la distance variable au micro. 0 (ou vide) désactive.
@@ -142,6 +162,71 @@ app = Flask(__name__)
 # ----------------------------------------------------------------
 # API LOCALES
 # ----------------------------------------------------------------
+
+# --- Chronométrage — une ligne de synthèse par requête HTTP ---
+# threading.local et non flask.g : le serveur tourne en threaded=True et les
+# fonctions instrumentées sont aussi appelables hors contexte de requête, où le
+# chronomètre doit simplement ne rien faire.
+_timing = threading.local()
+
+@contextmanager
+def timed(step: str):
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        steps = getattr(_timing, "steps", None)
+        if steps is not None:                 # hors requête : on ne mesure pas
+            total, n = steps.get(step, (0.0, 0))
+            steps[step] = (total + time.perf_counter() - t0, n + 1)
+
+
+def timing_note(**kv):
+    """Faits non chronométriques joints à la ligne (taille de réponse, durée audio)."""
+    notes = getattr(_timing, "notes", None)
+    if notes is not None:
+        notes.update(kv)
+
+
+def _timing_start():
+    _timing.steps = {}
+    _timing.notes = {}
+    _timing.t0 = time.perf_counter()
+
+
+def _timing_line(label: str) -> str | None:
+    """Ligne de synthèse, ou None si la requête n'a traversé aucune étape mesurée
+    (page de config, sondages de l'historique…)."""
+    steps = getattr(_timing, "steps", None)
+    if not steps:
+        return None
+    total = time.perf_counter() - _timing.t0
+    mesure = sum(v for v, _ in steps.values())
+    detail = "  ".join(f"{k} {v:.2f}s" + (f" x{n}" if n > 1 else "")
+                       for k, (v, n) in steps.items())
+    # « reste » = tout le non-instrumenté : lecture du corps, sérialisation,
+    # envoi de la réponse. S'il domine, c'est là qu'il faut aller regarder.
+    line = f"[Chrono] {label} total {total:.2f}s — {detail}  reste {total - mesure:.2f}s"
+    notes = getattr(_timing, "notes", None) or {}
+    if notes:
+        line += "  |  " + "  ".join(f"{k} {v}" for k, v in notes.items())
+    return line
+
+
+@app.before_request
+def _chrono_begin():
+    _timing_start()
+
+
+@app.after_request
+def _chrono_end(resp):
+    line = _timing_line(request.path)
+    if line:
+        print(line)
+    _timing.steps = None
+    _timing.notes = None
+    return resp
+
 
 # --- Audio — normalisation du niveau avant STT ---
 def normalize_pcm(pcm_bytes: bytes) -> bytes:
@@ -225,17 +310,21 @@ def _settings_save():
     except Exception as e:
         print(f"[Bridge] Paramètres non persistés ({e}) — actifs jusqu'au redémarrage")
 
-# Liste des voix francophones, récupérée une seule fois (appel réseau ~1 s).
+# Liste des voix, récupérée une seule fois (appel réseau ~1 s). TOUTES les
+# langues, pas seulement fr- : une voix étrangère lisant du français donne un
+# accent, là où un pitch-shift ne donne qu'une voix trafiquée. Les voix
+# francophones restent en tête de liste.
 _voices_cache = None
-def _voices_fr():
+def _voices_all():
     global _voices_cache
     if _voices_cache is None:
         try:
             allv = asyncio.run(edge_tts.list_voices())
             _voices_cache = sorted(
                 [{"name": v["ShortName"], "gender": v["Gender"], "locale": v["Locale"]}
-                 for v in allv if v["Locale"].startswith("fr-")],
-                key=lambda v: (v["locale"], v["name"]))
+                 for v in allv],
+                key=lambda v: (0 if v["locale"].startswith("fr-") else 1,
+                               v["locale"], v["name"]))
         except Exception as e:
             print(f"[Bridge] Liste des voix indisponible : {e}")
             return [{"name": _settings["voice"], "gender": "?", "locale": "?"}]
@@ -284,16 +373,18 @@ def _conversation_remember(question: str, answer: str):
 def stt_transcribe(pcm_bytes: bytes) -> str | None:
     # Normalisation AVANT l'emballage WAV : l'ESP32 capture en linéaire, le
     # niveau dépend donc directement de la distance au micro.
-    wav_bytes = pcm_to_wav(normalize_pcm(pcm_bytes))
+    with timed("prep"):
+        wav_bytes = pcm_to_wav(normalize_pcm(pcm_bytes))
     try:
-        r = requests.post(
-            STT_URL,
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            files={"file": ("audio.wav", wav_bytes, "audio/wav")},
-            data={"model": STT_MODEL, "language": "fr"},
-            timeout=15
-        )
-        r.raise_for_status()
+        with timed("stt"):
+            r = requests.post(
+                STT_URL,
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                files={"file": ("audio.wav", wav_bytes, "audio/wav")},
+                data={"model": STT_MODEL, "language": "fr"},
+                timeout=15
+            )
+            r.raise_for_status()
         return r.json().get("text", "").strip()
     except Exception as e:
         print(f"[Bridge] Erreur STT : {e}")
@@ -446,7 +537,31 @@ def _tool_web_search(query: str) -> str:
     return (f"Résultats de recherche web pour « {q} » "
             f"(extraits bruts, à recouper avant d'affirmer) :\n" + "\n".join(lignes))
 
+# Mémoire utilisable : module importé, base ouverte, et réglage actif. Testé
+# devant CHAQUE accès — le module peut manquer, la base avoir échoué à s'ouvrir.
+def _memory_on() -> bool:
+    return bool(memory and memory.memory_stats()["ready"]
+                and _settings.get("memory_enabled", True))
+
+def _tool_search_memory(query: str) -> str:
+    faits = memory.memory_search(query, limit=5)
+    if not faits:
+        return ("Rien de mémorisé sur ce sujet. Ça ne veut pas dire que c'est faux : "
+                "demande-le à l'utilisateur plutôt que de l'affirmer.")
+    return "Faits mémorisés :\n" + "\n".join(f"- {f['key']} : {f['value']}" for f in faits)
+
 _TOOLS = {
+    "search_memory": ({"type": "function", "function": {
+        "name": "search_memory",
+        "description": (
+            "Cherche dans la mémoire personnelle ce qui a été retenu de l'utilisateur "
+            "(préférences, proches, habitudes, lieux). À utiliser quand la question "
+            "porte sur lui, son entourage ou ses goûts, et que les faits déjà donnés "
+            "dans le contexte ne suffisent pas."),
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Sujet cherché, en mots-clés"}},
+            "required": ["query"]}}}, _tool_search_memory),
+
     "get_weather": ({"type": "function", "function": {
         "name": "get_weather",
         "description": "Météo actuelle ou prévisions, pour la ville configurée.",
@@ -482,6 +597,8 @@ def _tool_schemas() -> list:
     # web_search est débrayable à chaud (page config) : ses snippets peuvent
     # noyer une question à laquelle le modèle répond bien seul.
     off = () if _settings.get("web_search_enabled", True) else ("web_search",)
+    if not _memory_on():
+        off += ("search_memory",)
     return [s for n, (s, _) in _TOOLS.items() if n not in off]
 
 def _tool_run(name: str, args: dict) -> str:
@@ -509,7 +626,8 @@ def _llm_create(messages: list, max_tokens: int, tools: list | None = None):
                           max_tokens=max_tokens, extra_body=_llm_extra_body())
             if tools:
                 kwargs["tools"], kwargs["tool_choice"] = tools, "auto"
-            return llm_client.chat.completions.create(**kwargs).choices[0].message
+            with timed("llm"):
+                return llm_client.chat.completions.create(**kwargs).choices[0].message
         except Exception as e:
             if attempt == 1 and "reasoning" in str(e).lower():
                 _no_reasoning_models.add(_settings["llm_model"])
@@ -536,6 +654,13 @@ def llm_answer(question: str, context: str | None, max_tokens: int | None = None
     system = f"{_settings['system_prompt']}\n\nNous sommes le {_current_datetime_fr()}."
     if context:
         system += f"\n\n{context}"
+    # Mémoire persistante : injectée telle quelle, sans appel LLM ni latence.
+    # ⚠️ Ne PAS s'en remettre au seul outil search_memory — le tool-calling
+    # spontané dépend du modèle, la mémoire serait muette sur certains.
+    if _memory_on():
+        bloc = memory.memory_profile_block(_settings.get("memory_profile_limit"))
+        if bloc:
+            system += f"\n\n{bloc}"
     tools = _tool_schemas()
     if tools:
         system += f"\n\n{_TOOLS_SYSTEM}"
@@ -576,7 +701,8 @@ def llm_answer(question: str, context: str | None, max_tokens: int | None = None
                        "identique. Réponds avec ce que tu as, ou dis ce qui manque.")
             else:
                 vus.add(cle)
-                out = _tool_run(c.function.name, args)
+                with timed("outils"):
+                    out = _tool_run(c.function.name, args)
             print(f"[Bridge] Outil {c.function.name}({args}) → {out[:80]}")
             messages.append({"role": "tool", "tool_call_id": c.id, "content": out})
         # La rédaction qui suit peut avoir à résumer plusieurs titres.
@@ -606,11 +732,83 @@ def tts_speak(text: str, voice: str | None = None) -> bytes | None:
     try:
         # edge-tts rend du MP3, jamais du PCM : on le décode ici, l'ESP32 ne
         # sait lire que du PCM brut.
-        mp3_bytes = asyncio.run(_edge_tts_generate(text, voice or _settings["voice"]))
-        return audio_to_pcm(mp3_bytes, "mp3")
+        t0 = time.perf_counter()
+        with timed("tts"):
+            mp3_bytes = asyncio.run(_edge_tts_generate(text, voice or _settings["voice"]))
+        synth = time.perf_counter() - t0
+        with timed("decode"):
+            pcm = audio_to_pcm(mp3_bytes, "mp3")
+        # ratio = secondes de parole produites par seconde de synthèse. Élevé =>
+        # la réponse est longue ; proche de 1 => c'est edge-tts qui traîne.
+        duree = len(pcm) / 2 / SAMPLE_RATE
+        timing_note(rep=f"{len(text)}c", audio=f"{duree:.1f}s",
+                    ratio=f"{duree / synth:.1f}x" if synth > 0 else "-")
+        return pcm
     except Exception as e:
         print(f"[Bridge] Erreur TTS : {e}")
         return None
+
+
+# --- 4bis. TTS en flux — PCM produit au fil de la synthèse ---
+# edge-tts livre déjà le MP3 par morceaux ; pydub, lui, exige le fichier entier.
+# On interpose donc un ffmpeg alimenté en continu.
+# ⚠️ Un thread écrivain est OBLIGATOIRE : écrire sur stdin depuis le même thread
+# qui doit vider stdout interbloque dès que le tuyau de sortie est plein.
+def tts_stream(text: str, voice: str | None = None):
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
+           "-f", "mp3", "-i", "pipe:0",
+           "-f", "s16le", "-ac", "1", "-ar", str(SAMPLE_RATE), "pipe:1"]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+
+    def _feed():
+        async def run():
+            communicate = edge_tts.Communicate(text, voice or _settings["voice"])
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    proc.stdin.write(chunk["data"])
+        try:
+            asyncio.run(run())
+        except Exception as e:
+            print(f"[Bridge] Erreur TTS (flux) : {e}")
+        finally:
+            try:
+                proc.stdin.close()   # ffmpeg ne rendra la main qu'ici
+            except Exception:
+                pass
+
+    t0 = time.perf_counter()
+    threading.Thread(target=_feed, daemon=True).start()
+
+    octets, premier = 0, None
+    try:
+        while True:
+            data = proc.stdout.read(TTS_STREAM_CHUNK)
+            if not data:
+                break
+            if premier is None:
+                premier = time.perf_counter() - t0
+            octets += len(data)
+            yield data
+    finally:
+        # Passe aussi par ici si l'ESP32 coupe la connexion en cours de lecture :
+        # sans le kill, un ffmpeg resterait bloqué sur un tuyau que plus personne
+        # ne vide, un par requête interrompue.
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+
+    synth = time.perf_counter() - t0
+    duree = octets / 2 / SAMPLE_RATE
+    ratio = f"{duree / synth:.1f}x" if synth > 0 else "-"
+    # Ligne distincte de celle d'after_request : celle-ci part AVANT que le
+    # corps ne soit produit, le flux n'y figurerait donc jamais.
+    print(f"[Chrono] flux TTS — 1er son {premier or 0:.2f}s  audio {duree:.1f}s  "
+          f"synthese {synth:.2f}s  ratio {ratio}")
 
 # ----------------------------------------------------------------
 # ROUTES HTTP
@@ -738,6 +936,16 @@ button{flex:1;padding:11px;border:none;border-radius:6px;font-size:14px;cursor:p
 .histbox .empty{color:#888;font-style:italic}
 /* ---- PANNEAU VOIX ---- */
 audio{width:100%;margin-top:12px}
+/* ---- PANNEAU MÉMOIRE ---- */
+/* Clé, pastilles et croix sur la 1re ligne ; la valeur occupe la 2e en entier —
+   à trois colonnes, une clé hiérarchique partageant la ligne était tronquée. */
+.mrow{display:grid;grid-template-columns:1fr auto auto;gap:4px 8px;align-items:center;
+      margin-top:10px;padding-bottom:10px;border-bottom:1px solid #2a2a2a}
+.mrow .mv{grid-column:1 / -1}
+.mkey{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:#03dac6;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mtag{color:#777;font-size:11px;white-space:nowrap}
+.xbtn.mdel{padding:4px 9px;line-height:1}
+.memlist{max-height:420px;overflow-y:auto;margin-top:8px}
 /* ---- PANNEAU COMMANDES ---- */
 .tool{background:#232323;border:1px solid #333;border-radius:10px;margin-top:12px}
 .tool.op{border-color:#03dac6}
@@ -763,6 +971,7 @@ audio{width:100%;margin-top:12px}
 <h1>Paramètres de Jarvis</h1>
 <nav class="tabs">
   <button class="tab active" data-view="conv">Conversations</button>
+  <button class="tab" data-view="mem">Mémoire</button>
   <button class="tab" data-view="llm">Paramètres LLM</button>
   <button class="tab" data-view="tools">Outils</button>
 </nav>
@@ -800,6 +1009,69 @@ audio{width:100%;margin-top:12px}
 </div>
 <div id="histBox" class="histbox"></div>
 <div class="msg" id="msgC"></div>
+</div>
+
+</div>
+</div>
+</div>
+
+<div id="v-mem" class="view hidden">
+<div class="layout">
+<div class="col">
+
+<div class="box">
+<h2>Réglages de la mémoire</h2>
+<p class="sub">Sauvegardés — contrairement aux limites de conversation, ils survivent au redémarrage.</p>
+<div style="display:flex;align-items:center;gap:8px;margin-top:8px"><input type="checkbox" id="me" style="width:auto"><span style="font-size:13px">Mémoire active (lecture + écriture)</span></div>
+<div style="display:flex;align-items:center;gap:8px;margin-top:8px"><input type="checkbox" id="ma" style="width:auto"><span style="font-size:13px">Mémorisation automatique après chaque échange</span></div>
+<p class="hint">L'analyse automatique coûte <b>un appel LLM de plus par échange</b>, hors du chemin de la réponse (aucune latence ajoutée à l'oral). Décochée, seul « retiens que… » écrit.</p>
+<div class="grid">
+  <div><label for="mpl">Faits injectés au LLM</label>
+       <p class="hint">(1 – 200, à chaque requête)</p>
+       <input id="mpl" type="number" min="1" max="200"></div>
+  <div><label for="mmf">Faits gardés au total</label>
+       <p class="hint">(10 – 2000, éviction du plus ancien servi)</p>
+       <input id="mmf" type="number" min="10" max="2000"></div>
+</div>
+<label for="mk">Mot(s)-clé de mémorisation explicite (séparés par des virgules)</label>
+<input id="mk" maxlength="200">
+<p class="hint">Sans l'un de ces mots, la phrase reste une question normale. Si rien n'est extrait, elle repart aussi en question — aucune réponse d'échec.</p>
+<div class="row"><button class="pri" onclick="saveMemCfg()">Enregistrer</button></div>
+<div class="msg" id="msgMC"></div>
+</div>
+
+</div>
+<div class="col">
+
+<div class="box">
+<h2>Faits mémorisés</h2>
+<p class="sub">Ce que Jarvis retient d'un échange à l'autre, injecté dans son contexte à chaque requête. Contrairement à la conversation, ça survit au redémarrage.</p>
+<div class="cur" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+  <span><b id="memN">…</b> fait(s)</span>
+  <span id="memInfo" style="color:#888"></span>
+  <button class="warn" onclick="wipeMem()" style="flex:none;padding:6px 12px;margin-left:auto">Tout effacer</button>
+</div>
+<p class="hint">La valeur est modifiable directement : la clé sert d'identifiant, une même clé écrase l'ancienne valeur.</p>
+<div id="memBox" class="memlist"></div>
+<div class="msg" id="msgM"></div>
+</div>
+
+</div>
+<div class="col">
+
+<div class="box">
+<h2>Ajouter ou corriger un fait</h2>
+<p class="sub">Clé hiérarchique en minuscules, du général au particulier — c'est elle qui évite d'empiler deux versions d'un même fait. Une clé déjà présente écrase sa valeur.</p>
+<label for="fk">Clé</label>
+<input id="fk" placeholder="animal.chat.nom" maxlength="64">
+<label for="fs">Portée</label>
+<select id="fs"><option>user</option><option>maison</option><option>preference</option></select>
+<label for="fv">Valeur</label>
+<input id="fv" placeholder="Le chat s'appelle Mochi" maxlength="500">
+<label for="ft">Validité (secondes, vide = permanent)</label>
+<input id="ft" type="number" min="60" max="31536000" placeholder="permanent">
+<div class="row"><button class="pri" onclick="addFact()">Mémoriser</button></div>
+<div class="msg" id="msgMA"></div>
 </div>
 
 </div>
@@ -849,9 +1121,12 @@ audio{width:100%;margin-top:12px}
 
 <div class="box">
 <h2>Voix</h2>
-<p class="sub">Écoute puis adopte — prise en compte immédiate.</p>
-<label for="v">Voix disponibles</label>
-<select id="v"></select>
+<p class="sub">Écoute puis adopte — prise en compte immédiate. Toutes les langues sont
+listées : une voix étrangère lit le français avec son accent.</p>
+<div class="grid">
+  <div><label for="vloc">Langue</label><select id="vloc" onchange="fillVoices()"></select></div>
+  <div><label for="v">Voix</label><select id="v"></select></div>
+</div>
 <label for="t">Phrase de test</label>
 <input id="t" value="Bonjour, il est vingt-deux heures et tout va bien.">
 <div class="row">
@@ -1030,6 +1305,67 @@ async function loadConv(){
   }catch(e){}
 }
 
+// ---- PANNEAU MÉMOIRE ----
+let MEM=[];
+async function loadMem(){
+  try{
+    const d=await (await fetch('/memory')).json();
+    MEM=d.facts;
+    document.getElementById('memN').textContent=d.stats.count+'/'+d.stats.max;
+    document.getElementById('memInfo').textContent= !d.stats.ready ? 'base indisponible'
+      : (d.stats.fts ? 'recherche plein texte active' : 'recherche plein texte absente (repli LIKE)');
+    renderMem();
+  }catch(e){ say('msgM','Échec : '+e.message,false); }
+}
+function renderMem(){
+  const box=document.getElementById('memBox');
+  if(!MEM.length){ box.innerHTML='<p class="hint" style="margin-top:12px">Aucun fait mémorisé.</p>'; return; }
+  box.innerHTML=MEM.map(f=>`<div class="mrow">
+      <span class="mkey" title="${ecs(f.key)}">${ecs(f.key)}</span>
+      <span class="mtag">${ecs(f.scope)} · ${ecs(f.source||'?')}${f.expires_at?' · temporaire':''}</span>
+      <button class="xbtn mdel" data-k="${ecs(f.key)}" title="oublier">✕</button>
+      <input class="mv" data-k="${ecs(f.key)}" data-s="${ecs(f.scope)}" value="${ecs(f.value)}">
+    </div>`).join('');
+  // La portée repart telle quelle : sans elle le serveur retomberait sur "user".
+  box.querySelectorAll('.mv').forEach(el=>el.onchange=()=>putFact({key:el.dataset.k,value:el.value,scope:el.dataset.s},'msgM','Fait mis à jour.'));
+  box.querySelectorAll('.mdel').forEach(el=>el.onclick=()=>delFact(el.dataset.k));
+}
+async function putFact(body,msgId,okText){
+  try{
+    const r=await fetch('/memory',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const d=await r.json();
+    if(!r.ok) throw new Error((d.errors||['HTTP '+r.status]).join(' ; '));
+    say(msgId,okText,true); loadMem();
+  }catch(e){ say(msgId,'Échec : '+e.message,false); }
+}
+function addFact(){
+  const k=document.getElementById('fk').value.trim(), v=document.getElementById('fv').value.trim();
+  if(!k||!v){ say('msgMA','Clé et valeur obligatoires.',false); return; }
+  putFact({key:k,value:v,scope:document.getElementById('fs').value,
+           ttl_s:document.getElementById('ft').value||null},'msgMA','Mémorisé.');
+  document.getElementById('fk').value=''; document.getElementById('fv').value=''; document.getElementById('ft').value='';
+}
+async function delFact(key){
+  try{
+    await fetch('/memory/'+encodeURIComponent(key),{method:'DELETE'});
+    say('msgM','Oublié.',true); loadMem();
+  }catch(e){ say('msgM','Échec : '+e.message,false); }
+}
+async function wipeMem(){
+  if(!confirm('Effacer TOUS les faits mémorisés ? Cette action est définitive.')) return;
+  try{
+    const d=await (await fetch('/memory/clear',{method:'POST'})).json();
+    say('msgM',`Mémoire vidée (${d.cleared} fait(s)).`,true); loadMem();
+  }catch(e){ say('msgM','Échec : '+e.message,false); }
+}
+function saveMemCfg(){
+  postConfig({memory_enabled:document.getElementById('me').checked,
+              memory_auto:document.getElementById('ma').checked,
+              memory_profile_limit:document.getElementById('mpl').value,
+              memory_max_facts:document.getElementById('mmf').value,
+              memory_keywords:document.getElementById('mk').value},'msgMC','Réglages mémoire enregistrés.');
+}
+
 // ---- PANNEAU VOIX ----
 async function preview(){
   const v=document.getElementById('v').value, t=document.getElementById('t').value;
@@ -1137,6 +1473,28 @@ function saveCmds(){
 }
 
 // ---- INITIALISATION ----
+// Double filtre langue -> voix : edge-tts en expose ~400, une liste plate est
+// impraticable. VOICES garde le catalogue complet, la liste des voix est
+// reconstruite à chaque changement de langue.
+let VOICES=[];
+let DNAMES=null; try{ DNAMES=new Intl.DisplayNames(['fr'],{type:'language'}); }catch(e){}
+
+function localeLabel(loc){
+  if(!DNAMES) return loc;
+  try{ return `${loc} — ${DNAMES.of(loc)}`; }catch(e){ return loc; }
+}
+
+function fillVoices(){
+  const loc=document.getElementById('vloc').value;
+  const sel=document.getElementById('v');
+  sel.innerHTML='';
+  VOICES.filter(v=>v.locale===loc).forEach(v=>{
+    const o=document.createElement('option');
+    o.value=v.name; o.textContent=`${v.name}  —  ${v.gender}`;
+    sel.appendChild(o);
+  });
+}
+
 async function loadAll(){
   const cfg = await (await fetch('/config')).json();
   DEFAULTS = cfg.defaults;
@@ -1155,17 +1513,30 @@ async function loadAll(){
   document.getElementById('wlo').value = cfg.settings.weather_lon;
   document.getElementById('nf').value  = cfg.settings.news_feeds.join('\\n');
   document.getElementById('nc').value  = cfg.settings.news_count;
+  document.getElementById('me').checked = cfg.settings.memory_enabled !== false;
+  document.getElementById('ma').checked = cfg.settings.memory_auto !== false;
+  document.getElementById('mpl').value  = cfg.settings.memory_profile_limit || 40;
+  document.getElementById('mmf').value  = cfg.settings.memory_max_facts || 200;
+  document.getElementById('mk').value   = (cfg.settings.memory_keywords||[]).join(', ');
   document.getElementById('ck').value  = (cfg.settings.command_keywords||[]).join(', ');
   CTOOLS = JSON.parse(JSON.stringify(cfg.settings.command_tools||[]));
   renderTools();   // tous repliés par défaut
 
   const vs = await (await fetch('/voices')).json();
-  const sel = document.getElementById('v');
-  vs.voices.forEach(v=>{
+  VOICES = vs.voices;
+  const ls = document.getElementById('vloc');
+  const seen = new Set();
+  VOICES.forEach(v=>{                    // liste triée par locale, fr- en tête
+    if(seen.has(v.locale)) return;
+    seen.add(v.locale);
     const o=document.createElement('option');
-    o.value=v.name; o.textContent=`${v.name}  —  ${v.gender}  (${v.locale})`;
-    if(v.name===vs.current) o.selected=true; sel.appendChild(o);
+    o.value=v.locale; o.textContent=localeLabel(v.locale);
+    ls.appendChild(o);
   });
+  const curVoice = VOICES.find(v=>v.name===vs.current);
+  ls.value = curVoice ? curVoice.locale : VOICES[0].locale;
+  fillVoices();
+  if(curVoice) document.getElementById('v').value = vs.current;
 
   const md = await (await fetch('/llm_models')).json();
   const ms = document.getElementById('m');
@@ -1183,16 +1554,19 @@ async function loadAll(){
   ms.appendChild(oc);
 }
 // ---- ONGLETS (calqué sur activity_monitor) ----
-const _views = {conv:document.getElementById('v-conv'), llm:document.getElementById('v-llm'), tools:document.getElementById('v-tools')};
+const _views = {conv:document.getElementById('v-conv'), mem:document.getElementById('v-mem'),
+                llm:document.getElementById('v-llm'), tools:document.getElementById('v-tools')};
 document.querySelectorAll('.tab').forEach(t=>t.addEventListener('click',()=>{
   document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
   t.classList.add('active');
   for(const k in _views) _views[k].classList.toggle('hidden', k!==t.dataset.view);
   if(t.dataset.view==='llm') autoGrow(document.getElementById('sp'));   // scrollHeight fiable une fois visible
+  if(t.dataset.view==='mem') loadMem();   // la passe auto écrit hors de la page
 }));
 
 loadAll();
 loadConv();
+loadMem();
 setInterval(loadConv, 4000);
 </script></body></html>"""
 
@@ -1204,7 +1578,7 @@ def config_page():
 
 @app.route("/voices", methods=["GET"])
 def voices():
-    return {"voices": _voices_fr(), "current": _settings["voice"]}
+    return {"voices": _voices_all(), "current": _settings["voice"]}
 
 
 @app.route("/voice", methods=["POST"])
@@ -1214,7 +1588,7 @@ def set_voice():
     voice = (data.get("voice") or "").strip()
     if not voice:
         return "", 400
-    if voice not in [v["name"] for v in _voices_fr()]:
+    if voice not in [v["name"] for v in _voices_all()]:
         return "voix inconnue", 400
 
     _settings["voice"] = voice
@@ -1345,6 +1719,40 @@ def set_config():
             _settings["news_count"] = n
         except (TypeError, ValueError):
             errors.append("titres max : 1 à 15")
+
+    if "memory_enabled" in data:
+        _settings["memory_enabled"] = bool(data["memory_enabled"])
+
+    if "memory_auto" in data:
+        _settings["memory_auto"] = bool(data["memory_auto"])
+
+    for cle, lo, hi, libelle in (("memory_max_facts", 10, 2000, "faits max : 10 à 2000"),
+                                 ("memory_profile_limit", 1, 200, "faits injectés : 1 à 200")):
+        if cle in data:
+            try:
+                n = int(data[cle])
+                if not (lo <= n <= hi):
+                    raise ValueError
+                _settings[cle] = n
+            except (TypeError, ValueError):
+                errors.append(libelle)
+    if memory and ("memory_max_facts" in data or "memory_profile_limit" in data):
+        memory.memory_set_limits(_settings.get("memory_max_facts"),
+                                 _settings.get("memory_profile_limit"))
+
+    if "memory_keywords" in data:
+        raw = data["memory_keywords"]
+        if isinstance(raw, str):
+            kws = [k.strip().lower() for k in raw.split(",")]
+        elif isinstance(raw, list):
+            kws = [str(k).strip().lower() for k in raw]
+        else:
+            kws = []
+        kws = [k for k in kws if k]
+        if 1 <= len(kws) <= 10 and all(len(k) <= 40 for k in kws):
+            _settings["memory_keywords"] = kws
+        else:
+            errors.append("mots-clés mémoire : 1 à 10 entrées de 40 caractères max")
 
     if "command_keywords" in data:
         raw = data["command_keywords"]
@@ -1488,7 +1896,48 @@ def chat():
     answer = llm_answer(text, None)
     if answer is None:
         return {"error": "LLM indisponible"}, 500
+    memory_analyze_async(text, answer)
     return {"answer": answer}
+
+
+@app.route("/memory", methods=["GET"])
+def memory_get():
+    if not memory:
+        return {"facts": [], "stats": {"ready": False, "count": 0, "max": 0, "fts": False}}
+    return {"facts": memory.memory_all(), "stats": memory.memory_stats()}
+
+
+@app.route("/memory", methods=["POST"])
+def memory_set():
+    """Ajout/correction à la main depuis la page — c'est le seul recours quand la
+    passe d'analyse a mémorisé une transcription hallucinée."""
+    if not memory:
+        return {"errors": ["mémoire indisponible"]}, 400
+    data = request.get_json(silent=True) or {}
+    key   = str(data.get("key", "")).strip()
+    value = str(data.get("value", "")).strip()
+    if not key or not value:
+        return {"errors": ["clé et valeur obligatoires"]}, 400
+    try:
+        ttl = int(data["ttl_s"]) if data.get("ttl_s") else None
+    except (TypeError, ValueError):
+        return {"errors": ["durée : entier de secondes"]}, 400
+
+    fait = memory.memory_remember(key, value, scope=data.get("scope", "user"),
+                                  source="config", confidence=1.0, ttl_s=ttl)
+    if not fait:
+        return {"errors": ["mémoire indisponible ou clé invalide"]}, 400
+    return {"fact": fait}
+
+
+@app.route("/memory/<path:key>", methods=["DELETE"])
+def memory_del(key):
+    return {"deleted": bool(memory) and memory.memory_forget(key)}
+
+
+@app.route("/memory/clear", methods=["POST"])
+def memory_wipe():
+    return {"cleared": memory.memory_clear() if memory else 0}
 
 
 # ----------------------------------------------------------------
@@ -1693,28 +2142,196 @@ def maybe_handle_command(text: str):
     _execute_command(action)          # navigation : immédiat, sans confirmation
     return _speak_response(action["speak"], text)
 
+# ----------------------------------------------------------------
+# MÉMOIRE PERSISTANTE — écriture (la lecture est dans llm_answer)
+# ----------------------------------------------------------------
+# Deux chemins d'écriture, volontairement distincts :
+#   explicite — « retiens que… », portillon par mot-clé, réponse vocale immédiate ;
+#   implicite — passe d'analyse sur l'échange, dans un THREAD DÉTACHÉ.
+# ⚠️ La passe implicite ne doit JAMAIS être sur le chemin de la réponse : le TTS
+# pèse déjà ~74 % de la latence, un appel LLM de plus s'y verrait.
+
+# Whisper produit un générique de sous-titres sur du non-parole. Dans
+# l'historique court ça se purge tout seul ; en mémoire, c'est définitif.
+_STT_JUNK = ("sous-titrage", "sous-titres", "amara.org", "radio-canada",
+             "merci d'avoir regardé", "abonnez-vous", "❤")
+
+# ⚠️ Extraction en JSON DEMANDÉ, PAS en tool-calling — le tool-calling spontané
+# dépend du modèle (qwen3.6 n'appelle jamais ses outils seul), et la mémoire
+# serait alors muette selon le modèle choisi. Répondre par du JSON est demandé
+# explicitement à chaque appel, donc à la portée de n'importe quel modèle.
+_MEM_FORMAT = (
+    'Réponds UNIQUEMENT par un tableau JSON, sans phrase autour et sans balise de code.\n'
+    'Élément : {"op":"remember","key":"...","value":"...","scope":"user|maison|preference","ttl_s":null}\n'
+    'op vaut "remember" ou "forget" (pour "forget", seule "key" compte).\n'
+    'key : minuscules sans accent, hiérarchique du général au particulier — '
+    'logement.ville, animal.chat.nom, preference.musique, travail.metier. '
+    'RÉUTILISE une clé existante pour corriger un fait.\n'
+    'value : le fait, en une phrase courte.\n'
+    'ttl_s : durée de validité en secondes d\'un fait PASSAGER (rendez-vous, état de '
+    'santé) ; null si le fait est permanent.\n'
+    'Rien à mémoriser ni à oublier : réponds exactement []')
+
+def _memory_extract(consigne: str, contenu: str) -> list:
+    """Un appel LLM dédié -> liste d'opérations mémoire. Toujours une liste."""
+    try:
+        resp = llm_client.chat.completions.create(
+            model=_settings["llm_model"],
+            messages=[{"role": "system", "content": f"{consigne}\n\n{_MEM_FORMAT}"},
+                      {"role": "user", "content": contenu}],
+            # ⚠️ Raisonnement coupé (extra_body), comme pour _classify_command :
+            # un modèle à raisonnement rédige son analyse au lieu du JSON.
+            temperature=0, max_tokens=400, extra_body=_llm_extra_body())
+        raw = (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        print(f"[Memoire] Extraction impossible : {e}")
+        return []
+    return _memory_parse_ops(raw)
+
+def _memory_parse_ops(raw: str) -> list:
+    """⚠️ Du premier « [ » au dernier « ] » : les modèles encadrent volontiers le
+    JSON de ```json ou le font précéder d'une phrase d'introduction."""
+    i, j = raw.find("["), raw.rfind("]")
+    if i < 0 or j <= i:
+        # Un fait unique sort parfois en objet nu au lieu d'un tableau.
+        i, j = raw.find("{"), raw.rfind("}")
+        if i < 0 or j <= i:
+            if raw:
+                print(f"[Memoire] Réponse non exploitable : {raw[:120]}")
+            return []
+    try:
+        items = json.loads(raw[i:j + 1])
+    except Exception as e:
+        print(f"[Memoire] JSON invalide ({e}) : {raw[i:i + 120]}")
+        return []
+    if isinstance(items, dict):
+        items = [items]
+    if not isinstance(items, list):
+        return []
+
+    ops = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        key = str(it.get("key", "")).strip()
+        if not key:
+            continue
+        ops.append({"op": "forget" if str(it.get("op", "")).lower() == "forget" else "remember",
+                    "key": key,
+                    "value": str(it.get("value", "")).strip(),
+                    "scope": it.get("scope", "user"),
+                    "ttl_s": it.get("ttl_s")})
+    return ops
+
+def _memory_known_keys(limit: int = 60) -> str:
+    faits = memory.memory_all(limit)
+    if not faits:
+        return "(mémoire vide)"
+    return ", ".join(f["key"] for f in faits)
+
+def _memory_apply(ops: list, source: str, confidence: float) -> list:
+    """Exécute les opérations. Renvoie les valeurs retenues (None pour un oubli),
+    de quoi formuler la confirmation vocale."""
+    retenus = []
+    for o in ops:
+        if o["op"] == "forget":
+            if memory.memory_forget(o["key"]):
+                retenus.append(None)
+        elif o["value"]:
+            fait = memory.memory_remember(o["key"], o["value"], scope=o["scope"],
+                                          source=source, confidence=confidence,
+                                          ttl_s=o["ttl_s"])
+            if fait:
+                retenus.append(fait["value"])
+    return retenus
+
+def _norm_phrase(s: str) -> str:
+    """⚠️ Trait d'union et apostrophe ramenés à l'espace, des DEUX côtés de la
+    comparaison : Whisper rend « rappelle-toi » aussi bien que « rappelle toi »,
+    et un mot-clé écrit d'une seule façon ne voit jamais l'autre."""
+    s = s.lower().replace("’", "'")
+    return " ".join(re.split(r"[\s\-']+", s))
+
+def maybe_handle_memory(text: str):
+    """Court-circuit du flux Q-R sur « retiens que… » / « oublie… ». Renvoie None
+    dès que rien n'a été extrait : la phrase repart alors en question normale."""
+    if not _memory_on():
+        return None
+    low = _norm_phrase(text)
+    if not any(_norm_phrase(k) in low for k in _settings.get("memory_keywords", [])):
+        return None
+
+    ops = _memory_extract(
+        "Tu gères la mémoire personnelle d'un assistant vocal. L'utilisateur demande "
+        "explicitement de retenir ou d'oublier quelque chose : traduis sa demande. "
+        "S'il ne demande en fait ni l'un ni l'autre, renvoie [].\n"
+        f"Clés déjà utilisées : {_memory_known_keys()}",
+        text)
+    retenus = _memory_apply(ops, source="explicit", confidence=0.95)
+    if not retenus:
+        # Sans cette ligne, un portillon ouvert mais une extraction vide est
+        # indiscernable d'un portillon jamais ouvert.
+        print(f"[Memoire] Mot-clé vu, rien d'extrait : {text}")
+        return None
+
+    valeurs = [v for v in retenus if v]
+    phrase = f"C'est noté : {valeurs[0][:120]}" if valeurs else "C'est oublié."
+    return _speak_response(phrase, text)
+
+def _memory_analyze(question: str, answer: str):
+    """Passe implicite : ce que l'échange révèle de DURABLE sur l'utilisateur."""
+    try:
+        ops = _memory_extract(
+            "Tu tiens la mémoire à long terme d'un assistant vocal. Extrais de "
+            "l'échange fourni ce qui restera vrai dans un mois et concerne "
+            "l'utilisateur : identité, proches, animaux, lieux, métier, goûts et "
+            "préférences durables. L'utilisateur n'a PAS à demander explicitement "
+            "qu'on retienne — un fait livré au fil de la conversation compte.\n"
+            "Renvoie [] pour : une question de culture générale, une information sur "
+            "le monde, un état passager, ou un fait déjà mémorisé à l'identique.\n"
+            f"Clés déjà utilisées : {_memory_known_keys()}",
+            f"Utilisateur : {question}\nAssistant : {answer}")
+        # Un oubli automatique serait irrattrapable : seul le chemin explicite efface.
+        retenus = _memory_apply([o for o in ops if o["op"] == "remember"],
+                                source="auto", confidence=0.6)
+        if not retenus:
+            print(f"[Memoire] Analyse : rien à retenir de « {question[:60]} »")
+    except Exception as e:
+        print(f"[Memoire] Passe d'analyse en échec : {e}")
+
+def memory_analyze_async(question: str, answer: str):
+    """⚠️ Lancé APRÈS l'envoi de la réponse — la synthèse vocale est déjà en cours
+    de lecture sur l'ESP32, cette passe a tout son temps."""
+    if not (_memory_on() and _settings.get("memory_auto", True)):
+        return
+    low = question.lower()
+    if len(low) < 12 or any(j in low for j in _STT_JUNK):
+        return
+    threading.Thread(target=_memory_analyze, args=(question, answer), daemon=True).start()
+
 def _answer_and_speak(text: str):
     """Partie commune à /ask et /ask_text, une fois le texte de la
-    question connu : commande -> sinon LLM (+ outils) -> TTS -> réponse."""
+    question connu : commande -> mémoire -> sinon LLM (+ outils) -> TTS -> réponse."""
     cmd_resp = maybe_handle_command(text)
     if cmd_resp is not None:
         return cmd_resp
+    mem_resp = maybe_handle_memory(text)
+    if mem_resp is not None:
+        return mem_resp
     answer = llm_answer(text, None)          # le modèle décide seul de ses outils
     if not answer:
         mqtt_pub("ai/status", "error")
         return "", 500
     print(f"[Bridge] Réponse : {answer}")
 
-    pcm_out = tts_speak(answer)
-    if not pcm_out:
-        mqtt_pub("ai/status", "error")
-        return "", 500
-
-    # Publié seulement une fois le TTS prêt — évite que le texte apparaisse
-    # sur MQTT avant que l'ESP32 ne passe réellement en "speaking".
+    # Le texte complet est connu AVANT la synthèse : les en-têtes restent
+    # valides malgré le flux, l'ESP32 continue d'y lire ses sous-titres.
     mqtt_pub("ai/answer", answer)
+    memory_analyze_async(text, answer)
 
-    resp = Response(pcm_out, mimetype="application/octet-stream")
+    # Réponse en flux : pas de Content-Length, donc chunkée — c'est ce que
+    # l'ESP32 teste (total < 0) pour jouer au fil de la réception.
+    resp = Response(tts_stream(answer), mimetype="application/octet-stream")
     resp.headers["X-Transcript"] = quote(text)
     resp.headers["X-Answer"] = quote(answer)
     return resp
@@ -1728,6 +2345,15 @@ def main():
     print(f"[Bridge] Démarrage — LLM: {LLM_BASE_URL} ({_settings['llm_model']}) "
           f"— TTS: {_settings['voice']}")
     print(f"[Bridge] Paramètres IA : http://<NAS>:{HTTP_PORT}/")
+
+    # Mémoire persistante — un échec la laisse inerte, le bridge tourne sans.
+    if memory:
+        memory.memory_set_limits(_settings.get("memory_max_facts"),
+                                 _settings.get("memory_profile_limit"))
+        memory.memory_init()
+    print(f"[Bridge] Mémoire : {'active' if _memory_on() else 'INACTIVE'} — "
+          f"mots-clés {_settings.get('memory_keywords', [])} — "
+          f"auto {'oui' if _settings.get('memory_auto', True) else 'non'}")
 
     if not GROQ_API_KEY:
         print("[Bridge] ERREUR : GROQ_API_KEY non défini (requis pour le STT) !")
