@@ -26,9 +26,6 @@
 
 // ---- OBJETS GLOBAUX ----
 
-// Filet si le bridge ne renvoie pas de Content-Length (non attendu) — 20 s.
-#define PSRAM_STREAM_FALLBACK_BYTES (AUDIO_SAMPLE_RATE * 20 * sizeof(int16_t))
-
 static AiState     _state           = AI_IDLE;
 static char        _transcript[200] = "";
 static char        _answer[200]     = "";
@@ -172,6 +169,59 @@ static void _post_state_async(AiState s, const char* transcript, const char* ans
     }
 }
 
+// Puits branché sur HTTPClient::writeToStream() : chaque bloc de corps DÉCODÉ
+// part dans la session de lecture. write() bloque quand le tampon est plein, ce
+// qui cale la réception sur le rythme du haut-parleur.
+class AudioSink : public Stream {
+public:
+    size_t written = 0;
+    size_t write(uint8_t b) override { return write(&b, 1); }
+    size_t write(const uint8_t* b, size_t n) override {
+        size_t k = audio_stream_push(b, n);
+        written += k;
+        return k;
+    }
+    int  available() override { return 0; }
+    int  read()      override { return -1; }
+    int  peek()      override { return -1; }
+    void flush()     override {}
+};
+
+// Réponse sans Content-Length : le bridge streame le TTS.
+//
+// ⚠️ NE PAS lire getStreamPtr() ici, et NE PAS tenter de l'éviter par
+// useHTTP10(true) — TESTÉ, ÉCHOUÉ. Le serveur de développement de Werkzeug
+// répond avec SA version de protocole (`protocol_version`, attribut de classe)
+// sans tenir compte de celle du client : il chunke même une requête 1.0. Or le
+// flux BRUT porte alors le cadrage — taille en hexa + CRLF autour de chaque
+// bloc — qui, poussé au haut-parleur, s'entend : un clic par bloc, 4 Hz au
+// découpage actuel (mesuré : 140 o de cadrage pour 128 256 o d'audio).
+// writeToStream() applique le décodeur chunked de HTTPClient et traite aussi le
+// cas identity. ⚠️ Il s'alloue HTTP_TCP_RX_BUFFER_SIZE = 4096 o de RAM INTERNE
+// (4096 n'est pas > 4096, il ne part donc pas en PSRAM) : c'est le prix de la
+// correction, à surveiller sur le plancher.
+static void _stream_bridge_response(HTTPClient& http, const String& transcript,
+                                    const String& answer) {
+    if (!audio_stream_begin()) {
+        _post_state_async(AI_ERROR, nullptr, nullptr);
+        return;
+    }
+
+    _post_state_async(AI_SPEAKING,
+                      transcript.length() ? transcript.c_str() : nullptr,
+                      answer.length()     ? answer.c_str()     : nullptr);
+
+    AudioSink sink;
+    int ret = http.writeToStream(&sink);
+
+    // ⚠️ Toujours signaler la fin, même sur erreur : sans ça la tâche audio
+    // resterait à attendre des octets qui ne viendront pas.
+    audio_stream_end();
+
+    if (ret < 0) log_line("[AI] Flux TTS interrompu (%d)", ret);
+    log_line("[AI] Flux TTS reçu : %u o", (unsigned)sink.written);
+}
+
 // Lit le PCM de la réponse en PSRAM et le joue. Aucune écriture flash : elle
 // suspendrait le cache d'instructions, donc LVGL.
 static void _handle_bridge_response(HTTPClient& http, int http_code, const char* known_transcript) {
@@ -190,7 +240,16 @@ static void _handle_bridge_response(HTTPClient& http, int http_code, const char*
     _await_reply = (_url_decode(http.header("X-Listen-After")) == "1");
 
     int total = http.getSize();
-    size_t buf_capacity = (total > 0) ? (size_t)total : (size_t)PSRAM_STREAM_FALLBACK_BYTES;
+
+    // Longueur inconnue = réponse chunkée = le bridge streame le TTS. On joue
+    // au fil de la réception au lieu de tout bufferiser : la parole démarre
+    // pendant la synthèse, au lieu de l'attendre puis d'attendre le transfert.
+    if (total < 0) {
+        _stream_bridge_response(http, transcript, answer);
+        return;
+    }
+
+    size_t buf_capacity = (size_t)total;
 
     int16_t* pcm_buf = (int16_t*)heap_caps_malloc(buf_capacity, MALLOC_CAP_SPIRAM);
     if (!pcm_buf) {
@@ -203,7 +262,7 @@ static void _handle_bridge_response(HTTPClient& http, int http_code, const char*
     size_t received = 0;
     int remaining = total;
 
-    while (http.connected() && (remaining > 0 || total == -1) && received < buf_capacity) {
+    while (http.connected() && remaining > 0 && received < buf_capacity) {
         size_t avail = stream->available();
         if (avail == 0) {
             if (!http.connected()) break;
@@ -213,8 +272,8 @@ static void _handle_bridge_response(HTTPClient& http, int http_code, const char*
         size_t want = min(avail, buf_capacity - received);
         int n = stream->readBytes((uint8_t*)pcm_buf + received, want);
         if (n <= 0) break;
-        received += n;
-        if (total != -1) remaining -= n;
+        received  += n;
+        remaining -= n;
     }
 
     _post_state_async(AI_SPEAKING,

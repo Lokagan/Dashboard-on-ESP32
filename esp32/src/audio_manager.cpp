@@ -13,6 +13,7 @@
 #include <Wire.h>
 #include <ESP_I2S.h>   // API I2S Arduino 3.x — partagée avec ESP_SR
 #include <freertos/queue.h>
+#include <freertos/stream_buffer.h>
 #include <math.h>
 #include <esp_heap_caps.h>
 
@@ -54,12 +55,24 @@ static volatile bool _playback_stop_requested = false;
 
 static int16_t* _record_psram_buf = nullptr;   // alloué une fois, cf. _ensure_record_buffer
 
+// Flux TTS — tampon FreeRTOS à stockage PSRAM (le contrôle reste en interne).
+// Producteur ai_task, consommateur audio_task : un seul de chaque, ce que le
+// stream buffer exige.
+static StreamBufferHandle_t _stream_buf   = nullptr;
+static StaticStreamBuffer_t _stream_ctrl;
+static uint8_t*             _stream_store = nullptr;
+static volatile bool        _stream_eof   = false;
+
+#define STREAM_PREBUFFER_TIMEOUT_MS 4000   // départ forcé si le débit ne suit pas
+#define STREAM_PUSH_TIMEOUT_MS      5000   // au-delà, la lecture est morte
+
 enum AudioCmd {
     AUDIO_CMD_CLICK,
     AUDIO_CMD_FF6,
     AUDIO_CMD_TEST_LOOPBACK,
     AUDIO_CMD_RECORD_FILE,
     AUDIO_CMD_PLAY_PSRAM_STREAM,
+    AUDIO_CMD_PLAY_STREAM,
     AUDIO_CMD_WAKEWORD_ACK,
 };
 
@@ -309,6 +322,78 @@ static void _audio_play_psram_stream(const int16_t* pcm, size_t samples, bool fr
     if (free_after) free((void*)pcm);
 }
 
+// Lecture EN FLUX. Une seule session, donc un seul wakeword_pause/resume et un
+// seul front descendant de audio_is_playing — c'est toute la raison d'être de
+// ce chemin séparé plutôt que d'empiler des PLAY_PSRAM_STREAM.
+static void _audio_play_stream() {
+    audio_is_playing = true;
+    _playback_stop_requested = false;
+
+    // Pré-remplissage : sans lui le DMA se vide au premier à-coup réseau.
+    uint32_t t0 = millis();
+    while (!_stream_eof && !_playback_stop_requested &&
+           xStreamBufferBytesAvailable(_stream_buf) < AUDIO_STREAM_PREBUFFER &&
+           millis() - t0 < STREAM_PREBUFFER_TIMEOUT_MS) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    // Transit dans la MOITIÉ HAUTE de _audio_buf, l'expansion stéréo remplit la
+    // basse. Sûr en montant : on n'écrit par-dessus l'octet source qu'au tout
+    // dernier échantillon, déjà recopié dans `v`. Évite un statique dédié, donc
+    // 2 Ko d'interne prélevés sur le plancher.
+    const size_t   cap  = 1024;                       // échantillons par bloc
+    int16_t* const mono = _audio_buf + cap;
+    size_t played = 0, underruns = 0;
+    uint8_t carry = 0;
+    bool    has_carry = false;
+
+    for (;;) {
+        if (_playback_stop_requested) break;
+
+        // ⚠️ Le flux n'est pas aligné sur 2 octets : ce qui arrive dépend du
+        // découpage TCP. L'octet orphelin est reporté au bloc suivant, sinon
+        // tout le reste du flux est décalé d'un octet.
+        // ⚠️ has_carry n'est levé qu'APRÈS réception : sinon un octet orphelin
+        // en fin de flux empêche la boucle de sortir (bytes impair -> n=0 ->
+        // on repart), et audio_task tourne sans fin, wakeword jamais relancé.
+        uint8_t* dst = (uint8_t*)mono;
+        size_t   off = has_carry ? 1 : 0;
+        if (off) dst[0] = carry;
+
+        size_t got = xStreamBufferReceive(_stream_buf, dst + off,
+                                          cap * sizeof(int16_t) - off,
+                                          pdMS_TO_TICKS(50));
+        if (got == 0) {
+            if (_stream_eof) break;   // un demi-échantillon en attente est perdu, sans effet
+            if (!off) underruns++;
+            continue;
+        }
+        has_carry = false;
+        size_t bytes = got + off;
+        if (bytes & 1) {              // demi-échantillon en fin de bloc
+            carry = dst[bytes - 1];
+            has_carry = true;
+            bytes--;
+        }
+
+        size_t n = bytes / sizeof(int16_t);
+        for (size_t i = 0; i < n; i++) {
+            int16_t v = mono[i];
+            _audio_buf[i * 2]     = v;
+            _audio_buf[i * 2 + 1] = v;
+        }
+        if (n) _i2s.write((uint8_t*)_audio_buf, n * 2 * sizeof(int16_t));
+        played += n;
+    }
+
+    audio_is_playing = false;
+    // Pas de %f : newlib nano ne le gère pas.
+    unsigned ms = (unsigned)((uint64_t)played * 1000 / AUDIO_SAMPLE_RATE);
+    // underruns > 0 = le tampon s'est vidé : c'est ce qui s'entend en clics.
+    log_line("[Audio] Flux joué : %u,%u s (%u ech.), %u creux",
+             ms / 1000, (ms % 1000) / 100, (unsigned)played, (unsigned)underruns);
+}
+
 static void _sound_click() {
     _play_tone(1200.0f, 30, 0.5f);
 }
@@ -407,6 +492,7 @@ static void _audio_task(void* pvParameters) {
             case AUDIO_CMD_PLAY_PSRAM_STREAM:
                 _audio_play_psram_stream(msg.buf, msg.samples, msg.free_after);
                 break;
+            case AUDIO_CMD_PLAY_STREAM:    _audio_play_stream();   break;
         }
         wakeword_resume();
 
@@ -487,6 +573,49 @@ void audio_play_psram_stream_queue(const int16_t* psram_buf, size_t samples, boo
     msg.cmd = AUDIO_CMD_PLAY_PSRAM_STREAM;
     msg.buf = psram_buf; msg.samples = samples; msg.free_after = free_after;
     xQueueSend(_audio_queue, &msg, portMAX_DELAY);
+}
+
+// ⚠️ Le stockage doit faire xBufferSizeBytes + 1 : le stream buffer FreeRTOS
+// garde une case morte pour distinguer plein de vide.
+static bool _ensure_stream_buffer() {
+    if (_stream_buf) return true;
+    _stream_store = (uint8_t*)heap_caps_malloc(AUDIO_STREAM_BYTES + 1, MALLOC_CAP_SPIRAM);
+    if (!_stream_store) {
+        log_line("[Audio] PSRAM insuffisante pour le flux TTS (%u o)",
+                 (unsigned)AUDIO_STREAM_BYTES);
+        return false;
+    }
+    // ⚠️ Seuil de déclenchement = un bloc entier. À 1, chaque lecture rendait
+    // quelques octets et l'I2S recevait des centaines d'écritures minuscules
+    // par seconde : le DMA se vidait entre deux, ce qui s'entend en tics. Le
+    // délai d'attente de la réception laisse quand même passer le reliquat
+    // final, plus court qu'un bloc.
+    _stream_buf = xStreamBufferCreateStatic(AUDIO_STREAM_BYTES, 1024 * sizeof(int16_t),
+                                            _stream_store, &_stream_ctrl);
+    return _stream_buf != nullptr;
+}
+
+bool audio_stream_begin() {
+    if (!_audio_queue || !_ensure_stream_buffer()) return false;
+    xStreamBufferReset(_stream_buf);
+    _stream_eof = false;
+    AudioMsg msg = {};
+    msg.cmd = AUDIO_CMD_PLAY_STREAM;
+    xQueueSend(_audio_queue, &msg, portMAX_DELAY);
+    return true;
+}
+
+size_t audio_stream_push(const uint8_t* data, size_t len) {
+    if (!_stream_buf) return 0;
+    return xStreamBufferSend(_stream_buf, data, len, pdMS_TO_TICKS(STREAM_PUSH_TIMEOUT_MS));
+}
+
+void audio_stream_end() {
+    _stream_eof = true;
+}
+
+bool audio_stream_allocated() {
+    return _stream_store != nullptr;
 }
 
 void audio_record_file(int max_ms, audio_record_done_cb on_done) {

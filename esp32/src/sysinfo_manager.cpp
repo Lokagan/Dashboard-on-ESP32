@@ -490,6 +490,7 @@ static const Alloc allocs[] = {
     { "MQTT in",    false, MQTT_BUFFER_SIZE },
     { "MQTT build", false, MQTT_BUFFER_SIZE },
     { "Capture",    false, AUDIO_RECORD_CAPACITY_SAMPLES * sizeof(int16_t) },
+    { "Flux TTS",   false, AUDIO_STREAM_BYTES },
     { "Avatar",     false, COMPANION_PSRAM_BYTES },
     { "JSON",       false, JSON_TOTAL_SIZE },
     { "Sprite",     false, (uint32_t)SI_W * SI_H * 2 },
@@ -510,6 +511,7 @@ static const Stack stacks[] = {
     { "mqtt_task",  STACK_BYTES_MQTT_TASK  },
     { "ota_task",   STACK_BYTES_OTA_TASK   },
 };
+static const int stack_count = sizeof(stacks) / sizeof(stacks[0]);
 
 // Taille de pile allouée, 0 si inconnue (tâche système)
 static uint16_t stack_size(const char* name) {
@@ -527,6 +529,7 @@ static bool alloc_pending(const Alloc& a) {
     if (strcmp(a.label, "Sprite") == 0 || strcmp(a.label, "Canvas") == 0)
         return !sysinfo_allocated();
     if (strcmp(a.label, "Screenshot") == 0) return !panel_capture_allocated();
+    if (strcmp(a.label, "Flux TTS")   == 0) return !audio_stream_allocated();
     return false;
 }
 
@@ -793,8 +796,12 @@ constexpr int VAL_N   = 3;
 constexpr int LIVE_Y  = CARD_Y + BIG_Y - 1;                   // bande BLITTÉE
 constexpr int LIVE_H  = (VAL_Y + VAL_N * VAL_LH) - BIG_Y + 1;
 
-constexpr int LIST_Y  = CARD_Y + CARD_H + 22;     // 1re ligne de la liste
-constexpr int LIST_LH = 12;
+// ⚠️ 18 postes à loger sous les cartes : ni en-tête de section ni filet de
+// séparation, et interligne à 11 px -> 10 lignes par colonne. 11 est le
+// PLANCHER : le filet de proportion occupe y+9 et y+10, à 10 px il passerait
+// sous le texte de la ligne suivante.
+constexpr int LIST_Y  = CARD_Y + CARD_H + 4;      // 1re ligne de la liste
+constexpr int LIST_LH = 11;
 constexpr int COL_W   = CARD_W - PAD * 2;         // largeur utile d'une colonne
 
 constexpr int EVERY_N = 2;      // un rafraîchissement sur deux : le heap ne
@@ -928,20 +935,18 @@ static void draw_static(const inv::Mem& m) {
     card_frame(CARD_LX, "RAM INTERNE", m.int_total, C_MEM_INT, C_MEM_INT_DK);
     card_frame(CARD_RX, "PSRAM",       m.ps_total,  C_MEM_EXT, C_MEM_EXT_DK);
 
-    draw::hline(CARD_Y + CARD_H + 5);
-    draw::section(CARD_Y + CARD_H + 9, ">> POSTES CONNUS");
-
-    // Piles et ESP_SR ne sont pas dans inv::allocs (somme et mesure au boot) :
-    // ils rejoignent ici la colonne interne, d'où le +2. ⚠️ Dimensionné sur la
-    // table, pas à la main — un poste de plus déborderait sans rien dire.
-    Item li[inv::alloc_count + 2], ri[inv::alloc_count];
+    // ESP_SR et les piles ne sont pas dans inv::allocs (mesure au boot, et
+    // miroir de config.h) : ils rejoignent ici la colonne interne, d'où le
+    // dimensionnement. ⚠️ Sur les tables, pas à la main — un poste de plus
+    // déborderait sans rien dire.
+    Item li[inv::alloc_count + 1 + inv::stack_count], ri[inv::alloc_count];
     int  nl = 0, nr = 0;
     for (auto const& a : inv::allocs) {
         if (a.internal) li[nl++] = { a.label, a.bytes };
         else            ri[nr++] = { a.label, a.bytes };
     }
-    li[nl++] = { "Piles x6", inv::stacks_bytes() };
-    li[nl++] = { "ESP_SR",   m.esp_sr };
+    li[nl++] = { "ESP_SR", m.esp_sr };
+    for (auto const& s : inv::stacks) li[nl++] = { s.name, s.stack };
 
     list_col(CARD_LX, li, nl, C_MEM_INT, C_MEM_INT_DK);
     list_col(CARD_RX, ri, nr, C_MEM_EXT, C_MEM_EXT_DK);
