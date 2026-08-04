@@ -274,8 +274,13 @@ pio device monitor -b 115200
   </tr>
   <tr>
     <td align="center"><img src="docs/img/nas-disques.jpg" width="250"><br><sub><b>NAS – Disques</b> — table SMART/statut/T°</sub></td>
-    <td align="center"><img src="docs/img/sysinfo.jpg" width="250"><br><sub><b>SysInfo</b> — diagnostics (page 1/6)</sub></td>
     <td align="center"><img src="docs/img/companion.jpg" width="250"><br><sub><b>Companion IA</b> — assistant vocal « Jarvis »</sub></td>
+    <td align="center"><img src="docs/img/sysinfo.jpg" width="250"><br><sub><b>SysInfo 1/6</b> — identité, CPU, flash</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/img/sysinfo-memoire.jpg" width="250"><br><sub><b>SysInfo 2/6</b> — bilan RAM interne / PSRAM</sub></td>
+    <td align="center"><img src="docs/img/sysinfo-taches.jpg" width="250"><br><sub><b>SysInfo 3/6</b> — tâches FreeRTOS, %CPU, piles</sub></td>
+    <td align="center"><img src="docs/img/sysinfo-partitions.jpg" width="250"><br><sub><b>SysInfo 4/6</b> — carte de la flash 16 Mo</sub></td>
   </tr>
 </table>
 
@@ -317,6 +322,8 @@ Table « qui fait quoi sur le réseau » : pour chaque appareil, le **service** 
 ### Interface web ESP32
 
 Accessible sur `http://<IP_ESP32>/` (port 80, `http_manager.cpp`, tâche FreeRTOS dédiée). Deux colonnes.
+
+<p align="center"><img src="docs/img/interface-web.jpg" width="760"><br><sub>Interface web embarquée — assistant, journal, LittleFS à gauche ; navigation, paramètres et diagnostic à droite</sub></p>
 
 Colonne de gauche :
 - **Assistant IA** : poser une question en texte, ou lancer une écoute vocale (champ vide + « Demander », même séquence que le wake word)
