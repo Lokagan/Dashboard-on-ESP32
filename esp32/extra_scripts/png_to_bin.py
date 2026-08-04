@@ -6,8 +6,9 @@ LittleFS via `pio run -t uploadfs`.
 
 Format produit (PAS de header LVGL) :
     [plan couleur RGB565, w*h*2 octets, little-endian]
-  + [plan alpha A8,        w*h*1 octet ]
+  + [plan alpha A8,        w*h*1 octet ]   (--format rgb565a8, défaut)
 Layout confirmé par la doc LVGL v9 pour LV_COLOR_FORMAT_RGB565A8.
+`--format rgb565` s'arrête au plan couleur, pour une image opaque.
 Le lv_image_dsc_t correspondant est reconstruit à la main côté
 firmware (voir ai_companion.cpp) — aucun risque de désalignement
 avec un format de header qui changerait d'une version LVGL à l'autre.
@@ -58,7 +59,7 @@ def rgb888_to_rgb565(r, g, b):
 # ----------------------------------------------------------------
 # API LOCALES
 # ----------------------------------------------------------------
-def convert_one(png_path: Path, out_path: Path, size: int):
+def convert_one(png_path: Path, out_path: Path, size: int, fmt: str):
     img = Image.open(png_path).convert("RGBA")
     if img.size != (size, size):
         raise ValueError(
@@ -76,7 +77,9 @@ def convert_one(png_path: Path, out_path: Path, size: int):
             color_plane += struct.pack("<H", rgb888_to_rgb565(r, g, b))
             alpha_plane.append(a)
 
-    blob = bytes(color_plane) + bytes(alpha_plane)
+    blob = bytes(color_plane)
+    if fmt == "rgb565a8":
+        blob += bytes(alpha_plane)
     out_path.write_bytes(blob)
     return len(blob)
 
@@ -90,6 +93,9 @@ def main():
                      help="Dossier de sortie (défaut : même dossier que l'entrée)")
     ap.add_argument("--size", type=int, default=120,
                      help="Largeur/hauteur attendue en pixels (défaut : 120)")
+    ap.add_argument("--format", choices=("rgb565a8", "rgb565"), default="rgb565a8",
+                     help="rgb565 omet le plan alpha (2 o/px au lieu de 3) — "
+                          "réservé aux images opaques")
     args = ap.parse_args()
 
     if args.input.is_dir():
@@ -108,7 +114,7 @@ def main():
     for png in pngs:
         out_path = out_dir / (png.stem + ".bin")
         try:
-            n = convert_one(png, out_path, args.size)
+            n = convert_one(png, out_path, args.size, args.format)
             total += n
             print(f"  {png.name:30s} -> {out_path.name:30s} ({n} octets)")
         except Exception as e:

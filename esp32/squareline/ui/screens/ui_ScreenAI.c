@@ -70,8 +70,7 @@ ui_LabelQuestion = lv_label_create(ui_ScreenAI);
 lv_obj_set_width( ui_LabelQuestion, 320);
 lv_obj_set_height( ui_LabelQuestion, 30);
 lv_obj_set_x( ui_LabelQuestion, 0 );
-lv_obj_set_y( ui_LabelQuestion, 10 );
-lv_obj_set_align( ui_LabelQuestion, LV_ALIGN_CENTER );
+lv_obj_set_y( ui_LabelQuestion, 122 );
 lv_label_set_long_mode(ui_LabelQuestion,LV_LABEL_LONG_SCROLL);
 lv_label_set_text(ui_LabelQuestion,"Question\n");
 lv_obj_add_flag( ui_LabelQuestion, LV_OBJ_FLAG_CLICKABLE );   /// Flags
@@ -83,10 +82,9 @@ lv_obj_set_style_text_font(ui_LabelQuestion, &ui_font_Font12, LV_PART_MAIN| LV_S
 
 ui_LabelAnswer = lv_label_create(ui_ScreenAI);
 lv_obj_set_width( ui_LabelAnswer, 320);
-lv_obj_set_height( ui_LabelAnswer, 90);
+lv_obj_set_height( ui_LabelAnswer, 88);
 lv_obj_set_x( ui_LabelAnswer, 0 );
-lv_obj_set_y( ui_LabelAnswer, 70 );
-lv_obj_set_align( ui_LabelAnswer, LV_ALIGN_CENTER );
+lv_obj_set_y( ui_LabelAnswer, 152 );
 lv_label_set_text(ui_LabelAnswer,"Réponse");
 lv_obj_add_flag( ui_LabelAnswer, LV_OBJ_FLAG_CLICKABLE );   /// Flags
 lv_obj_remove_flag( ui_LabelAnswer, LV_OBJ_FLAG_PRESS_LOCK | LV_OBJ_FLAG_CLICK_FOCUSABLE | LV_OBJ_FLAG_GESTURE_BUBBLE | LV_OBJ_FLAG_SNAPPABLE );    /// Flags

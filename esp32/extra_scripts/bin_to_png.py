@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-bin_to_png.py — Convertit un ou plusieurs blobs RGB565A8 .bin en PNG RGBA
+bin_to_png.py — Convertit un ou plusieurs blobs .bin en PNG RGBA
 
 Format attendu :
     [plan couleur RGB565, w*h*2 octets, little-endian]
-  + [plan alpha A8,        w*h*1 octet ]
+  + [plan alpha A8,        w*h*1 octet ]   (--format rgb565a8, défaut)
+`--format rgb565` s'arrête au plan couleur, l'image sort opaque.
 
-Inverse exact du script png_to_bin.py.
+Inverse exact du script png_to_bin.py — même option `--format`, et les frames
+de data/companion/ sont en rgb565.
 
 USAGE
 -----
@@ -19,6 +21,9 @@ Un dossier entier :
 
 Taille différente de 120x120 :
     python3 bin_to_png.py mon_icone.bin --size 64
+
+Frames de l'avatar (sans plan alpha) :
+    python3 bin_to_png.py ../data/companion/ --format rgb565 -o /tmp/frames/
 
 PRÉREQUIS
 ---------
@@ -60,18 +65,18 @@ def rgb565_to_rgb888(value):
 # ----------------------------------------------------------------
 # API LOCALES
 # ----------------------------------------------------------------
-def convert_one(bin_path: Path, out_path: Path, size: int):
+def convert_one(bin_path: Path, out_path: Path, size: int, fmt: str):
     data = bin_path.read_bytes()
     pixel_count = size * size
     color_size = pixel_count * 2
-    alpha_size = pixel_count
-    expected_size = color_size + alpha_size
+    has_alpha = (fmt == "rgb565a8")
+    expected_size = color_size + (pixel_count if has_alpha else 0)
 
     if len(data) != expected_size:
         raise ValueError(
             f"{bin_path.name} : taille {len(data)} octets, "
             f"attendu {expected_size} octets pour une image "
-            f"{size}x{size} RGB565A8."
+            f"{size}x{size} {fmt.upper()}."
         )
 
     color_plane = data[:color_size]
@@ -86,7 +91,7 @@ def convert_one(bin_path: Path, out_path: Path, size: int):
             offset = index * 2
             rgb565 = struct.unpack_from("<H", color_plane, offset)[0]
             r, g, b = rgb565_to_rgb888(rgb565)
-            a = alpha_plane[index]
+            a = alpha_plane[index] if has_alpha else 255
             pixels[x, y] = (r, g, b, a)
     img.save(out_path, "PNG")
     return len(data)
@@ -96,7 +101,7 @@ def convert_one(bin_path: Path, out_path: Path, size: int):
 # API PUBLIQUES
 # ----------------------------------------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="RGB565A8 .bin -> PNG RGBA")
+    ap = argparse.ArgumentParser(description="RGB565A8 / RGB565 .bin -> PNG RGBA")
 
     ap.add_argument("input", type=Path,
         help="Fichier .bin ou dossier contenant des .bin")
@@ -104,6 +109,8 @@ def main():
                     help="Dossier de sortie (défaut : même dossier que l'entrée)")
     ap.add_argument("--size", type=int, default=120,
         help="Largeur/hauteur de l'image (défaut : 120)")
+    ap.add_argument("--format", choices=("rgb565a8", "rgb565"), default="rgb565a8",
+                    help="rgb565 : pas de plan alpha (2 o/px), image opaque")
     args = ap.parse_args()
 
     if args.input.is_dir():
@@ -123,7 +130,7 @@ def main():
     for bin_file in bins:
         out_path = out_dir / (bin_file.stem + ".png")
         try:
-            n = convert_one(bin_file, out_path, args.size)
+            n = convert_one(bin_file, out_path, args.size, args.format)
             total += n
 
             print(f"  {bin_file.name:30s} -> "

@@ -9721,7 +9721,7 @@
                 "strtype": "OBJECT/Position",
                 "intarray": [
                   0,
-                  10
+                  122
                 ],
                 "InheritedType": 7
               },
@@ -9738,7 +9738,7 @@
               {
                 "nid": 70,
                 "strtype": "OBJECT/Align",
-                "strval": "CENTER",
+                "strval": "TOP_LEFT",
                 "InheritedType": 3
               },
               {
@@ -9909,7 +9909,7 @@
                 "strtype": "OBJECT/Position",
                 "intarray": [
                   0,
-                  70
+                  152
                 ],
                 "InheritedType": 7
               },
@@ -9919,14 +9919,14 @@
                 "strtype": "OBJECT/Size",
                 "intarray": [
                   320,
-                  90
+                  88
                 ],
                 "InheritedType": 7
               },
               {
                 "nid": 70,
                 "strtype": "OBJECT/Align",
-                "strval": "CENTER",
+                "strval": "TOP_LEFT",
                 "InheritedType": 3
               },
               {
@@ -10196,7 +10196,7 @@
               {
                 "nid": 1020,
                 "strtype": "IMAGE/Asset",
-                "strval": "-",
+                "strval": "",
                 "InheritedType": 5
               },
               {
@@ -10516,7 +10516,7 @@
   },
   "animations": [],
   "selected_theme": "Default",
-  "selected_screen": "GUID3999223-995875S895144",
+  "selected_screen": "GUID33796434-555143S6075191",
   "info": {
     "name": "dashboard.spj",
     "depth": 1,
@@ -10545,7 +10545,7 @@
     "separate_screen_save": false,
     "hierarchy_state_save": false,
     "reverse_event_order": false,
-    "backup_cnt": 183,
+    "backup_cnt": 184,
     "autosave_cnt": 0,
     "group_color_cnt": 2,
     "imagebytearrayprefix": "",

@@ -11,6 +11,12 @@ esp32/src/config.h
 esp32/squareline/ui/backup/
 esp32/*.local.ini
 
+# Avatar Companion — atelier local (planche source, découpe, PNG intermédiaires).
+# Seuls les .bin de data/companion/ sont versionnés.
+esp32/extra_scripts/companion_src/
+esp32/extra_scripts/companion_png_v2/
+esp32/extra_scripts/companion_slice.py
+
 # Services NAS — secrets + état runtime local + captures vocales
 synology/monitor.env
 synology/scripts/bridge_settings.json

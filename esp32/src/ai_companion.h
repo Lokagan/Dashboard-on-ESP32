@@ -9,14 +9,14 @@
 
 // ---- OBJETS GLOBAUX ----
 
-// Avatar préchargé en PSRAM : chaque frame porte un plan RGB565 (2 o/px) suivi
-// d'un plan alpha A8 (1 o/px). Consommateur externe : la page MEMOIRE de
-// SysInfo (_si_alloc). Le nombre de frames est vérifié par static_assert
-// contre la vraie liste, dans ai_companion.cpp.
+// Avatar préchargé en PSRAM : chaque frame est un plan RGB565 (2 o/px), sans
+// plan alpha — les frames sont des carrés opaques. Consommateur externe : la
+// page MEMOIRE de SysInfo (_si_alloc). Le nombre de frames est vérifié par
+// static_assert contre la vraie liste, dans ai_companion.cpp.
 #define COMPANION_FRAME_W     120
 #define COMPANION_FRAME_H     120
-#define COMPANION_FRAME_COUNT 21
-#define COMPANION_FRAME_SZ    (COMPANION_FRAME_W * COMPANION_FRAME_H * 3)
+#define COMPANION_FRAME_COUNT 42
+#define COMPANION_FRAME_SZ    (COMPANION_FRAME_W * COMPANION_FRAME_H * 2)
 #define COMPANION_PSRAM_BYTES (COMPANION_FRAME_COUNT * COMPANION_FRAME_SZ)
 
 // ---- API PUBLIQUES ----
