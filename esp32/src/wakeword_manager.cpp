@@ -84,8 +84,23 @@ void wakeword_loop() {
     }
 }
 
+// ⚠️ DOUBLE appel volontaire, contournement d'une course DANS ESP_SR — ne pas
+// « simplifier ». audio_feed_task attend PAUSE_FEED *et* RESUME_FEED puis
+// efface les deux (esp32-hal-sr.c). Si resume() tombe alors que la tâche n'est
+// pas encore bloquée — elle était dans sa lecture I2S —, RESUME_FEED reste
+// posé ; la pause suivante trouve les deux bits et traverse l'attente sans
+// s'arrêter. ESP_SR continue alors de lire le micro PENDANT l'enregistrement,
+// les deux lecteurs se partagent l'anneau DMA et la capture perd les deux
+// tiers de ses échantillons (mesuré : x2,9 de temps réel pour l'audio produit,
+// phrase déchiquetée). Le 1er appel consomme le bit resté posé, le 2e pause
+// réellement ; le délai laisse la tâche atteindre son test.
+#define SR_PAUSE_SETTLE_MS 40   // > un chunk AFE (~32 ms)
+
 void wakeword_pause() {
-    if (_sr_started) ESP_SR.pause();
+    if (!_sr_started) return;
+    ESP_SR.pause();
+    vTaskDelay(pdMS_TO_TICKS(SR_PAUSE_SETTLE_MS));
+    ESP_SR.pause();
 }
 
 void wakeword_resume() {
