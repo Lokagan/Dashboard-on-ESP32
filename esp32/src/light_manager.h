@@ -22,6 +22,7 @@ struct LightStatus {
     uint16_t prox;
     uint16_t prox_base;     // repos suivi en continu
     uint16_t thr_near, thr_far;   // seuils vivants, base + delta
+    bool     psat;          // etage proximite sature — mesure a jeter
     uint32_t clux;          // CENTILUX (lux x100) — ce montage vit sous 1 lux
     uint16_t ch0, ch1;      // canaux bruts (visible + IR)
     bool     near;          // main actuellement au-dessus du seuil PROCHE
@@ -54,6 +55,11 @@ void light_wake();
 // Appelé par le tactile au PREMIER appui d'une séquence. Renvoie true si cet
 // appui a servi à sortir de veille : il ne doit alors pas atteindre LVGL.
 bool light_touch_wake();
+
+// Suspension DURE pendant l'OTA : ni veille, ni asservissement, ni geste.
+// L'écran de progression est en direct-draw et ota_task possède la dalle.
+void light_ota_suspend();
+void light_ota_resume();
 
 void light_get_status(LightStatus* out);
 void light_log_state();   // cmd "light" — lux, proximité, mode, veille

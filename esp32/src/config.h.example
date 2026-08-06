@@ -20,26 +20,24 @@
 #define DISPLAY_BRIGHTNESS_DEFAULT 10 // appliqué au boot ET position initiale du Slider
 
 // --- CAPTEUR DE LUMIÈRE / PROXIMITÉ (light_manager) ---
-#define LIGHT_POLL_MS              100     // cadence de lecture de la proximité
-#define LIGHT_ALS_EVERY_N          5       // 1 mesure de lumière sur N poll
+#define LIGHT_POLL_MS              50      // cadence de lecture de la proximité
+#define LIGHT_ALS_EVERY_N          10      // 1 mesure de lumière sur N poll — reste à 500 ms
 // ⚠️ Seuils en CENTILUX (lux x100), pas en lux : ce montage lit ~80 clux en
 // lumière tamisée, un entier en lux écraserait toute la plage utile à 0.
-#define LIGHT_CLUX_DARK            90      // en deçà : plancher — mesuré en lumière tamisée
-#define LIGHT_CLUX_BRIGHT          600     // au-delà : plafond — mesuré toutes lumières allumées
-#define LIGHT_BRIGHTNESS_MIN       10      // jamais sous DISPLAY_BRIGHTNESS_DEFAULT, la reference de l'utilisateur
-#define LIGHT_BRIGHTNESS_MAX       40      // plein eclairage — affaire de gout, a ajuster
+#define LIGHT_CLUX_DARK            80      // en deçà : plancher — mesuré en lumière tamisée
+#define LIGHT_CLUX_BRIGHT          800     // au-delà : plafond — mesuré toutes lumières allumées
+#define LIGHT_BRIGHTNESS_MIN       10      // Obscurité totale — affaire de gout, a ajuster
+#define LIGHT_BRIGHTNESS_MAX       40      // Plein éclairage  — affaire de gout, a ajuster
 #define LIGHT_BRIGHTNESS_STEP      3       // écart minimal avant d'écrire le rétroéclairage
 #define LIGHT_MANUAL_HOLD_MS       60000   // suspension de l'auto après un réglage manuel
-// ⚠️ Seuils RELATIFS à une ligne de base suivie en continu, jamais absolus : le
-// repos du canal de proximité vaut la DIAPHONIE du montage (retour interne de
-// la LED IR sur la vitre), qui dépend du gain et dérive avec la température.
-#define LIGHT_PROX_NEAR_DELTA      250     // au-dessus de la ligne de base : entrée du geste
+// ⚠️ Seuils RELATIFS à une ligne de base suivie en continu
+#define LIGHT_PROX_NEAR_DELTA      150     // au-dessus de la ligne de base : entrée du geste
 #define LIGHT_PROX_FAR_DELTA       100     // sortie (hystérésis)
-#define LIGHT_PROX_BASE_DIV        64      // inertie de la ligne de base (x LIGHT_POLL_MS)
+#define LIGHT_PROX_BASE_DIV        64      // inertie de la ligne de base (x LIGHT_POLL_MS) — reste à 3,2 s
 #define LIGHT_PROX_CEILING         1000    // ecretage des seuils : au-dela de 1023 le geste serait indetectable
 #define LIGHT_PROX_PERSIST         2       // echantillons consecutifs pour valider une transition
-#define LIGHT_GESTURE_MIN_MS       200     // en deçà : parasite. ⚠️ DOIT dépasser LIGHT_POLL_MS, sinon ne filtre rien
-#define LIGHT_GESTURE_MAX_MS       1500    // au-delà : main immobile, pas un passage
+#define LIGHT_GESTURE_MIN_MS       150     // en deçà : parasite. ⚠️ DOIT dépasser LIGHT_POLL_MS, sinon ne filtre rien
+#define LIGHT_GESTURE_MAX_MS       1000    // au-delà : main immobile, pas un passage
 #define LIGHT_GESTURE_COOLDOWN_MS  2000
 #define LIGHT_SLEEP_TIMEOUT_MS     300000  // 5 min sans proximité ni tactile
 #define LIGHT_PROBE_MS             2000    // re-sondage I2C quand le capteur est absent
@@ -196,7 +194,7 @@
 #define TOUCH_ADDR  0x38
 
 // --- Lumière/proximité APDS-9930 (I2C) — même bus que le tactile ---
-#define APDS_ADDR   0x39
+#define APDS_ADDR   0x39    // Port i2c de la carte (APDS-9930), IO15 = SCL, IO16 = SDA
 
 // --- Audio ES8311 (I2S) ---
 #define I2S_MCLK    4

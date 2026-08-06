@@ -645,8 +645,17 @@ static void _handle_screen_request() {
     while (panel_capture_seq() == seq0 && millis() - t0 < SCREEN_CAPTURE_TIMEOUT_MS)
         vTaskDelay(pdMS_TO_TICKS(20));
 
+    // Les deux échecs possibles ne se ressemblent pas et n'ont pas la même
+    // cause : sans cette ligne, l'un comme l'autre ne laissaient qu'un 504 nu.
     const uint16_t* px = (panel_capture_seq() != seq0) ? panel_capture_buffer() : nullptr;
-    if (!px) { server.send(504, "text/plain", "Capture indisponible"); return; }
+    if (!px) {
+        log_line("[HTTP] Capture KO : %s",
+                 panel_capture_seq() == seq0
+                     ? "aucune frame en 2 s — loopTask bloquee ou 'shot' ecrase"
+                     : "frame vide — lv_refr_now n'a rien repeint");
+        server.send(504, "text/plain", "Capture indisponible");
+        return;
+    }
 
     const uint32_t rowBytes = (uint32_t)SCREEN_WIDTH * 3;   // 960, déjà multiple de 4
     const uint32_t dataSize = rowBytes * SCREEN_HEIGHT;

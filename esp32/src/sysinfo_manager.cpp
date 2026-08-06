@@ -96,7 +96,7 @@
 #define SI_MAX_TASKS  32
 
 #define SI_REFRESH_TICKS  20    // timer à 50 ms -> rafraîchissement 1 Hz
-#define SI_SENSOR_TICKS   4     // page CAPTEUR : 5 Hz, on y suit la main à vue
+#define SI_SENSOR_TICKS   2     // page CAPTEUR : 10 Hz, on y suit la main à vue
 
 
 // ════════════════════════════════════════════════════════════
@@ -1752,8 +1752,9 @@ constexpr int CARD_Y  = BADGE_Y + 16;
 constexpr int CARD_X  = SI_LX - 2;
 constexpr int CARD_W  = SI_W - CARD_X * 2;
 constexpr int CARD_TH = 11;
-constexpr int CARD_H  = CARD_TH + 24;
+constexpr int CARD_H  = CARD_TH + 36;   // vedette + jauge + légende
 constexpr int VAL_Y   = CARD_Y + CARD_TH + 5;
+constexpr int LEG_Y   = VAL_Y + 18;     // sous la vedette (double hauteur) et la jauge
 constexpr int GAU_X   = SI_LX + 86;
 constexpr int GAU_W   = SI_W - GAU_X - SI_LX - 2;
 
@@ -1765,7 +1766,7 @@ constexpr int ROW1_N  = 3;
 constexpr int RULE2_Y = ROW1_Y + ROW1_N * SI_LH + 3;
 constexpr int SEC2_Y  = RULE2_Y + 5;
 constexpr int ROW2_Y  = SEC2_Y + SI_LH + 2;
-constexpr int ROW2_N  = 4;
+constexpr int ROW2_N  = 3;
 
 // Bandes BLITTÉES : la proximité seule d'un côté, les mesures lentes de l'autre.
 constexpr int LIVE_P_Y = BADGE_Y - 1;
@@ -1802,6 +1803,8 @@ static void draw_prox(const LightStatus& s) {
     bx += draw::badge(bx, BADGE_Y, s.present ? "CAPTEUR DETECTE" : "CAPTEUR ABSENT",
                       s.present ? C_GREEN : C_RED, s.present ? C_BG : C_WHITE) + 6;
     bx += draw::badge(bx, BADGE_Y, "GESTE INHIBE", C_YELLOW) + 6;
+    // Un étage saturé rend une valeur d'allure normale : seul ce badge le dit.
+    if (s.psat)   bx += draw::badge(bx, BADGE_Y, "SATURE", C_RED, C_WHITE) + 6;
     if (s.asleep) draw::badge(bx, BADGE_Y, "VEILLE", C_MAGENTA, C_WHITE);
 
     surface::rect(CARD_X, CARD_Y, CARD_W, CARD_H, C_DKCYAN);
@@ -1819,9 +1822,18 @@ static void draw_prox(const LightStatus& s) {
     draw::text(SI_LX + 2 + 4 * 12 + 4, VAL_Y + 8, "prox", C_DIM);
 
     draw::bar(GAU_X, VAL_Y + 1, GAU_W, draw::BAR_HERO, (float)s.prox / PROX_MAX, c);
-    mark(s.prox_base, C_DKCYAN);   // repos suivi, d'où partent les deux seuils
+    mark(s.prox_base, C_CYAN);     // repos suivi, d'où partent les deux seuils
     mark(s.thr_far,   C_ORANGE);
     mark(s.thr_near,  C_RED);
+
+    // Légende cadrée SUR LA JAUGE, pas sur la valeur-vedette, et dans l'ordre où
+    // les repères y apparaissent. Chaque valeur porte la couleur de SON trait.
+    snprintf(buf, sizeof(buf), "repos %u", (unsigned)s.prox_base);
+    draw::text(GAU_X, LEG_Y, buf, C_CYAN);
+    snprintf(buf, sizeof(buf), "proche %u", (unsigned)s.thr_near);
+    draw::text_right(GAU_X + GAU_W, LEG_Y, buf, C_RED);
+    snprintf(buf, sizeof(buf), "loin %u", (unsigned)s.thr_far);
+    draw::text(GAU_X + (GAU_W - gfx::text_w(buf)) / 2, LEG_Y, buf, C_ORANGE);
 }
 
 static void draw_slow(const LightStatus& s) {
@@ -1856,11 +1868,6 @@ static void draw_slow(const LightStatus& s) {
     else            snprintf(aux, sizeof(aux), "aucun");
     snprintf(buf, sizeof(buf), "%lu   (%s)", (unsigned long)s.gestures, aux);
     draw::row(y, "Gestes  ", buf, s.gestures ? C_GREEN : C_DIM);
-    y += SI_LH;
-
-    snprintf(buf, sizeof(buf), "repos %u   proche>=%u   loin<=%u",
-             (unsigned)s.prox_base, (unsigned)s.thr_near, (unsigned)s.thr_far);
-    draw::row(y, "Seuils  ", buf, C_DIM);
     y += SI_LH;
 
     if (s.since_present < LIGHT_POLL_MS * 5) snprintf(buf, sizeof(buf), "OUI");

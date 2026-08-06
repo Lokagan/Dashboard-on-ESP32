@@ -34,6 +34,7 @@
 #define APDS_PPULSE     0x0E
 #define APDS_CONTROL    0x0F
 #define APDS_ID         0x12
+#define APDS_STATUS     0x13   // bit 6 = PSAT (etage proximite sature)
 #define APDS_CH0DATA    0x14   // Ch0 puis Ch1 : 4 octets consécutifs
 #define APDS_PDATA      0x18
 
@@ -60,13 +61,18 @@
 #define LUX_AGAIN        16.0f
 
 // CONTROL, assemblé pièce par pièce plutôt qu'en constante opaque.
-#define APDS_PDRIVE_100MA  0x00   // courant LED max — 0x40 50 mA, 0x80 25 mA, 0xC0 12,5 mA
+// ⚠️ PDRIVE N'A AUCUN EFFET sur cette carte — vérifié le 2026-08-06 sur toute la
+// plage, 0x00 comme 0xC0 donnent la même mesure. La LED est alimentée par une
+// résistance posée sur la carte de dérivation, le registre ne fait que la
+// commuter. Ne pas y chercher un levier de portée : il n'y en a pas.
+#define APDS_PDRIVE_BITS   0x00   // 0x00 100 mA | 0x40 50 mA | 0x80 25 mA | 0xC0 12,5 mA
 #define APDS_PDIODE_CH1    0x20   // seule valeur valide en proximité
-#define APDS_PGAIN_BITS    0x08   // 0x00 1x | 0x04 2x | 0x08 4x | 0x0C 8x
+#define APDS_PGAIN_BITS    0x00   // 0x00 1x | 0x04 2x | 0x08 4x | 0x0C 8x
 
 // Impulsions IR par mesure de proximité (1-255). ⚠️ La PORTÉE ne suit pas le
 // signal : le retour d'une surface diffuse décroît en 1/d⁴, donc x4
-// d'impulsions ne vaut que x1,4 de distance.
+// d'impulsions ne vaut que x1,4 de distance. Avec PGAIN, seul couple de leviers
+// restant — PDRIVE est inopérant, cf. ci-dessus.
 #define APDS_PPULSE_COUNT  32
 
 // --- Présence du capteur (hotplug) ---
@@ -74,6 +80,7 @@ static bool     _present     = false;
 static uint8_t  _strikes     = 0;   // lectures ratées consécutives
 static uint32_t _last_probe  = 0;
 static uint32_t _plugs       = 0;
+static bool     _ota_suspended = false;
 
 // --- Luminosité ---
 static bool     _auto_on     = true;
@@ -87,6 +94,7 @@ static int      _applied_pct = DISPLAY_BRIGHTNESS_DEFAULT;
 static bool       _asleep       = false;
 static uint32_t   _last_present = 0;
 static lv_obj_t*  _last_screen  = nullptr;   // détection de changement d'écran
+static AiState    _last_ai      = AI_IDLE;   // idem, côté assistant
 
 // --- Geste ---
 static float    _prox_base    = -1.0f;   // repos suivi en continu (IR ambiant)
@@ -105,6 +113,7 @@ static uint32_t _gestures     = 0;
 static uint32_t _last_poll     = 0;
 static uint8_t  _als_countdown = 0;
 static uint16_t _last_prox     = 0;
+static bool     _psat          = false;   // etage proximite sature (STATUS bit 6)
 static uint32_t _last_clux     = 0;
 static uint16_t _last_ch0      = 0;
 static uint16_t _last_ch1      = 0;
@@ -181,7 +190,18 @@ static void _wake() {
 // Toute NAVIGATION sort de la veille, sans un seul appel à poser chez les
 // appelants : l'écran actif change quelle qu'en soit l'origine — tactile, MQTT,
 // page web, wake word. Le tactile pur passe par light_touch_wake().
+//
+// L'état de l'IA est surveillé de la même façon, pour ai_say() / POST /say :
+// Jarvis parle et l'avatar s'anime SANS changer d'écran.
+// ⚠️ Sur la TRANSITION, jamais sur l'état courant : un AI_ERROR qui persiste
+// rallumerait la dalle à chaque poll, donc aussitôt après chaque endormissement.
 static void _wake_on_interaction() {
+    AiState ai = ai_get_state();
+    if (ai != _last_ai) {
+        _last_ai = ai;
+        if (ai != AI_IDLE) _wake();
+    }
+
     lv_obj_t* scr = lv_scr_act();
     if (scr == _last_screen) return;
     _last_screen = scr;
@@ -201,9 +221,20 @@ static bool _probe() {
     _apds_write(APDS_WTIME,   0xFF);
     _apds_write(APDS_PPULSE,  APDS_PPULSE_COUNT);
     _apds_write(APDS_CONFIG,  0x00);
-    _apds_write(APDS_CONTROL, APDS_PDRIVE_100MA | APDS_PDIODE_CH1 |
+    _apds_write(APDS_CONTROL, APDS_PDRIVE_BITS  | APDS_PDIODE_CH1 |
                               APDS_PGAIN_BITS   | APDS_AGAIN_BITS);
     if (!_apds_write(APDS_ENABLE, 0x0F)) return false;   // PON | AEN | PEN | WEN
+
+    // ⚠️ Relecture. Une écriture qui n'aboutit pas laisse le capteur sur ses
+    // valeurs d'usine — dont PDIODE = 00, combinaison RÉSERVÉE : la proximité
+    // part alors en butée sans qu'aucun symptôme ne désigne la configuration.
+    const uint8_t want = APDS_PDRIVE_BITS | APDS_PDIODE_CH1 |
+                         APDS_PGAIN_BITS  | APDS_AGAIN_BITS;
+    uint8_t back[2];                       // 0x0E PPULSE puis 0x0F CONTROL
+    if (_apds_read(APDS_PPULSE, back, 2))
+        log_line("[Light] Relu : PPULSE=%u CONTROL=0x%02X (attendu %u / 0x%02X)%s",
+                 back[0], back[1], APDS_PPULSE_COUNT, want,
+                 (back[0] == APDS_PPULSE_COUNT && back[1] == want) ? "" : "  <<< ECART");
 
     _present      = true;
     _strikes      = 0;
@@ -260,6 +291,8 @@ void light_init() {
 }
 
 void light_loop() {
+    if (_ota_suspended) return;
+
     uint32_t now = millis();
 
     if (now - _last_poll < LIGHT_POLL_MS) return;
@@ -274,6 +307,11 @@ void light_loop() {
         }
         return;
     }
+
+    // ⚠️ PSAT relevé AVANT la mesure : un étage saturé rend une valeur qui a
+    // l'air normale, seul ce bit le dit.
+    uint8_t st;
+    if (_apds_read(APDS_STATUS, &st, 1)) _psat = (st & 0x40) != 0;
 
     uint8_t pb[2];
     if (!_apds_read(APDS_PDATA, pb, 2)) {
@@ -393,6 +431,16 @@ void light_notify_manual() {
 
 void light_wake() { _wake(); }
 
+void light_ota_suspend() { _ota_suspended = true; }
+
+// ⚠️ Le compteur d'absence repart de zéro : un OTA plus long que
+// LIGHT_SLEEP_TIMEOUT_MS renverrait sinon l'écran en veille dès la reprise.
+void light_ota_resume() {
+    _ota_suspended = false;
+    _last_present  = millis();
+    _last_poll     = millis();
+}
+
 // ⚠️ La décision se prend ICI, pas dans _wake_on_interaction() : le compteur
 // d'inactivité de LVGL n'est mis à jour qu'APRÈS que l'appui lui a été livré,
 // donc trop tard pour l'intercepter.
@@ -409,6 +457,7 @@ void light_get_status(LightStatus* out) {
     out->prox_base     = _prox_base < 0.0f ? 0 : (uint16_t)_prox_base;
     out->thr_near      = _thr_near;
     out->thr_far       = _thr_far;
+    out->psat          = _psat;
     out->clux          = _last_clux;
     out->ch0           = _last_ch0;
     out->ch1           = _last_ch1;

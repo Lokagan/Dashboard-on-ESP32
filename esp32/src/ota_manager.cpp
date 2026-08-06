@@ -23,6 +23,7 @@
 #include "ota_manager.h"
 #include "config.h"
 #include "display_manager.h"
+#include "light_manager.h"
 #include "display_driver.h"
 #include "display_gfx.h"
 #include "audio_manager.h"
@@ -269,6 +270,11 @@ void ota_init() {
     ArduinoOTA.onStart([]() {
         String type = ArduinoOTA.getCommand() == U_FLASH ? "firmware" : "filesystem";
         log_line("[OTA] Début mise à jour : %s", type.c_str());
+        // Sort de veille AVANT tout : l'écran de progression est en direct-draw
+        // hors LVGL, il ne passe donc par aucun des chemins de réveil habituels
+        // et s'afficherait sur une dalle éteinte.
+        light_wake();
+        light_ota_suspend();      // sinon la veille tombe en plein flash (5 min d'absence)
         led_pause();
         display_pause();
         wakeword_ota_suspend();   // ESP_SR vole sinon le cœur 0 à l'ota_task (prio 5 > 2)
@@ -312,6 +318,7 @@ void ota_init() {
         display_resume();
         wakeword_ota_resume();   // échec : on relâche le verrou (le succès reboote)
         mqtt_ota_resume();
+        light_ota_resume();
     });
 
     ArduinoOTA.begin();
