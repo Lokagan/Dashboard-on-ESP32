@@ -16,6 +16,7 @@
 #include "config.h"
 #include "mqtt_manager.h"
 #include "display_manager.h"
+#include "light_manager.h"
 #include "audio_manager.h"
 #include "ai_manager.h"
 #include "sysinfo_manager.h"
@@ -38,7 +39,7 @@ static size_t _rx_len = 0;
 
 // Aides des messages d'erreur de esp32/cmd.
 // ⚠️ Doivent tenir dans LOG_LINE_LEN (100 OCTETS, dont 10 d'horodatage)
-static const char* CMD_HELP      = "page:X, brightness, volume, loop:on|off, mem, saverec, spy, tree, shot, reboot";
+static const char* CMD_HELP      = "page:X, brightness, volume, light, loop, mem, saverec, spy, tree, shot, reboot";
 static const char* CMD_HELP_PAGE = "home, nas, freebox, ai, sysinfo[1-6], disks, downloads, connections, devices, activity";
 
 // ---- API LOCALES ----
@@ -255,6 +256,12 @@ void mqtt_handle_esp_cmd(const char* cmd) {
         if      (strcmp(arg, "on")  == 0) log_set_loop_measure(true);
         else if (strcmp(arg, "off") == 0) log_set_loop_measure(false);
         else log_line("[MQTT] loop attend on|off : %s", arg);
+
+    } else if (strcmp(buf, "light") == 0) {
+        if      (strcmp(arg, "auto")   == 0) light_set_auto(true);
+        else if (strcmp(arg, "manual") == 0) light_set_auto(false);
+        else if (*arg == '\0')               light_log_state();
+        else log_line("[MQTT] light attend auto|manual : %s", arg);
 
     } else if (strcmp(buf, "mem") == 0) {
         sysinfo_log_memory();

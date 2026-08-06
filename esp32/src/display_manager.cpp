@@ -24,6 +24,7 @@
 #include "audio_manager.h"
 #include "ai_manager.h"
 #include "ai_companion.h"
+#include "light_manager.h"
 #include "log_manager.h"
 
 // ---- OBJETS GLOBAUX ----
@@ -39,6 +40,10 @@
 #define CHART_REFRESH_MIN_INTERVAL_MS 1000
 
 // Instance partagée (extern depuis sysinfo_manager.cpp)
+
+// Consigne et veille sont indépendantes : le réveil retrouve la luminosité.
+static int  _bl_pct      = DISPLAY_BRIGHTNESS_DEFAULT;
+static bool _bl_sleeping = false;
 
 static lv_display_t* _disp = nullptr;
 static lv_color_t*   _buf1 = nullptr;
@@ -573,6 +578,32 @@ static void _table_load(TableSource source) {
     if (lv_scr_act() != ui_ScreenTable) lv_scr_load(ui_ScreenTable);
 }
 
+static void _bl_apply() {
+    analogWrite(TFT_BL, _bl_sleeping ? 0 : map(_bl_pct, 0, 100, 0, 255));
+}
+
+// BtnLight (écran d'accueil) : miroir de l'état de light_manager, qui bouge
+// aussi par MQTT, par la page web et au débranchement du capteur.
+// ⚠️ N'écrit que sur CHANGEMENT — lv_label_set_text invalide même à texte
+// identique, et cette synchro est appelée à chaque frame.
+static int8_t _light_btn_present = 0;    // 0 = masqué, état posé par display_init
+static int8_t _light_btn_auto    = -1;   // -1 = jamais appliqué
+
+static void _light_btn_sync() {
+    LightStatus s;
+    light_get_status(&s);
+
+    if ((int8_t)s.present != _light_btn_present) {
+        _light_btn_present = (int8_t)s.present;
+        if (s.present) lv_obj_remove_flag(ui_BtnLight, LV_OBJ_FLAG_HIDDEN);
+        else           lv_obj_add_flag(ui_BtnLight, LV_OBJ_FLAG_HIDDEN);
+    }
+    if ((int8_t)s.auto_on != _light_btn_auto) {
+        _light_btn_auto = (int8_t)s.auto_on;
+        lv_label_set_text(ui_LabelLight, s.auto_on ? "Auto" : "Manuel");
+    }
+}
+
 // ---- API PUBLIQUES ----
 
 // --- Init / Loop ---
@@ -586,7 +617,7 @@ void display_init() {
         log_line("[Display] FATAL: dalle indisponible");
         return;
     }
-    analogWrite(TFT_BL, map(DISPLAY_BRIGHTNESS_DEFAULT, 0, 100, 0, 255));
+    _bl_apply();
 
     lv_init();
 
@@ -702,6 +733,15 @@ void display_init() {
         display_show_sysinfo();
     }, LV_EVENT_CLICKED, nullptr);
 
+    // --- Bouton Light — bascule l'asservissement du rétroéclairage ---
+    // Masqué au départ : light_init() n'a pas encore tourné, _light_btn_sync()
+    // le fera apparaître dès que le capteur répond (et le remasquera s'il part).
+    lv_obj_add_flag(ui_BtnLight, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(ui_BtnLight, [](lv_event_t* e) {
+        audio_click();
+        light_set_auto(!light_is_auto());
+    }, LV_EVENT_CLICKED, nullptr);
+
     // --- Bouton Audio — test hardware micro/HP ---
     lv_obj_add_event_cb(ui_BtnAudio, [](lv_event_t* e) {
         audio_test_loopback();
@@ -778,6 +818,9 @@ void display_loop() {
         lv_tick_inc(now - _last_lv_tick);
         _last_lv_tick = now;
     }
+    // Seulement sur l'écran d'accueil : c'est le seul où le bouton est visible.
+    if (lv_scr_act() == ui_ScreenHome) _light_btn_sync();
+
     // Forcer un redraw LVGL (après un resume)
     if (_force_redraw) {
         _force_redraw = false;
@@ -1204,10 +1247,21 @@ bool display_capture_screen() {
     return true;
 }
 
+void display_set_brightness_silent(int percent) {
+    _bl_pct = constrain(percent, 0, 100);
+    _bl_apply();
+    lv_slider_set_value(ui_SliderLCD, _bl_pct, LV_ANIM_OFF);
+}
+
 void display_set_brightness(int percent) {
-    int duty = map(constrain(percent, 0, 100), 0, 100, 0, 255);
-    analogWrite(TFT_BL, duty);
-    lv_slider_set_value(ui_SliderLCD, constrain(percent, 0, 100), LV_ANIM_OFF);
+    display_set_brightness_silent(percent);
+    light_notify_manual();
+}
+
+void display_backlight_sleep(bool sleeping) {
+    if (_bl_sleeping == sleeping) return;
+    _bl_sleeping = sleeping;
+    _bl_apply();
 }
 
 void display_sync_volume_slider(int percent) {

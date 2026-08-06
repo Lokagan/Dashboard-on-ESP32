@@ -17,6 +17,7 @@
 #include "audio_manager.h"
 #include "ai_manager.h"
 #include "display_manager.h"
+#include "light_manager.h"
 #include "log_manager.h"
 
 // ---- OBJETS GLOBAUX ----
@@ -76,6 +77,10 @@ void wakeword_loop() {
 
     AiState s = ai_get_state();
     if (s != AI_LISTENING && s != AI_THINKING && s != AI_SPEAKING) {
+        // ⚠️ Explicite malgré le réveil sur changement d'écran de light_loop() :
+        // si la veille est tombée alors que l'écran IA était DÉJÀ affiché,
+        // lv_scr_act() ne change pas et rien ne réveillerait la dalle.
+        light_wake();
         display_show_ai_auto();   // vocal : arme le retour auto à l'écran précédent
         audio_wakeword_ack();
         ai_start_listening();

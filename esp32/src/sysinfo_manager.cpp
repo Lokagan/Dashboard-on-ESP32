@@ -1,7 +1,7 @@
 // ============================================================
 // SYSINFO_MANAGER.CPP — écran de diagnostic système.
 // Dessiné par gfx dans un buffer hors-écran puis copié (memcpy) dans un
-// lv_canvas affiché comme un écran LVGL normal. 6 pages, navigation
+// lv_canvas affiché comme un écran LVGL normal. 7 pages, navigation
 // tactile gauche/droite/centre.
 //
 // ORGANISATION DU FICHIER
@@ -11,8 +11,8 @@
 //                          FIXE       dessiné une fois, à l'entrée sur la page
 //                          BLITTÉ     réécrit par-dessus à chaque rafraîchissement
 //                          ASSEMBLAGE ce que le dispatcher appelle
-//   3. La TABLE        — _pages[] : draw / refresh / cadence. Ajouter une page
-//                        = une ligne + un bloc.
+//   3. La TABLE        — _pages[] : draw / refresh / période en ticks de 50 ms.
+//                        Ajouter une page = une ligne + un bloc.
 //   4. Écran, ticker, API publiques.
 // ============================================================
 
@@ -38,6 +38,7 @@
 #include "wifi_manager.h"
 #include "mqtt_manager.h"
 #include "wakeword_manager.h"
+#include "light_manager.h"
 #include "littlefs_manager.h"
 #include "log_manager.h"
 // Pour les tailles de l'inventaire — chaque poste vient du header de son propriétaire
@@ -95,6 +96,7 @@
 #define SI_MAX_TASKS  32
 
 #define SI_REFRESH_TICKS  20    // timer à 50 ms -> rafraîchissement 1 Hz
+#define SI_SENSOR_TICKS   4     // page CAPTEUR : 5 Hz, on y suit la main à vue
 
 
 // ════════════════════════════════════════════════════════════
@@ -1735,6 +1737,184 @@ static void draw() {
 
 
 // ════════════════════════════════════════════════════════════
+// PAGE 7 — CAPTEUR (APDS-9930)
+// ════════════════════════════════════════════════════════════
+// Page de RÉGLAGE : light_manager y compte les gestes sans les transmettre à
+// l'IA (sysinfo_sensor_page_active), on cale donc les seuils en regardant la
+// jauge. La proximité est rafraîchie 5x plus vite que le reste — c'est la seule
+// valeur avec laquelle on interagit à la main.
+
+namespace page_light {
+
+// -- géométrie --
+constexpr int BADGE_Y = SI_PAGE_Y0 + 16;
+constexpr int CARD_Y  = BADGE_Y + 16;
+constexpr int CARD_X  = SI_LX - 2;
+constexpr int CARD_W  = SI_W - CARD_X * 2;
+constexpr int CARD_TH = 11;
+constexpr int CARD_H  = CARD_TH + 24;
+constexpr int VAL_Y   = CARD_Y + CARD_TH + 5;
+constexpr int GAU_X   = SI_LX + 86;
+constexpr int GAU_W   = SI_W - GAU_X - SI_LX - 2;
+
+constexpr int RULE1_Y = CARD_Y + CARD_H + 4;
+constexpr int SEC1_Y  = RULE1_Y + 5;
+constexpr int ROW1_Y  = SEC1_Y + SI_LH + 2;
+constexpr int ROW1_N  = 3;
+
+constexpr int RULE2_Y = ROW1_Y + ROW1_N * SI_LH + 3;
+constexpr int SEC2_Y  = RULE2_Y + 5;
+constexpr int ROW2_Y  = SEC2_Y + SI_LH + 2;
+constexpr int ROW2_N  = 4;
+
+// Bandes BLITTÉES : la proximité seule d'un côté, les mesures lentes de l'autre.
+constexpr int LIVE_P_Y = BADGE_Y - 1;
+constexpr int LIVE_P_H = CARD_Y + CARD_H - LIVE_P_Y;
+constexpr int LIVE_S_Y = ROW1_Y - 1;
+constexpr int LIVE_S_H = ROW1_N * SI_LH + 1;
+constexpr int LIVE_T_Y = ROW2_Y - 1;
+constexpr int LIVE_T_H = ROW2_N * SI_LH + 1;
+
+static_assert(ROW2_Y + ROW2_N * SI_LH <= SI_PAGE_YMAX,
+              "page CAPTEUR : la derniere ligne deborde sur le pied de page");
+
+constexpr int PROX_MAX = 1023;   // pleine échelle du canal proximité
+
+// Un poll sur EVERY_N rafraîchit aussi les bandes lentes.
+constexpr int SLOW_EVERY_N = 5;
+static int _slow = 0;
+
+// ---- BLITTÉ ----
+
+// Repère de seuil sur la jauge de proximité : c'est lui qu'on vient lire pour
+// décider si LIGHT_PROX_NEAR_DELTA/FAR_DELTA sont bien placés.
+static void mark(int thr, uint16_t c) {
+    int x = GAU_X + 1 + (int)((GAU_W - 2) * (float)thr / PROX_MAX);
+    surface::vline(x, VAL_Y + 1, draw::BAR_HERO - 2, c);
+}
+
+static void draw_prox(const LightStatus& s) {
+    char buf[40];
+
+    surface::fill_rect(0, LIVE_P_Y, SI_W, LIVE_P_H, C_BG);
+
+    int bx = SI_LX;
+    bx += draw::badge(bx, BADGE_Y, s.present ? "CAPTEUR DETECTE" : "CAPTEUR ABSENT",
+                      s.present ? C_GREEN : C_RED, s.present ? C_BG : C_WHITE) + 6;
+    bx += draw::badge(bx, BADGE_Y, "GESTE INHIBE", C_YELLOW) + 6;
+    if (s.asleep) draw::badge(bx, BADGE_Y, "VEILLE", C_MAGENTA, C_WHITE);
+
+    surface::rect(CARD_X, CARD_Y, CARD_W, CARD_H, C_DKCYAN);
+    surface::fill_rect(CARD_X + 1, CARD_Y + 1, CARD_W - 2, CARD_TH - 1, C_DKCYAN);
+    draw::text(CARD_X + 4, CARD_Y + 3, "PROXIMITE", C_WHITE, C_DKCYAN);
+
+    if (!s.present) {
+        draw::text(SI_LX + 2, VAL_Y + 4, "Aucune reponse en 0x39 - branchez le capteur.", C_DIM);
+        return;
+    }
+
+    uint16_t c = s.near ? C_GREEN : s.prox > s.thr_far ? C_YELLOW : C_DIM;
+    snprintf(buf, sizeof(buf), "%4u", (unsigned)s.prox);
+    draw::big(SI_LX + 2, VAL_Y, buf, c);
+    draw::text(SI_LX + 2 + 4 * 12 + 4, VAL_Y + 8, "prox", C_DIM);
+
+    draw::bar(GAU_X, VAL_Y + 1, GAU_W, draw::BAR_HERO, (float)s.prox / PROX_MAX, c);
+    mark(s.prox_base, C_DKCYAN);   // repos suivi, d'où partent les deux seuils
+    mark(s.thr_far,   C_ORANGE);
+    mark(s.thr_near,  C_RED);
+}
+
+static void draw_slow(const LightStatus& s) {
+    char buf[48];
+    char aux[24];
+
+    surface::fill_rect(0, LIVE_S_Y, SI_W, LIVE_S_H, C_BG);
+    surface::fill_rect(0, LIVE_T_Y, SI_W, LIVE_T_H, C_BG);
+
+    // -- mesures --
+    int y = ROW1_Y;
+    snprintf(buf, sizeof(buf), "%lu.%02lu lux",
+             (unsigned long)(s.clux / 100), (unsigned long)(s.clux % 100));
+    draw::row(y, "Lumiere ", buf, C_CYAN, true,
+              (float)s.clux / LIGHT_CLUX_BRIGHT, C_CYAN, 120);
+    y += SI_LH;
+
+    snprintf(buf, sizeof(buf), "ch0 %u   ch1 %u", (unsigned)s.ch0, (unsigned)s.ch1);
+    draw::row(y, "Canaux  ", buf, C_WHITE);
+    y += SI_LH;
+
+    snprintf(buf, sizeof(buf), "%d%%", s.brightness);
+    draw::row(y, "Ecran   ", buf, C_GREEN, true, s.brightness / 100.0f, C_GREEN, 120);
+    draw::text_right(SI_W - SI_LX, y,
+                     !s.auto_on ? "MANUEL" : s.manual_hold ? "AUTO (suspendu)" : "AUTO",
+                     s.auto_on && !s.manual_hold ? C_GREEN : C_YELLOW);
+
+    // -- geste et veille --
+    y = ROW2_Y;
+    if (s.gestures) snprintf(aux, sizeof(aux), "il y a %lus",
+                             (unsigned long)(s.since_gesture / 1000));
+    else            snprintf(aux, sizeof(aux), "aucun");
+    snprintf(buf, sizeof(buf), "%lu   (%s)", (unsigned long)s.gestures, aux);
+    draw::row(y, "Gestes  ", buf, s.gestures ? C_GREEN : C_DIM);
+    y += SI_LH;
+
+    snprintf(buf, sizeof(buf), "repos %u   proche>=%u   loin<=%u",
+             (unsigned)s.prox_base, (unsigned)s.thr_near, (unsigned)s.thr_far);
+    draw::row(y, "Seuils  ", buf, C_DIM);
+    y += SI_LH;
+
+    if (s.since_present < LIGHT_POLL_MS * 5) snprintf(buf, sizeof(buf), "OUI");
+    else snprintf(buf, sizeof(buf), "non   (il y a %lus)",
+                  (unsigned long)(s.since_present / 1000));
+    draw::row(y, "Presence", buf, s.since_present < LIGHT_POLL_MS * 5 ? C_GREEN : C_DIM);
+    y += SI_LH;
+
+    if (s.asleep) snprintf(buf, sizeof(buf), "ACTIVE");
+    else if (s.since_present >= LIGHT_SLEEP_TIMEOUT_MS) snprintf(buf, sizeof(buf), "imminente");
+    else snprintf(buf, sizeof(buf), "dans %lus",
+                  (unsigned long)((LIGHT_SLEEP_TIMEOUT_MS - s.since_present) / 1000));
+    draw::row(y, "Veille  ", buf, s.asleep ? C_MAGENTA : C_WHITE);
+    snprintf(buf, sizeof(buf), "%lu branchement(s)", (unsigned long)s.plugs);
+    draw::text_right(SI_W - SI_LX, y, buf, C_DIM);
+}
+
+static void refresh() {
+    LightStatus s;
+    light_get_status(&s);
+
+    draw_prox(s);
+    surface::blit_rows(LIVE_P_Y, LIVE_P_H);
+
+    if (++_slow < SLOW_EVERY_N) return;
+    _slow = 0;
+    draw_slow(s);
+    surface::blit_rows(LIVE_S_Y, LIVE_S_H);
+    surface::blit_rows(LIVE_T_Y, LIVE_T_H);
+}
+
+// ---- FIXE ----
+
+static void draw() {
+    draw::section(SI_PAGE_Y0, ">> CAPTEUR APDS-9930");
+    draw::text_right(SI_W - SI_LX, SI_PAGE_Y0, "I2C 0x39 - bus tactile", C_DIM);
+
+    draw::hline(RULE1_Y);
+    draw::section(SEC1_Y, ">> MESURES");
+    draw::hline(RULE2_Y);
+    draw::section(SEC2_Y, ">> GESTE ET VEILLE");
+
+    _slow = SLOW_EVERY_N - 1;   // la 1re passe remplit les deux bandes lentes
+
+    LightStatus s;
+    light_get_status(&s);
+    draw_prox(s);
+    draw_slow(s);
+}
+
+}  // namespace page_light
+
+
+// ════════════════════════════════════════════════════════════
 // TABLE DES PAGES
 // ════════════════════════════════════════════════════════════
 // Source unique de l'ordre, du rendu et de la cadence. Ajouter une page =
@@ -1743,16 +1923,17 @@ static void draw() {
 struct PageDesc {
     void  (*draw)();      // rendu complet dans le sprite
     void  (*refresh)();   // colonnes vivantes + blit partiel ; nullptr = statique
-    uint8_t every_n;      // rafraîchissements de 1 Hz entre deux appels à refresh
+    uint8_t period;       // ticks de 50 ms entre deux appels à refresh
 };
 
 static const PageDesc _pages[] = {
-    { page_chip::draw,  page_chip::refresh,  1                 },
-    { page_mem::draw,   page_mem::refresh,   page_mem::EVERY_N },
-    { page_tasks::draw, page_tasks::refresh, 1                 },
-    { page_part::draw,  nullptr,             0                 },
-    { page_fs::draw,    nullptr,             0                 },
-    { page_net::draw,   nullptr,             0                 },
+    { page_chip::draw,  page_chip::refresh,  SI_REFRESH_TICKS                     },
+    { page_mem::draw,   page_mem::refresh,   SI_REFRESH_TICKS * page_mem::EVERY_N },
+    { page_tasks::draw, page_tasks::refresh, SI_REFRESH_TICKS                     },
+    { page_part::draw,  nullptr,             0                                    },
+    { page_fs::draw,    nullptr,             0                                    },
+    { page_net::draw,   nullptr,             0                                    },
+    { page_light::draw, page_light::refresh, SI_SENSOR_TICKS                      },
 };
 
 static const int _page_count = sizeof(_pages) / sizeof(_pages[0]);
@@ -1764,7 +1945,7 @@ static int _page = 0;   // page courante
 
 
 // ════════════════════════════════════════════════════════════
-// TICKER — horodatage 20 Hz + rafraîchissements 1 Hz
+// TICKER — horodatage 20 Hz + rafraîchissements à la période de la page
 // ════════════════════════════════════════════════════════════
 // ⚠️ %CPU mesuré ENTRE DEUX RENDUS : le coût du rendu compte donc dans
 // loopTask, qui apparaît plus chargée quand on la regarde. Même biais que htop.
@@ -1773,7 +1954,6 @@ namespace ticker {
 
 static lv_timer_t* _timer = nullptr;
 static uint8_t     _ticks = 0;
-static uint8_t     _skip  = 0;
 
 // ⚠️ Doit être appelé sur TOUTE sortie d'écran, pas seulement par screen::hide :
 // display_show_home/nas/ai() font un lv_scr_load() nu. Un timer survivant blitte
@@ -1790,25 +1970,21 @@ static void cb(lv_timer_t* t) {
     frame::clock();
     frame::blit_clock();
 
-    if (++_ticks < SI_REFRESH_TICKS) return;
-    _ticks = 0;
-
     const PageDesc& p = _pages[_page];
     if (!p.refresh) return;                       // page statique
-    if (++_skip < p.every_n) return;
-    _skip = 0;
+    if (++_ticks < p.period) return;
+    _ticks = 0;
     p.refresh();
 }
 
 static void start() {
     stop();
     _ticks = 0;
-    _skip  = 0;
     _timer = lv_timer_create(cb, 50, nullptr);
 }
 
 // Changement de page : la cadence repart de zéro.
-static void reset_cadence() { _skip = 0; }
+static void reset_cadence() { _ticks = 0; }
 
 }  // namespace ticker
 
@@ -1914,6 +2090,10 @@ static bool is_active() { return obj && lv_scr_act() == obj; }
 
 
 // ---- API PUBLIQUES ----
+
+bool sysinfo_sensor_page_active() {
+    return screen::is_active() && _page == SYSINFO_PAGE_LIGHT;
+}
 
 // Séparateur titré à largeur fixe : "=== TITRE ===…===(NN% libre)".
 static void _log_sep(const char* title, unsigned pctFree) {

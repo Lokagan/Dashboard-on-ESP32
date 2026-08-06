@@ -15,6 +15,7 @@
 #include "mqtt_manager.h"
 #include "display_manager.h"
 #include "touch_manager.h"
+#include "light_manager.h"
 #include "led_manager.h"
 #include "audio_manager.h"
 #include "ota_manager.h"
@@ -35,9 +36,9 @@ SET_LOOP_TASK_STACK_SIZE(STACK_BYTES_LOOP_TASK);
 #define LOOP_REPORT_MS  10000
 
 // Postes chronométrés. L'ordre est celui de la ligne de synthèse.
-enum { L_WIFI, L_MQTT, L_HTTP, L_LVGL, L_LED, L_AI, L_WW, L_COUNT };
+enum { L_WIFI, L_MQTT, L_HTTP, L_LVGL, L_LED, L_LIGHT, L_AI, L_WW, L_COUNT };
 static const char* const _loop_names[L_COUNT] =
-    { "wifi", "mqtt", "http", "lvgl", "led", "ai", "ww" };
+    { "wifi", "mqtt", "http", "lvgl", "led", "light", "ai", "ww" };
 
 static uint32_t      _loop_us[L_COUNT];   // cumul sur la fenêtre
 static uint32_t      _loop_turns;         // tours de boucle sur la fenêtre
@@ -106,6 +107,7 @@ void setup() {
     // L'ordre compte : écran d'abord (feedback visuel), réseau ensuite.
     display_init();
     touch_init();
+    light_init();         // APRÈS touch_init : bus Wire
     littlefs_init();      // audio, HTTP, sysinfo, avatar Companion
     wifi_connect();       // non bloquant, la connexion se termine via wifi_loop()
     ota_init();
@@ -130,6 +132,7 @@ void loop() {
     TIMED(L_HTTP, http_loop());
     TIMED_ACC(L_LVGL, display_loop());   // se logge lui-même ("[LVGL] slow")
     TIMED(L_LED, led_loop());
+    TIMED(L_LIGHT, light_loop());
     TIMED(L_AI,  ai_loop());
     // Doit être sur loopTask : le callback d'ESP_SR ne lève qu'un drapeau.
     TIMED(L_WW, wakeword_loop());

@@ -11,6 +11,7 @@
 // ---- RESSOURCES LOCALES ----
 #include "config.h"
 #include "touch_manager.h"
+#include "light_manager.h"
 #include "log_manager.h"
 
 // ---- OBJETS GLOBAUX ----
@@ -33,6 +34,9 @@ static lv_point_t  _last_point  = {0, 0};
 // émis qu'au relâchement.
 static uint32_t      _pressed_reads    = 0;
 static unsigned long _last_timeout_log = 0;
+
+// Appui en cours ayant servi à sortir de veille : absorbé jusqu'au relâchement.
+static bool _swallow = false;
 
 // ---- HELPERS ----
 
@@ -64,6 +68,15 @@ static void _lv_touch_read_cb(lv_indev_t* indev, lv_indev_data_t* data) {
     uint8_t num_touches = _ft6336_read(FT6336_REG_NUMTCH);
 
     if (num_touches > 0 && num_touches < 6) {
+        // Sur dalle éteinte, le premier appui ne fait que rallumer : le laisser
+        // passer ferait agir à l'aveugle sur le widget qui se trouve dessous.
+        // _was_touched reste faux tant qu'on absorbe, d'où le test de séquence.
+        if (!_was_touched && light_touch_wake()) _swallow = true;
+        if (_swallow) {
+            data->state = LV_INDEV_STATE_RELEASED;
+            return;
+        }
+
         uint8_t xh = _ft6336_read(FT6336_REG_P1_XH);
         uint8_t xl = _ft6336_read(FT6336_REG_P1_XL);
         uint8_t yh = _ft6336_read(FT6336_REG_P1_YH);
@@ -87,6 +100,7 @@ static void _lv_touch_read_cb(lv_indev_t* indev, lv_indev_data_t* data) {
                      data->point.x, data->point.y, (int)num_touches, raw_x, raw_y);
         }
     } else {
+        _swallow = false;
         if (_was_touched) {
             log_line("[Touch] Point : x=%d, y=%d (apres %lu lectures)",
                      _last_point.x, _last_point.y, (unsigned long)_pressed_reads);

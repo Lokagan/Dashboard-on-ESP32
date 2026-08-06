@@ -5,7 +5,7 @@
 
 #include "../ui.h"
 
-lv_obj_t *ui_ScreenHome = NULL;lv_obj_t *ui_BtnNAS = NULL;lv_obj_t *ui_Label1 = NULL;lv_obj_t *ui_BtnFreebox = NULL;lv_obj_t *ui_Label4 = NULL;lv_obj_t *ui_BtnSysInfo = NULL;lv_obj_t *ui_Label7 = NULL;lv_obj_t *ui_BtnAI = NULL;lv_obj_t *ui_Label10 = NULL;lv_obj_t *ui_BtnAudio = NULL;lv_obj_t *ui_Label18 = NULL;lv_obj_t *ui_SliderLCD = NULL;lv_obj_t *ui_Label3 = NULL;lv_obj_t *ui_SliderVOL = NULL;lv_obj_t *ui_Label9 = NULL;
+lv_obj_t *ui_ScreenHome = NULL;lv_obj_t *ui_BtnNAS = NULL;lv_obj_t *ui_Label1 = NULL;lv_obj_t *ui_BtnFreebox = NULL;lv_obj_t *ui_Label4 = NULL;lv_obj_t *ui_BtnSysInfo = NULL;lv_obj_t *ui_Label7 = NULL;lv_obj_t *ui_BtnAI = NULL;lv_obj_t *ui_Label10 = NULL;lv_obj_t *ui_BtnLight = NULL;lv_obj_t *ui_LabelLight = NULL;lv_obj_t *ui_SliderLCD = NULL;lv_obj_t *ui_Label3 = NULL;lv_obj_t *ui_BtnAudio = NULL;lv_obj_t *ui_Label18 = NULL;lv_obj_t *ui_SliderVOL = NULL;lv_obj_t *ui_Label9 = NULL;
 // event funtions
 void ui_event_BtnNAS( lv_event_t * e) {
     lv_event_code_t event_code = lv_event_get_code(e);
@@ -102,20 +102,20 @@ lv_obj_set_height( ui_Label10, LV_SIZE_CONTENT);   /// 1
 lv_obj_set_align( ui_Label10, LV_ALIGN_CENTER );
 lv_label_set_text(ui_Label10,"Companion IA");
 
-ui_BtnAudio = lv_button_create(ui_ScreenHome);
-lv_obj_set_width( ui_BtnAudio, 90);
-lv_obj_set_height( ui_BtnAudio, 45);
-lv_obj_set_x( ui_BtnAudio, 220 );
-lv_obj_set_y( ui_BtnAudio, 160 );
-lv_obj_add_flag( ui_BtnAudio, LV_OBJ_FLAG_SCROLL_ON_FOCUS );   /// Flags
-lv_obj_remove_flag( ui_BtnAudio, LV_OBJ_FLAG_SCROLLABLE );    /// Flags
-lv_obj_set_style_text_font(ui_BtnAudio, &lv_font_montserrat_16, LV_PART_MAIN| LV_STATE_DEFAULT);
+ui_BtnLight = lv_button_create(ui_ScreenHome);
+lv_obj_set_width( ui_BtnLight, 90);
+lv_obj_set_height( ui_BtnLight, 45);
+lv_obj_set_x( ui_BtnLight, 220 );
+lv_obj_set_y( ui_BtnLight, 130 );
+lv_obj_add_flag( ui_BtnLight, LV_OBJ_FLAG_SCROLL_ON_FOCUS );   /// Flags
+lv_obj_remove_flag( ui_BtnLight, LV_OBJ_FLAG_SCROLLABLE );    /// Flags
+lv_obj_set_style_text_font(ui_BtnLight, &lv_font_montserrat_16, LV_PART_MAIN| LV_STATE_DEFAULT);
 
-ui_Label18 = lv_label_create(ui_BtnAudio);
-lv_obj_set_width( ui_Label18, LV_SIZE_CONTENT);  /// 1
-lv_obj_set_height( ui_Label18, LV_SIZE_CONTENT);   /// 1
-lv_obj_set_align( ui_Label18, LV_ALIGN_CENTER );
-lv_label_set_text(ui_Label18,"Test Audio");
+ui_LabelLight = lv_label_create(ui_BtnLight);
+lv_obj_set_width( ui_LabelLight, LV_SIZE_CONTENT);  /// 1
+lv_obj_set_height( ui_LabelLight, LV_SIZE_CONTENT);   /// 1
+lv_obj_set_align( ui_LabelLight, LV_ALIGN_CENTER );
+lv_label_set_text(ui_LabelLight,"Auto");
 
 ui_SliderLCD = lv_slider_create(ui_ScreenHome);
 lv_slider_set_value( ui_SliderLCD, 20, LV_ANIM_OFF);
@@ -134,6 +134,21 @@ lv_obj_set_align( ui_Label3, LV_ALIGN_CENTER );
 lv_label_set_text(ui_Label3,"Backlight");
 lv_obj_set_style_text_color(ui_Label3, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT );
 lv_obj_set_style_text_opa(ui_Label3, 255, LV_PART_MAIN| LV_STATE_DEFAULT);
+
+ui_BtnAudio = lv_button_create(ui_ScreenHome);
+lv_obj_set_width( ui_BtnAudio, 90);
+lv_obj_set_height( ui_BtnAudio, 45);
+lv_obj_set_x( ui_BtnAudio, 220 );
+lv_obj_set_y( ui_BtnAudio, 185 );
+lv_obj_add_flag( ui_BtnAudio, LV_OBJ_FLAG_SCROLL_ON_FOCUS );   /// Flags
+lv_obj_remove_flag( ui_BtnAudio, LV_OBJ_FLAG_SCROLLABLE );    /// Flags
+lv_obj_set_style_text_font(ui_BtnAudio, &lv_font_montserrat_16, LV_PART_MAIN| LV_STATE_DEFAULT);
+
+ui_Label18 = lv_label_create(ui_BtnAudio);
+lv_obj_set_width( ui_Label18, LV_SIZE_CONTENT);  /// 1
+lv_obj_set_height( ui_Label18, LV_SIZE_CONTENT);   /// 1
+lv_obj_set_align( ui_Label18, LV_ALIGN_CENTER );
+lv_label_set_text(ui_Label18,"Test Audio");
 
 ui_SliderVOL = lv_slider_create(ui_ScreenHome);
 lv_slider_set_value( ui_SliderVOL, 60, LV_ANIM_OFF);
@@ -173,10 +188,12 @@ ui_BtnSysInfo= NULL;
 ui_Label7= NULL;
 ui_BtnAI= NULL;
 ui_Label10= NULL;
-ui_BtnAudio= NULL;
-ui_Label18= NULL;
+ui_BtnLight= NULL;
+ui_LabelLight= NULL;
 ui_SliderLCD= NULL;
 ui_Label3= NULL;
+ui_BtnAudio= NULL;
+ui_Label18= NULL;
 ui_SliderVOL= NULL;
 ui_Label9= NULL;
 

@@ -9,7 +9,10 @@
 // ---- OBJETS GLOBAUX ----
 
 // Nombre de pages. La table interne _pages[] s'y aligne par static_assert.
-#define SYSINFO_PAGE_COUNT 6
+#define SYSINFO_PAGE_COUNT 7
+
+// Index de la page CAPTEUR (0-based) : light_manager y inhibe le geste.
+#define SYSINFO_PAGE_LIGHT 6
 
 // ---- API PUBLIQUES ----
 // Affiche l'écran ; si déjà affiché, passe à la page suivante (bouclage).
@@ -18,6 +21,11 @@ void display_show_sysinfo();
 // Affiche l'écran directement sur une page (0-based). Hors plage : ignoré et
 // journalisé. Si l'écran est déjà affiché, seule la page change.
 void display_show_sysinfo_page(int page);
+
+// Vrai quand la page CAPTEUR est affichée. light_manager s'en sert pour
+// compter les gestes SANS réveiller Jarvis : on règle les seuils en regardant
+// la page, sans partir en écoute à chaque passage de main.
+bool sysinfo_sensor_page_active();
 
 // Journalise l'état mémoire (interne / DMA / PSRAM / fragmentation / pile)
 // dans le log circulaire — commande esp32/cmd "mem", relisible via GET /serial.

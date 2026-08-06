@@ -21,6 +21,7 @@
 #include "display_manager.h"   // display_show_ai_auto (écoute déclenchée depuis le web)
 #include "display_driver.h"    // panel_capture_* (GET /screen.bmp)
 #include "audio_manager.h"     // audio_wakeword_ack
+#include "light_manager.h"     // état APDS-9930 (bouton « Luminosité auto »)
 #include "config.h"
 
 // ---- OBJETS GLOBAUX ----
@@ -104,15 +105,16 @@ const char HTML_CONTENT[] PROGMEM = R"=====(
         .cmd-slider { width: 100%; }
         .cmd-row .cmd-slider { flex: 1; }
         a.cmd-btn { display: block; box-sizing: border-box; text-decoration: none; text-align: center; }
-        .cmd-grid6 { display: grid; grid-template-columns: repeat(6, 1fr); gap: 4px; margin-bottom: 8px; }
-        .cmd-grid6 .cmd-btn { width: auto; min-width: 0; margin-bottom: 0;
-                              text-align: center; font-size: 12px; padding: 8px 0; }
+        .cmd-grid-si { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; margin-bottom: 8px; }
+        .cmd-grid-si .cmd-btn { width: auto; min-width: 0; margin-bottom: 0;
+                                text-align: center; font-size: 12px; padding: 8px 0; }
         .cmd-pair { display: flex; gap: 8px; margin-bottom: 8px; }
         .cmd-pair .cmd-btn { flex: 1; width: auto; min-width: 0; margin-bottom: 0;
                              text-align: center; font-size: 13px; padding: 8px 4px;
                              white-space: nowrap; }
         .cmd-btn.btn-on { background: #00c853; color: #121212; }
         .cmd-btn.btn-on:hover { background: #00e676; color: #121212; }
+        .cmd-btn:disabled, .cmd-btn:disabled:hover { background: #262626; color: #666; cursor: not-allowed; }
         .cmd-btn.btn-reboot { background: #cf6679; color: #121212; text-align: center; }
         .cmd-btn.btn-reboot:hover { background: #ff4081; color: white; }
     </style>
@@ -199,13 +201,14 @@ const char HTML_CONTENT[] PROGMEM = R"=====(
 
         <div class="cmd-section">
             <h3>Diagnostic</h3>
-            <div class="cmd-grid6">
+            <div class="cmd-grid-si">
                 <button class="cmd-btn" onclick="sendCmd('page:sysinfo1')" title="SysInfo — Identité : puce, charge par cœur, température, uptime, flash, écran, firmware, dernier reset">ID</button>
                 <button class="cmd-btn" onclick="sendCmd('page:sysinfo2')" title="SysInfo — Mémoire : heap interne/DMA/PSRAM, firmware, postes d'allocation connus">MEM</button>
                 <button class="cmd-btn" onclick="sendCmd('page:sysinfo3')" title="SysInfo — Tâches : état, priorité, %CPU et pile de chaque tâche FreeRTOS">TSK</button>
                 <button class="cmd-btn" onclick="sendCmd('page:sysinfo4')" title="SysInfo — Partitions : table de partitionnement de la flash">PRT</button>
                 <button class="cmd-btn" onclick="sendCmd('page:sysinfo5')" title="SysInfo — Fichiers : occupation LittleFS">FS</button>
                 <button class="cmd-btn" onclick="sendCmd('page:sysinfo6')" title="SysInfo — Réseau : WiFi, IP, MQTT">NET</button>
+                <button class="cmd-btn" onclick="sendCmd('page:sysinfo7')" title="SysInfo — Capteur APDS-9930 : lumière, proximité, seuils du geste. Le geste n'y déclenche PAS Jarvis">CAP</button>
             </div>
             <div class="cmd-pair">
                 <button class="cmd-btn" onclick="sendMem()">État mémoire</button>
@@ -221,7 +224,11 @@ const char HTML_CONTENT[] PROGMEM = R"=====(
                 <a class="cmd-btn" href="/screen.bmp" target="_blank" rel="noopener"
                    title="Image de ce qu'affiche la dalle, en BMP">Capture d'écran</a>
             </div>
-            <button class="cmd-btn btn-reboot" onclick="sendReboot()">Redémarrer</button>
+            <div class="cmd-pair">
+                <button id="lightBtn" class="cmd-btn" onclick="toggleLight()" disabled
+                        title="Asservit le rétroéclairage à la lumière ambiante (APDS-9930). Un réglage manuel du slider le suspend 60 s. Grisé tant que le capteur ne répond pas.">Luminosité auto : —</button>
+                <button class="cmd-btn btn-reboot" onclick="sendReboot()">Redémarrer</button>
+            </div>
         </div>
     </div>
     </div>
@@ -261,6 +268,7 @@ const char HTML_CONTENT[] PROGMEM = R"=====(
                 const data = await response.json();
                 document.getElementById('aiLight').className = 'ai-light ' + data.state;
                 setLoopBtn(data.loop === true);
+                setLightBtn(data.light === true, data.apds === true);
             } catch (error) {
             }
         }
@@ -436,6 +444,22 @@ const char HTML_CONTENT[] PROGMEM = R"=====(
             const btn = document.getElementById('loopBtn');
             btn.textContent = 'Mesure boucle : ' + (on ? 'ON' : 'OFF');
             btn.className = 'cmd-btn' + (on ? ' btn-on' : '');
+        }
+
+        let lightAuto = false;
+        async function toggleLight() {
+            await sendCmd('light:' + (lightAuto ? 'manual' : 'auto'));
+        }
+
+        // Le sondage /ai_status pilote aussi le grisage : un capteur rebranché
+        // réactive le bouton tout seul.
+        function setLightBtn(auto, present) {
+            lightAuto = auto;
+            const btn = document.getElementById('lightBtn');
+            btn.disabled = !present;
+            btn.textContent = present ? 'Luminosité auto : ' + (auto ? 'ON' : 'OFF')
+                                      : 'Luminosité auto : capteur absent';
+            btn.className = 'cmd-btn' + (present && auto ? ' btn-on' : '');
         }
 
         async function sendDiag(cmd, delayMs) {
@@ -715,11 +739,15 @@ static void _handle_ai_status_request() {
         case AI_SPEAKING:  state_str = "speaking";  break;
         case AI_ERROR:     state_str = "error";     break;
     }
-    // "loop" voyage avec l'état IA : le sondage à 1,5 s existe déjà et
-    // resynchronise le bouton après un rechargement de page.
-    char json[64];
-    snprintf(json, sizeof(json), "{\"state\":\"%s\",\"loop\":%s}",
-             state_str, log_loop_measure() ? "true" : "false");
+    // "loop", "light" et "apds" voyagent avec l'état IA : le sondage à 1,5 s
+    // existe déjà et resynchronise les boutons après un rechargement de page.
+    LightStatus ls;
+    light_get_status(&ls);
+
+    char json[112];
+    snprintf(json, sizeof(json), "{\"state\":\"%s\",\"loop\":%s,\"light\":%s,\"apds\":%s}",
+             state_str, log_loop_measure() ? "true" : "false",
+             ls.auto_on ? "true" : "false", ls.present ? "true" : "false");
     server.send(200, "application/json", json);
 }
 

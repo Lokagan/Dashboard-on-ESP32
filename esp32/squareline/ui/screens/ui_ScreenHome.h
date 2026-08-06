@@ -25,10 +25,12 @@ extern lv_obj_t *ui_Label7;
 extern void ui_event_BtnAI( lv_event_t * e);
 extern lv_obj_t *ui_BtnAI;
 extern lv_obj_t *ui_Label10;
-extern lv_obj_t *ui_BtnAudio;
-extern lv_obj_t *ui_Label18;
+extern lv_obj_t *ui_BtnLight;
+extern lv_obj_t *ui_LabelLight;
 extern lv_obj_t *ui_SliderLCD;
 extern lv_obj_t *ui_Label3;
+extern lv_obj_t *ui_BtnAudio;
+extern lv_obj_t *ui_Label18;
 extern lv_obj_t *ui_SliderVOL;
 extern lv_obj_t *ui_Label9;
 // CUSTOM VARIABLES

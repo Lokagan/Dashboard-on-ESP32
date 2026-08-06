@@ -148,13 +148,21 @@ Format `cmd` ou `cmd:arg`, traité par `mqtt_handle_esp_cmd()` (`mqtt_manager.cp
 | `page:freebox`       | Affiche l'écran Freebox                                      |
 | `page:ai`            | Affiche l'écran Companion (IA)                               |
 | `page:sysinfo`       | Affiche l'écran SysInfo ; si déjà affiché, passe à la page suivante
-|.                     | (bouclage sur 6 pages) — sortie par toucher.                 |
+|.                     | (bouclage sur 7 pages) — sortie par toucher.                 |
+| `page:sysinfo1-7`    | Ouvre directement une page SysInfo (7 = CAPTEUR)             |
 | `page:disks`         | Affiche le tableau NAS - Disques                             |
 | `page:downloads`     | Affiche le tableau NAS - Downloads                           |
 | `page:connections`   | Affiche le tableau NAS - Connexions                          |
 | `page:devices`       | Affiche le tableau Freebox - Devices                         |
-| `brightness:1-100`   | Règle la luminosité du retroéclairage (+synchro slider)      |
+| `page:activity`      | Affiche le tableau Activité réseau (AdGuard)                 |
+| `brightness:1-100`   | Règle la luminosité du retroéclairage (+synchro slider).
+|                      | ⚠️ Suspend l'asservissement au capteur pendant 60 s.          |
+| `light`              | Journalise lux, proximité, mode et veille (APDS-9930)        |
+| `light:auto|manual`  | (Ré)active ou coupe l'asservissement du rétroéclairage.
+|                      | Réveille l'écran dans les deux sens — bouton « Luminosité
+|                      | auto » du panneau web et bouton de l'écran d'accueil.        |
 | `volume:0-100`       | Règle le volume audio                 (+synchro slider)      |
+| `loop:on|off`        | Journalisation des mesures de `loopTask` (coupée au boot)    |
 | `mem`                | Journalise l'état mémoire (heap interne/DMA/PSRAM, plus gros bloc libre, pile loopTask)
 |                      | bouton « État mémoire » du panneau web, relisible via `GET /serial`
 | `saverec`            | Envoie la dernière capture vocale au bridge (`POST /record`),
@@ -164,6 +172,8 @@ Format `cmd` ou `cmd:arg`, traité par `mqtt_handle_esp_cmd()` (`mqtt_manager.cp
 | `shot`               | Capture l'écran de la dalle dans un buffer PSRAM, récupérable
 |                      | en BMP par `GET /screen.bmp` — bouton « Capture d'écran » du
 |                      | panneau web, qui arme et récupère d'un seul clic.            |
+| `spy`                | Journalise les 24 prochaines invalidations LVGL              |
+| `tree`               | Arbre des widgets de l'écran actif                           |
 | `reboot`             | Redémarre l'ESP32 (`ESP.restart()`)                          |
 |----------------------|--------------------------------------------------------------|
 Chaque commande reçue est journalisée dans le buffer circulaire de `log_manager.cpp` (visible via `GET /serial` sur l'interface web).

@@ -94,5 +94,7 @@ void display_spy_invalidations(uint8_t count);
 void display_dump_tree();
 // Diagnostic (cmd "shot") — arme la capture et force un repeint plein écran.
 bool display_capture_screen();
-void display_set_brightness(int percent);
+void display_set_brightness(int percent);          // réglage UTILISATEUR : suspend l'auto
+void display_set_brightness_silent(int percent);   // idem sans suspendre — pour light_manager
+void display_backlight_sleep(bool sleeping);       // coupe le rétroéclairage sans perdre la consigne
 void display_sync_volume_slider(int percent);

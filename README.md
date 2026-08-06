@@ -11,6 +11,10 @@ Le projet est basé sur une architecture MQTT modulaire :
 - `synology/compose.yaml` lance un container Python central
 - `esp32/` lit les topics MQTT et affiche les informations sur un écran ILI9341 via LVGL
 
+Confort d'usage
+- Luminosité automatique et veille de l'écran (capteur APDS-9930)
+- Réveil et déclenchement de l'assistant par passage de main
+
 Assistant IA de bureau via groq
 - Déclenchement par le mot clef 'Jarvis' (ESP_SR)
 - requêtes/réponses en vocales et textes
@@ -29,6 +33,7 @@ Assistant IA de bureau via groq
 | Audio         | ES8311 + FM8002E  |
 | Micro         | MEMS LMA2718B     |
 | LED           | WS2812B           |
+| Lumière/prox. | APDS-9930 (I2C)   |
 
 ---
 
@@ -46,6 +51,7 @@ ESP32-S3 (ES3C28P)
   ├── WiFi → MQTT → Synology
   ├── esp_lcd + LVGL 9.x → ILI9341 (affichage)
   ├── FT6336G (touch I2C 400KHz)
+  ├── APDS-9930 (lumière/proximité, même bus I2C)
   └── ES8311 (audio)
 ```
 
@@ -61,7 +67,7 @@ ESP32-S3 (ES3C28P)
 - ✅ Écran tableau générique dynamique (disques, downloads, connexions, appareils Freebox)
 - ✅ Réglage luminosité backlight via slider tactile
 - ✅ Réglage du volume via slider tactile
-- ✅ Écran de diagnostic système (SysInfo) — identité chip, mémoire, réseau, tâches FreeRTOS, partitions flash, système de fichiers LittleFS (6 pages)
+- ✅ Écran de diagnostic système (SysInfo) — identité chip, mémoire, réseau, tâches FreeRTOS, partitions flash, système de fichiers LittleFS, capteur de lumière (7 pages)
 - ✅ Audio ES8311 + I2S (sons d'interface, fanfare, test loopback micro/haut-parleur) — tourne sur une tâche FreeRTOS dédiée (cœur 1)
 - ✅ LED WS2812B — indicateur d'état (WiFi/MQTT/enregistrement audio)
 - ✅ Mise à jour OTA (ArduinoOTA) — tâche dédiée, avec écran de progression
@@ -76,8 +82,10 @@ ESP32-S3 (ES3C28P)
      ou explicite (« retiens que… »), le tout consultable et corrigeable depuis la page de config
 - ✅ Détection par mot-clé (wake word) « Jarvis » via ESP_SR natif (`wakeword_manager.cpp`) — déclenche l'assistant IA sans appui bouton, en plus du bouton Rec et de MQTT
 - ✅ Écran « Activité réseau » — service en cours par appareil (YouTube, Steam…) déduit du journal DNS d'AdGuard Home (`activity_monitor.py`, port 8091)
-- ✅ Commandes `esp32/cmd` (navigation à distance, luminosité, volume, reboot, outils de diagnostic) pleinement exécutées via `mqtt_handle_esp_cmd()` — appelable depuis le topic MQTT `esp32/cmd` 
+- ✅ Commandes `esp32/cmd` (navigation à distance, luminosité manuelle ou automatique, volume, reboot, outils de diagnostic) pleinement exécutées via `mqtt_handle_esp_cmd()` — appelable depuis le topic MQTT `esp32/cmd` 
      ou depuis la colonne de commandes de la page web (`POST /cmd`)
+- ✅ Capteur de lumière et de proximité APDS-9930 (`light_manager.cpp`) — luminosité automatique, veille de l'écran sur absence,
+     et déclenchement de l'assistant par passage de main ; débranchable à chaud, calibrage sur la page SysInfo « CAPTEUR »
 - ✅ Commandes vocales — une phrase contenant un mot-clé de pilotage (« pilote… ») est traduite en action `esp32/cmd` par le LLM ;
      les réglages (volume, luminosité) demandent une confirmation vocale, la navigation s'exécute directement
 
@@ -134,6 +142,7 @@ dashboard-projet/
 │       ├── display_manager.cpp / .h   # LVGL, tableaux dynamiques, graphiques
 │       ├── http_manager.cpp / .h      # Serveur web : fichiers LittleFS, logs, commandes ESP32
 │       ├── led_manager.cpp / .h       # WS2812B — indicateur d'état
+│       ├── light_manager.cpp / .h     # APDS-9930 — luminosité auto, veille, geste
 │       ├── littlefs_manager.cpp / .h  # Montage LittleFS + accès fichiers génériques
 │       ├── log_manager.cpp / .h       # Journal circulaire (remplace Serial.print*)
 │       ├── mqtt_manager.cpp / .h      # Client MQTT, réception topics
@@ -280,24 +289,29 @@ pio device monitor -b 115200
   <tr>
     <td align="center"><img src="docs/img/nas-disques.jpg" width="250"><br><sub><b>NAS – Disques</b> — table SMART/statut/T°</sub></td>
     <td align="center"><img src="docs/img/companion.jpg" width="250"><br><sub><b>Companion IA</b> — assistant vocal « Jarvis »</sub></td>
-    <td align="center"><img src="docs/img/sysinfo.jpg" width="250"><br><sub><b>SysInfo 1/6</b> — identité, CPU, flash</sub></td>
+    <td align="center"><img src="docs/img/sysinfo.jpg" width="250"><br><sub><b>SysInfo 1/7</b> — identité, CPU, flash</sub></td>
   </tr>
   <tr>
-    <td align="center"><img src="docs/img/sysinfo-memoire.jpg" width="250"><br><sub><b>SysInfo 2/6</b> — bilan RAM interne / PSRAM</sub></td>
-    <td align="center"><img src="docs/img/sysinfo-taches.jpg" width="250"><br><sub><b>SysInfo 3/6</b> — tâches FreeRTOS, %CPU, piles</sub></td>
-    <td align="center"><img src="docs/img/sysinfo-partitions.jpg" width="250"><br><sub><b>SysInfo 4/6</b> — carte de la flash 16 Mo</sub></td>
+    <td align="center"><img src="docs/img/sysinfo-memoire.jpg" width="250"><br><sub><b>SysInfo 2/7</b> — bilan RAM interne / PSRAM</sub></td>
+    <td align="center"><img src="docs/img/sysinfo-taches.jpg" width="250"><br><sub><b>SysInfo 3/7</b> — tâches FreeRTOS, %CPU, piles</sub></td>
+    <td align="center"><img src="docs/img/sysinfo-partitions.jpg" width="250"><br><sub><b>SysInfo 4/7</b> — carte de la flash 16 Mo</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/img/sysinfo-fichiers.jpg" width="250"><br><sub><b>SysInfo 5/7</b> — occupation LittleFS</sub></td>
+    <td align="center"><img src="docs/img/sysinfo-capteur.jpg" width="250"><br><sub><b>SysInfo 7/7</b> — capteur APDS-9930, seuils du geste</sub></td>
+    <td></td>
   </tr>
 </table>
 
 | Écran          | Description                                              |
 |----------------|----------------------------------------------------------|
-| Home           | Navigation principale + sliders luminosité backlight et volume |
+| Home           | Navigation principale + sliders luminosité backlight et volume + bouton Auto/Manuel du rétroéclairage (masqué si le capteur est absent) |
 | NAS            | CPU, RAM, temp, réseau, volume — graphiques temps réel   |
 | Freebox        | Débit, IP publique, compteur appareils — graphique       |
 | Table          | Tableau générique : disques / downloads / connexions / appareils Freebox |
 | Activité réseau | Par appareil : service en cours (YouTube, Steam…) + débits DL/UP — via le journal DNS d'AdGuard Home |
 | Companion (IA) | Assistant vocal : bouton Rec (enregistrement), bouton Play (rejouer la dernière réponse), sous-titres question/réponse |
-| SysInfo        | Diagnostic système (6 pages, écran LVGL via canvas + buffer PSRAM hors-écran) : identité chip, mémoire, tâches FreeRTOS, partitions flash, système de fichiers LittleFS, réseau |
+| SysInfo        | Diagnostic système (7 pages, écran LVGL via canvas + buffer PSRAM hors-écran) : identité chip, mémoire, tâches FreeRTOS, partitions flash, système de fichiers LittleFS, réseau, capteur de lumière |
 
 ### Navigation tableau
 
@@ -307,7 +321,9 @@ Les tableaux Disques et Freebox supportent le scroll horizontal pour accéder au
 
 ### Écran SysInfo
 
-Accessible depuis le bouton dédié sur l'écran Home (`display_show_sysinfo()`). Chaque page est dessinée par le rastériseur `display_gfx` dans un buffer PSRAM hors-écran, puis copiée dans un `lv_canvas` affiché comme un écran LVGL normal (`lv_scr_load()`) — WiFi, MQTT et le reste de LVGL continuent de tourner normalement pendant l'affichage. Navigation tactile : zone gauche = page précédente, zone droite = page suivante, zone centrale = retour à l'UI LVGL. Un rappel de `display_show_sysinfo()` alors que l'écran est déjà affiché (commande `page:sysinfo` via MQTT ou la page web) fait avancer d'une page ; `page:sysinfo1` à `page:sysinfo6` ouvrent directement la page voulue.
+Accessible depuis le bouton dédié sur l'écran Home (`display_show_sysinfo()`). Chaque page est dessinée par le rastériseur `display_gfx` dans un buffer PSRAM hors-écran, puis copiée dans un `lv_canvas` affiché comme un écran LVGL normal (`lv_scr_load()`) — WiFi, MQTT et le reste de LVGL continuent de tourner normalement pendant l'affichage. Navigation tactile : zone gauche = page précédente, zone droite = page suivante, zone centrale = retour à l'UI LVGL. Un rappel de `display_show_sysinfo()` alors que l'écran est déjà affiché (commande `page:sysinfo` via MQTT ou la page web) fait avancer d'une page ; `page:sysinfo1` à `page:sysinfo7` ouvrent directement la page voulue.
+
+La 7ᵉ page, **CAPTEUR**, sert au réglage de l'APDS-9930 (voir plus bas) : elle rafraîchit la proximité à 5 Hz, contre 1 Hz pour les autres pages.
 
 ### Écran Companion (IA)
 
@@ -339,6 +355,27 @@ L'onglet **Mémoire** de `http://<NAS>:8090/` liste les faits, permet d'en corri
 
 Table « qui fait quoi sur le réseau » : pour chaque appareil, le **service** en cours (YouTube, Steam, Discord…) et les débits **DL/UP**. Le service est déduit du **journal DNS d'[AdGuard Home](https://adguard.com/adguard-home.html)** installé sur le NAS comme résolveur DNS du réseau : `synology/scripts/activity_monitor.py` mappe `domaine → service` (`services.json`, éditable à chaud depuis sa page web) et enrichit le topic `freebox/devices` d'un champ `service` par IP — **aucun nouveau topic MQTT**. Page web dédiée sur `http://<NAS>:8091/` (bouton « ⚙ Config Services » de l'interface web ESP32). Déployez le bridge NAS **avant** de flasher, sinon la colonne « service » reste vide (sans casse).
 
+### Capteur de lumière et de proximité (APDS-9930)
+
+Branché sur le **port externe** du module — `IO15` = SCL, `IO16` = SDA, soit le **même bus I2C que le tactile**, adresse `0x39`. Aucun câblage supplémentaire, aucun bus à initialiser : `light_init()` passe après `touch_init()`, qui possède le `Wire.begin()`. Tout est piloté par `light_manager.cpp`, sur un seul `light_loop()`.
+
+Trois services rendus par le même capteur :
+
+- **Luminosité automatique** — le rétroéclairage suit la lumière ambiante, sur une courbe en racine carrée (l'œil discrimine bien plus finement en bas d'échelle). Un réglage manuel (slider de l'écran d'accueil, `brightness:N`) le **suspend 60 s** ; le bouton **Auto/Manuel** de l'écran d'accueil, la commande `light:manual` ou le bouton de la page web le désactivent franchement. ⚠️ Le bouton de l'écran d'accueil est **masqué tant que le capteur ne répond pas**, et réapparaît de lui-même au rebranchement.
+- **Veille de l'écran** — rétroéclairage coupé après 5 minutes sans présence devant le capteur **ni** appui tactile. **Toute** interaction le rallume : passage de main, tactile, changement d'écran d'où qu'il vienne, « Jarvis ». ⚠️ L'appui tactile qui réveille est **absorbé** : sur une dalle noire on tape à l'aveugle, il ne doit pas agir sur le widget qui se trouve dessous.
+- **Geste** — un passage de main devant l'écran déclenche l'assistant, exactement comme le mot-clé « Jarvis ». ⚠️ L'APDS-9930 n'a **pas** de moteur de gestes (c'est l'APDS-9960) : le geste est reconstruit depuis le seul canal de proximité — entrée puis sortie dans une fenêtre de temps. Une main *immobile* devant l'écran ne déclenche donc rien, ce qui évite qu'un objet posé là relance l'écoute en boucle.
+
+Le capteur est **débranchable à chaud**. Absent au démarrage, il est re-sondé toutes les 2 s et reconfiguré dès qu'il répond. Arraché en marche, sa disparition est détectée après plusieurs lectures ratées consécutives — et l'écran est **rallumé au passage**, sans quoi une veille en cours resterait définitive, faute de capteur pour en sortir.
+
+**Le calibrage dépend entièrement du montage** (ouverture du boîtier, orientation, vitre) et se fait sur la page SysInfo **CAPTEUR** (`page:sysinfo7`, bouton `CAP` de l'interface web), qui affiche en direct les lux, les canaux bruts, la proximité et ses seuils. Le geste y est **compté sans solliciter l'assistant** : c'est tout l'intérêt de la page, on règle les seuils en agitant la main sans partir en écoute à chaque passage.
+
+Deux pièges qui coûtent cher à diagnostiquer sans cette page :
+
+- **Le repos du canal de proximité n'est pas nul, et ce n'est pas de l'IR ambiant** : c'est la lumière de la LED infrarouge qui revient au photodétecteur par réflexion interne sur la vitre. Les seuils sont donc **relatifs à une ligne de base suivie en continu**, jamais absolus.
+- **Un pic isolé fabrique un faux geste** — il franchit le seuil haut puis retombe, et la durée obtenue ressemble à s'y méprendre à un passage de main. D'où une médiane glissante et une confirmation sur plusieurs échantillons.
+
+Les valeurs de `config.h.example` sont celles mesurées sur le montage de référence, **pas des constantes universelles**.
+
 ### Interface web ESP32
 
 Accessible sur `http://<IP_ESP32>/` (port 80, `http_manager.cpp`, tâche FreeRTOS dédiée). Deux colonnes.
@@ -354,7 +391,7 @@ Colonne de gauche :
 Colonne de droite, les mêmes commandes que le topic MQTT `esp32/cmd`, envoyées via `POST /cmd` :
 - **Navigation** : accès direct à chaque écran
 - **Paramètres** : luminosité, volume, et les boutons « ⚙ Config IA », « ⚙ Config ACTIVITÉS » et « ⚙ Config ADGUARD » qui ouvrent les pages de paramétrage servies par le NAS
-- **Diagnostic** : 6 boutons vers les pages SysInfo, plus les outils embarqués (état mémoire, mesure de boucle, capture d'écran, espion LVGL, arbre des widgets, capture IA → NAS) et le redémarrage
+- **Diagnostic** : 7 boutons vers les pages SysInfo, plus les outils embarqués (état mémoire, mesure de boucle, capture d'écran, espion LVGL, arbre des widgets, capture IA → NAS), le basculement de la luminosité automatique (grisé si le capteur ne répond pas) et le redémarrage
 
 ---
 
@@ -381,8 +418,8 @@ Pour plus de détails, voir `docs/mqtt_topics.md`.
 
 ## Notes importantes
 
-- **Touch FT6336G** : le bus I2C doit être configuré à 400KHz maximum. Une fréquence trop élevée provoque des blocages du contrôleur tactile.
-- **Backlight** : géré via `analogWrite(TFT_BL, …)` dans `display_init()`, après l'init de la dalle.
+- **Touch FT6336G** : le bus I2C doit être configuré à 400KHz maximum. Une fréquence trop élevée provoque des blocages du contrôleur tactile. Ce bus est **partagé avec l'APDS-9930** (port externe, adresse 0x39) : le plafond vaut pour les deux, et c'est `touch_init()` qui possède le `Wire.begin()`.
+- **Backlight** : consigne de luminosité et état de veille sont deux variables distinctes de `display_manager.cpp`, appliquées ensemble sur `TFT_BL` — le réveil retrouve donc la luminosité d'avant. `display_set_brightness()` est le réglage *utilisateur* (il suspend l'asservissement) ; le capteur passe par une variante silencieuse.
 - **Horloge SPI de l'écran** : `TFT_SPI_HZ` dans `config.h`. ⚠️ Ce n'est qu'une **demande** : le contrôleur dérive l'APB (80 MHz) par un diviseur entier et retient le plus grand candidat ≤ la demande (80 / 40 / 26,7 / 20 MHz…, rien entre 40 et 80). `panel_actual_hz()` rend la valeur réellement appliquée. **80 MHz ne fonctionne pas sur ce câblage** en transfert DMA continu : 40 MHz est le plafond du montage.
 - **`%f` dans LVGL** : newlib nano ne supporte pas `printf` flottant. Tous les affichages de flottants passent par des macros `FLOAT_INT` / `FLOAT_DEC` dans `display_manager.cpp`.
 - Si vous changez `FREEBOX_API`, vérifiez la compatibilité avec la version de l'API Freebox.
@@ -417,5 +454,4 @@ Ce projet est distribué sous licence **GNU General Public License v3.0** — vo
 ## Idées d'évolutions :
 
 - Intégration Home Assistant
-- Capteurs ESP32 supplémentaires
 - Support multi-broker MQTT (ou plusieurs Dashboard)
