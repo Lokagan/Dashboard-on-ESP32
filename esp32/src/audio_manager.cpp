@@ -33,6 +33,8 @@
 // Plafond de l'amplification de relecture : au-delà, une capture silencieuse
 // rendrait un souffle plein pot.
 #define LOOPBACK_PLAY_GAIN_MAX_Q8  (32 * 256)
+// Extinction du jingle avant la capture : 350 ms mesurés, marge comprise.
+#define LOOPBACK_ACK_SETTLE_MS     450
 
 // Purge du HP avant d'enregistrer (cf. _drain_playback)
 #define PLAYBACK_DRAIN_SILENCE_MS  120
@@ -453,10 +455,17 @@ static void _sound_ff6() {
 // Test hardware micro + HP : enregistre, rejoue, archive sur le NAS.
 // Envoi asynchrone (file de _ai_task), il ne retarde pas le bus I2S.
 static void _sound_test_loopback() {
-    log_line("[Audio] Test loopback — enregistrement %d ms...", LOOPBACK_RECORD_MS);
-
     size_t samples   = 0;
     bool   cancelled = false;
+
+    // ⚠️ `_drain_playback()` de l'accusé ne suffit PAS ici : il empile du silence
+    // derrière le jingle au lieu de vider l'anneau DMA, et le chemin IA ne s'en
+    // sort que grâce aux deux messages de file qui l'espacent de l'enregistrement.
+    // Sans cette attente, 350 ms de 990 Hz entrent dans la capture et deviennent
+    // son pic — donc la référence de la normalisation ET de « Amplitude capturée ».
+    _sound_wakeword_ack();   // « parle maintenant »
+    delay(LOOPBACK_ACK_SETTLE_MS);
+    log_line("[Audio] Test loopback — enregistrement %d ms...", LOOPBACK_RECORD_MS);
 
     audio_is_recording = true;
     _audio_capture_to_psram(LOOPBACK_RECORD_MS, false, &samples, &cancelled);
