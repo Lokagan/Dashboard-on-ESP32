@@ -579,7 +579,8 @@ static void _table_load(TableSource source) {
 }
 
 static void _bl_apply() {
-    analogWrite(TFT_BL, _bl_sleeping ? 0 : map(_bl_pct, 0, 100, 0, 255));
+    int pct = _bl_sleeping ? LIGHT_SLEEP_BRIGHTNESS : _bl_pct;
+    analogWrite(TFT_BL, map(pct, 0, 100, 0, 255));
 }
 
 // BtnLight (écran d'accueil) : miroir de l'état de light_manager, qui bouge

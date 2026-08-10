@@ -27,7 +27,7 @@
       "speak": "J'affiche {screen}.",
       "prompt": "",
       "params": [
-        {"name": "screen", "type": "choix", "spec": "home, nas, freebox, ai, sysinfo1, sysinfo2, sysinfo3, sysinfo4, sysinfo5, sysinfo6, disks, downloads, connections, devices, activity", "desc": "home=accueil, nas=NAS, freebox=box Freebox, ai=assistant, sysinfo1=diagnostic identité, sysinfo2=diagnostic mémoire, sysinfo3=diagnostic taches, sysinfo4=diagnostic partitions, sysinfo5=diagnostic littleFS, sysinfo6=diagnostic wifi, disks=disques, downloads=téléchargements, connections=connexions, devices=appareils, activity=activité réseau"}
+        {"name": "screen", "type": "choix", "spec": "home, nas, freebox, ai, sysinfo1, sysinfo2, sysinfo3, sysinfo4, sysinfo5, sysinfo6, sysinfo7, disks, downloads, connections, devices, activity", "desc": "home=accueil, nas=NAS, freebox=box Freebox, ai=assistant, sysinfo1=diagnostic identité, sysinfo2=diagnostic mémoire, sysinfo3=diagnostic taches, sysinfo4=diagnostic partitions, sysinfo5=diagnostic littleFS, sysinfo6=diagnostic wifi, sysinfo7=diagnostic APDS, disks=disques, downloads=téléchargements, connections=connexions, devices=appareils, activity=activité réseau"}
       ]
     },
     {

@@ -20,20 +20,20 @@
 struct LightStatus {
     bool     present;
     uint16_t prox;
-    uint16_t prox_base;     // repos suivi en continu
-    uint16_t thr_near, thr_far;   // seuils vivants, base + delta
-    bool     psat;          // etage proximite sature — mesure a jeter
-    uint32_t clux;          // CENTILUX (lux x100) — ce montage vit sous 1 lux
-    uint16_t ch0, ch1;      // canaux bruts (visible + IR)
-    bool     near;          // main actuellement au-dessus du seuil PROCHE
-    bool     auto_on;
-    bool     manual_hold;   // auto suspendu par un réglage manuel
-    bool     asleep;
-    int      brightness;    // dernière consigne posée par l'asservissement
-    uint32_t gestures;      // compteur depuis le boot
-    uint32_t since_gesture; // ms depuis le dernier geste (0 si aucun)
-    uint32_t since_present; // ms depuis la dernière présence devant le capteur
-    uint32_t plugs;         // nombre de détections du capteur (hotplug)
+    uint16_t prox_base;             // repos suivi en continu
+    uint16_t thr_near, thr_far;     // seuils vivants, base + delta
+    bool     psat;                  // etage proximite sature — mesure a jeter
+    uint32_t clux;                  // CENTILUX (lux x100) — ce montage vit sous 1 lux
+    uint16_t ch0, ch1;              // canaux bruts (visible + IR)
+    bool     near;                  // main actuellement au-dessus du seuil PROCHE
+    bool     auto_on;               // mode automatique (asservissement du rétroéclairage)
+    bool     manual_hold;           // auto suspendu par un réglage manuel
+    bool     asleep;                // écran en veille (absence prolongée devant le capteur)
+    int      brightness;            // dernière consigne posée par l'asservissement
+    uint32_t gestures;              // compteur depuis le boot
+    uint32_t since_gesture;         // ms depuis le dernier geste (0 si aucun)
+    uint32_t since_present;         // ms depuis la dernière présence devant le capteur
+    uint32_t plugs;                 // nombre de détections du capteur (hotplug)
 };
 
 // ---- API PUBLIQUES ----

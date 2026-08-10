@@ -108,6 +108,8 @@ const char HTML_CONTENT[] PROGMEM = R"=====(
         .cmd-grid-si { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; margin-bottom: 8px; }
         .cmd-grid-si .cmd-btn { width: auto; min-width: 0; margin-bottom: 0;
                                 text-align: center; font-size: 12px; padding: 8px 0; }
+        .cmd-grid-nav { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-bottom: 8px; }
+        .cmd-grid-nav .cmd-btn { width: auto; min-width: 0; margin-bottom: 0; }
         .cmd-pair { display: flex; gap: 8px; margin-bottom: 8px; }
         .cmd-pair .cmd-btn { flex: 1; width: auto; min-width: 0; margin-bottom: 0;
                              text-align: center; font-size: 13px; padding: 8px 4px;
@@ -168,15 +170,19 @@ const char HTML_CONTENT[] PROGMEM = R"=====(
     <div class="cmd-panel">
         <div class="cmd-section">
             <h3>Navigation</h3>
-            <button class="cmd-btn" onclick="sendCmd('page:home')">Accueil</button>
-            <button class="cmd-btn" onclick="sendCmd('page:ai')">Assistant IA</button>
-            <button class="cmd-btn" onclick="sendCmd('page:nas')">NAS</button>
-            <button class="cmd-btn" onclick="sendCmd('page:disks')">NAS - Disques</button>
-            <button class="cmd-btn" onclick="sendCmd('page:downloads')">NAS - Téléchargements</button>
-            <button class="cmd-btn" onclick="sendCmd('page:connections')">NAS - Connexions</button>
-            <button class="cmd-btn" onclick="sendCmd('page:freebox')">Freebox</button>
-            <button class="cmd-btn" onclick="sendCmd('page:devices')">Freebox - Appareils</button>
-            <button class="cmd-btn" onclick="sendCmd('page:activity')">Freebox - Activité Réseau</button>
+            <!-- Colonne gauche = NAS, colonne droite = Freebox : l'ordre du HTML est celui de la grille. -->
+            <div class="cmd-grid-nav">
+                <button class="cmd-btn" onclick="sendCmd('page:home')">Accueil</button>
+                <button class="cmd-btn" onclick="sendCmd('page:ai')">Assistant IA</button>
+                <button class="cmd-btn" onclick="sendCmd('page:nas')">NAS</button>
+                <button class="cmd-btn" onclick="sendCmd('page:freebox')">Freebox</button>
+                <button class="cmd-btn" onclick="sendCmd('page:disks')">NAS - Disques</button>
+                <button class="cmd-btn" onclick="sendCmd('page:devices')">Freebox - Appareils</button>
+                <button class="cmd-btn" onclick="sendCmd('page:connections')">NAS - Connexions</button>
+                <button class="cmd-btn" onclick="sendCmd('page:activity')">Freebox - Activité Réseau</button>
+                <button class="cmd-btn" onclick="sendCmd('page:downloads')">NAS - Téléchargements</button>
+                <button class="cmd-btn" disabled></button>
+            </div>
         </div>
 
         <div class="cmd-section">
