@@ -14,7 +14,9 @@
 
 // Buffers de dessin LVGL, en RAM INTERNE Format RGB565_SWAPPED : 2 octets/pixel
 // LV_BUF_N = 1 ou 2 (simple ou double buffer asynchrones)
-// Meilleures valeurs possibles : 2 buffers de 16 lignes
+// ⚠️ NE PAS remonter à 24 : testé deux fois (2026-08-03 et 2026-08-10), il tue
+// l'IA et le serveur HTTP. Le plus rapide (−33 %), mais 30 720 o d'interne qui
+// laissent 888 o de DMA au pire cas. Repli si l'interne se retend : 12.
 #define LV_BUF_N 2
 #define LV_BUF_LINES 16
 #define LV_BUF_BYTES (SCREEN_WIDTH * LV_BUF_LINES * 2)

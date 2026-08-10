@@ -674,13 +674,18 @@ void display_init() {
 
     log_line("[Display] LVGL OK");
 
-    // Test visuel — valide la chaîne de flush avant de charger l'UI SquareLine
+    // Test visuel — valide la chaîne de flush avant de charger l'UI SquareLine.
+    // ⚠️ Noir sur BLANC : `ui_init()` n'a pas encore posé le thème sombre. Le flash
+    // blanc est le signal que la dalle répond, ne pas l'habiller.
     lv_obj_t* label_test = lv_label_create(lv_scr_act());
     lv_label_set_text(label_test, "Initialisation...");
+    // 20 et pas plus gros : déjà liée par ailleurs, donc gratuite en flash —
+    // le linker n'embarque que les tailles réellement référencées.
+    lv_obj_set_style_text_font(label_test, &lv_font_montserrat_20, 0);
     lv_obj_center(label_test);
 
     unsigned long t0 = millis();
-    while (millis() - t0 < 3000) {
+    while (millis() - t0 < 300) {
         lv_tick_inc(5);
         lv_timer_handler();
         delay(5);
