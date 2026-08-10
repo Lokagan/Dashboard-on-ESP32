@@ -30,6 +30,9 @@
 // La capacité d'enregistrement (durée max + 1 s de marge) vit dans
 // audio_manager.h : la page MEMOIRE de SysInfo la lit aussi.
 #define LOOPBACK_RECORD_MS 3000
+// Plafond de l'amplification de relecture : au-delà, une capture silencieuse
+// rendrait un souffle plein pot.
+#define LOOPBACK_PLAY_GAIN_MAX_Q8  (32 * 256)
 
 // Purge du HP avant d'enregistrer (cf. _drain_playback)
 #define PLAYBACK_DRAIN_SILENCE_MS  120
@@ -37,6 +40,11 @@
 
 #define SPEECH_MIN_MS        250   // parole cumulée requise pour armer la coupure au silence
 #define NO_SPEECH_TIMEOUT_MS 3000  // rien entendu au bout de ça → abandon
+
+// Registre 0x17 : 0xBF = 0 dB, 0,5 dB par pas.
+static const uint8_t MIC_GAIN_REG = (uint8_t)(0xBF + AUDIO_MIC_GAIN_DB * 2);
+static_assert(AUDIO_MIC_GAIN_DB >= -95 && AUDIO_MIC_GAIN_DB <= 32,
+              "AUDIO_MIC_GAIN_DB hors plage du registre 0x17");
 
 bool audio_is_recording = false;
 bool audio_is_playing   = false;
@@ -184,9 +192,8 @@ static void _es8311_init() {
     _es_write(0x1C, 0x6A);  // passe-haut ADC (supprime l'offset DC)
     _es_write(0x14, 0x1A);  // Mic1P–Mic1N, PGA analogique +30 dB (max matériel)
     // ⚠️ Micro volontairement LINÉAIRE — NE PAS RÉACTIVER L'ALC ni l'automute.
-    // ALC coupée, 0x17 n'est plus un plafond mais le gain numérique FIXE :
-    // 0xFF (+32 dB) obligatoire, à 0 dB la parole tombe à -52 dBFS.
-    _es_write(0x17, 0xFF);
+    // ALC coupée, 0x17 n'est plus un plafond mais le gain numérique FIXE.
+    _es_write(0x17, MIC_GAIN_REG);
     _es_write(0x18, 0x00);  // ALC_EN=0, ADC_AUTOMUTE_EN=0
     _es_write(0x19, 0xF0);  // cibles ALC — sans effet
     _es_write(0x1A, 0x37);  // fenêtre automute — sans effet
@@ -222,7 +229,10 @@ static bool _audio_capture_to_psram(int max_ms, bool silence_cutoff, size_t* out
         log_line("[Audio] max_ms tronqué à la capacité du buffer PSRAM");
     }
 
-    const int16_t SILENCE_THRESHOLD  = 400;
+    // 400 relevé à +32 dB : ⚠️ le seuil SUIT le gain, sinon plus rien n'est
+    // détecté comme parole.
+    const int16_t SILENCE_THRESHOLD  =
+        (int16_t)(400.0f * powf(10.0f, (AUDIO_MIC_GAIN_DB - 32) / 20.0f));
     const int     SILENCE_MS_TO_STOP = 800;
     int silence_frames = 0;
     int silence_limit  = (SAMPLE_RATE * SILENCE_MS_TO_STOP) / 1000;
@@ -233,7 +243,8 @@ static bool _audio_capture_to_psram(int max_ms, bool silence_cutoff, size_t* out
     int no_speech_limit = (SAMPLE_RATE * NO_SPEECH_TIMEOUT_MS) / 1000;
 
     size_t  recorded = 0;
-    int16_t min_l = 32767, max_l = -32768;
+    int16_t  min_l = 32767, max_l = -32768;
+    uint32_t clipped = 0;
 
     _cancel_requested = false;
     uint32_t t_loop_start = millis();
@@ -251,6 +262,7 @@ static bool _audio_capture_to_psram(int max_ms, bool silence_cutoff, size_t* out
             _record_psram_buf[recorded + i] = l;
             if (l < min_l) min_l = l;
             if (l > max_l) max_l = l;
+            if (l >= 32000 || l <= -32000) clipped++;
             sum_abs += abs((int)l);
         }
         recorded += frames_read;
@@ -288,7 +300,12 @@ static bool _audio_capture_to_psram(int max_ms, bool silence_cutoff, size_t* out
                  (unsigned long)(wall_ms / audio_ms),
                  (unsigned long)((wall_ms * 100 / audio_ms) % 100));
     }
-    log_line("[Audio] Amplitude capturée : min=%d max=%d", min_l, max_l);
+    // Un échantillon écrêté est de l'information perdue avant la normalisation
+    // du bridge. dBFS en entier : %f est indisponible (newlib nano).
+    int peak = max((int)max_l, -(int)min_l);
+    log_line("[Audio] Amplitude capturée : min=%d max=%d — crête %d dBFS, %lu ecretes",
+             min_l, max_l, (int)(20.0f * log10f((float)max(peak, 1) / 32768.0f)),
+             (unsigned long)clipped);
 
     if (out_speech_ms) {
         uint32_t ms = (uint32_t)((uint64_t)speech_frames * 1000 / SAMPLE_RATE);
@@ -300,7 +317,10 @@ static bool _audio_capture_to_psram(int max_ms, bool silence_cutoff, size_t* out
     return true;
 }
 
-static void _audio_play_psram_stream(const int16_t* pcm, size_t samples, bool free_after) {
+// gain_q8 : virgule fixe, 256 = ×1. Défaut plutôt qu'un champ d'AudioMsg, que
+// le `= {}` des appelants mettrait à zéro, donc à MUET.
+static void _audio_play_psram_stream(const int16_t* pcm, size_t samples, bool free_after,
+                                     int gain_q8 = 256) {
     audio_is_playing = true;
     _playback_stop_requested = false;
 
@@ -310,8 +330,11 @@ static void _audio_play_psram_stream(const int16_t* pcm, size_t samples, bool fr
         if (_playback_stop_requested) break;
         size_t n = min((size_t)1024, remaining);
         for (size_t i = 0; i < n; i++) {
-            _audio_buf[i * 2]     = p[i];
-            _audio_buf[i * 2 + 1] = p[i];
+            int16_t s = (gain_q8 == 256)
+                      ? p[i]
+                      : (int16_t)constrain(((int32_t)p[i] * gain_q8) >> 8, -32768, 32767);
+            _audio_buf[i * 2]     = s;
+            _audio_buf[i * 2 + 1] = s;
         }
         _i2s.write((uint8_t*)_audio_buf, n * 2 * sizeof(int16_t));
         p         += n;
@@ -444,10 +467,17 @@ static void _sound_test_loopback() {
         return;
     }
 
+    // ⚠️ Amplifiée à la LECTURE seulement : le buffer part brut au NAS, sans quoi
+    // le WAV ne dirait plus rien du niveau réel ni de l'écrêtage.
+    int peak = 1;
+    for (size_t i = 0; i < samples; i++) peak = max(peak, abs((int)_record_psram_buf[i]));
+    int gain_q8 = min(LOOPBACK_PLAY_GAIN_MAX_Q8, (32767 / 2 * 256) / peak);
+
     uint32_t t_play = millis();
-    _audio_play_psram_stream(_record_psram_buf, samples, false);   // false : buffer singleton
-    log_line("[Audio] Lecture : %lu ms (%u échantillons)",
-             (unsigned long)(millis() - t_play), (unsigned)samples);
+    _audio_play_psram_stream(_record_psram_buf, samples, false, gain_q8);   // false : buffer singleton
+    log_line("[Audio] Lecture : %lu ms (%u échantillons), amplifiée x%d.%d",
+             (unsigned long)(millis() - t_play), (unsigned)samples,
+             gain_q8 / 256, (gain_q8 * 10 / 256) % 10);
 
     ai_upload_pcm(_record_psram_buf, samples);
     log_line("[Audio] Test loopback terminé — capture envoyée au NAS");

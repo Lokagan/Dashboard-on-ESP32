@@ -884,9 +884,13 @@ def record():
         return "", 400
 
     os.makedirs(RECORD_DIR, exist_ok=True)
-    name = datetime.now().strftime("%Y%m%d-%H%M%S") + ".wav"
+    # ⚠️ Horodatage sur _TZ, pas sur l'horloge du conteneur : elle est en UTC.
+    name = datetime.now(zoneinfo.ZoneInfo(_TZ)).strftime("%Y%m%d-%H%M%S") + ".wav"
+    # Archive NORMALISÉE, sinon inécoutable : le micro est linéaire et vise la
+    # marge, pas le niveau. Le niveau réel est journalisé par le firmware
+    # (« Amplitude capturée »), le fichier n'a plus à le porter.
     with open(os.path.join(RECORD_DIR, name), "wb") as f:
-        f.write(pcm_to_wav(pcm))
+        f.write(pcm_to_wav(normalize_pcm(pcm)))
 
     seconds = round(len(pcm) / 2 / SAMPLE_RATE, 2)
     print(f"[Bridge] Capture archivée : {name} ({seconds} s)")
