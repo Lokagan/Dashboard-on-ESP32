@@ -45,6 +45,10 @@ void text(const Canvas& c, int x, int y, const char* s,
           uint16_t fg, uint16_t bg, uint8_t size = 1);
 
 // Largeur d'une chaîne, pour aligner à droite ou centrer sans compter à la main.
+// ⚠️ Largeur d'AVANCE : la colonne d'espacement du dernier caractère est COMPRISE.
+// Ce n'est pas un bug de 1 px — la plupart des appelants enchaînent dessus
+// (`x + text_w(cle)` pour poser une valeur après son intitulé) et comptent sur ce
+// pixel de queue. Le « corriger » décalerait tout le monde pour aligner deux appels.
 int text_w(const char* s, uint8_t size = 1);
 
 }  // namespace gfx

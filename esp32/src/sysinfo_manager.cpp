@@ -484,7 +484,12 @@ static bool load(int* core0, int* core1) {
 
 namespace inv {
 
-struct Alloc { const char* label; bool internal; uint32_t bytes; };
+// dyn : poste dont la taille n'est connue qu'au runtime. Laissé à nullptr par
+// l'init agrégée pour tous les autres. ⚠️ Lire par size(), jamais par `bytes`.
+struct Alloc {
+    const char* label; bool internal; uint32_t bytes; uint32_t (*dyn)();
+    uint32_t size() const { return dyn ? dyn() : bytes; }
+};
 
 static const Alloc allocs[] = {
     { "LVGL",       true,  LV_BUF_BYTES * LV_BUF_N },
@@ -493,7 +498,7 @@ static const Alloc allocs[] = {
     { "MQTT build", false, MQTT_BUFFER_SIZE },
     { "Capture",    false, AUDIO_RECORD_CAPACITY_SAMPLES * sizeof(int16_t) },
     { "Flux TTS",   false, AUDIO_STREAM_BYTES },
-    { "Avatar",     false, COMPANION_PSRAM_BYTES },
+    { "Avatar",     false, 0, ai_companion_psram_bytes },
     { "JSON",       false, JSON_TOTAL_SIZE },
     { "Sprite",     false, (uint32_t)SI_W * SI_H * 2 },
     { "Canvas",     false, (uint32_t)SI_W * SI_H * 2 },
@@ -543,7 +548,7 @@ static uint32_t stacks_bytes() {
 
 static uint32_t known_internal() {
     uint32_t sum = stacks_bytes();
-    for (auto const& a : allocs) if (a.internal) sum += a.bytes;
+    for (auto const& a : allocs) if (a.internal) sum += a.size();
     return sum;
 }
 
@@ -551,7 +556,7 @@ static uint32_t known_psram() {
     uint32_t sum = 0;
     for (auto const& a : allocs) {
         if (a.internal) continue;
-        if (!alloc_pending(a)) sum += a.bytes;
+        if (!alloc_pending(a)) sum += a.size();
     }
     return sum;
 }
@@ -944,8 +949,8 @@ static void draw_static(const inv::Mem& m) {
     Item li[inv::alloc_count + 1 + inv::stack_count], ri[inv::alloc_count];
     int  nl = 0, nr = 0;
     for (auto const& a : inv::allocs) {
-        if (a.internal) li[nl++] = { a.label, a.bytes };
-        else            ri[nr++] = { a.label, a.bytes };
+        if (a.internal) li[nl++] = { a.label, a.size() };
+        else            ri[nr++] = { a.label, a.size() };
     }
     li[nl++] = { "ESP_SR", m.esp_sr };
     for (auto const& s : inv::stacks) li[nl++] = { s.name, s.stack };
@@ -2155,7 +2160,7 @@ void sysinfo_log_memory() {
         }
     }
     for (auto const& a : inv::allocs)
-        if (a.internal) log_line("[MEM] Buffer %-13s : %u o", a.label, (unsigned)a.bytes);
+        if (a.internal) log_line("[MEM] Buffer %-13s : %u o", a.label, (unsigned)a.size());
     log_line("[MEM] %-20s : %u o d'interne (mesuré au boot)", "ESP_SR utilise", (unsigned)m.esp_sr);
     log_line("[MEM] %-22s : %ld o", "Système (non tracé)", m.untracked_int);
     log_line("[MEM] %-20s : %u o utilise / %u o", "   Bilan HEAP", (unsigned)m.int_used, (unsigned)m.int_total);
@@ -2173,7 +2178,7 @@ void sysinfo_log_memory() {
             // que "0 o", et exclus du total tant qu'ils n'existent pas.
             bool pending = inv::alloc_pending(a);
             if (pending) log_line("[MEM] Buffer %-13s : (pas encore calculé)", a.label);
-            else         log_line("[MEM] Buffer %-13s : %u o", a.label, (unsigned)a.bytes);
+            else         log_line("[MEM] Buffer %-13s : %u o", a.label, (unsigned)a.size());
         }
         // Non tracé : modèles ESP_SR chargés en PSRAM + framework.
         log_line("[MEM] %-22s : %ld o", "Système (non tracé)", m.untracked_ps);
